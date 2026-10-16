@@ -1,6 +1,7 @@
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 
+mod cpu;
 mod rom;
 
 const W: usize = 256;
