@@ -15,11 +15,6 @@
 //! 3. Nametable mirroring is VERTICAL, hardwired in the board. Nothing in the
 //!    header selects it and nothing in `Cartridge` needs to.
 
-// TEMPORARY: these entry points are unreachable until the CPU bus task loads a
-// ROM, so without this `cargo build` emits 4 dead_code warnings. Removing it is
-// one line of follow-up there; module-wide, it would also mute later additions.
-#![allow(dead_code)]
-
 /// Size of one PRG bank, and of both PRG windows.
 const BANK: usize = 0x4000;
 

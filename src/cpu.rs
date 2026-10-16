@@ -15,11 +15,6 @@
 //! * No NMI hijack. `BusLike` can only raise an NMI between instructions, so
 //!   the earliest sample point is the top of `step`; see the `nmi` comment.
 
-// TEMPORARY: nothing calls these until the bus task exists, so without this
-// `cargo build` emits 16 dead_code warnings for the whole CPU. Removed for good
-// once `Bus` exists. Same as rom.rs.
-#![allow(dead_code)]
-
 /// Everything an instruction needs from the rest of the machine.
 ///
 /// `tick` advances the PPU by **one dot**, not by one CPU cycle. The NES PPU

@@ -18,11 +18,6 @@
 //!   pattern fetch & render" for the 8x16 address rule, the in-range comparator,
 //!   and the down-counter that serialises a sprite's eight pixels.
 
-// TEMPORARY: nothing constructs a `Ppu` until the CPU-bus task does, so without
-// this `cargo build` emits a dead_code warning per entry point. Removing it is
-// one line of follow-up there; module-wide, it would also mute later additions.
-#![allow(dead_code)]
-
 const DOTS_PER_LINE: u32 = 341;
 const VISIBLE_LINES: u32 = 240;
 const VBLANK_FIRST: u32 = 241;
