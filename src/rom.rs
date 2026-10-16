@@ -15,8 +15,9 @@
 //! 3. Nametable mirroring is VERTICAL, hardwired in the board. Nothing in the
 //!    header selects it and nothing in `Cartridge` needs to.
 
-// Drop when the CPU bus in a later task actually loads a ROM; these entry
-// points are unreachable until then.
+// TEMPORARY: these entry points are unreachable until the CPU bus task loads a
+// ROM, so without this `cargo build` emits 4 dead_code warnings. Removing it is
+// one line of follow-up there; module-wide, it would also mute later additions.
 #![allow(dead_code)]
 
 /// Size of one PRG bank, and of both PRG windows.
@@ -57,7 +58,11 @@ impl Cartridge {
     }
 
     /// `$8000-$BFFF` is the switchable bank, `$C000-$FFFF` is fixed to the last
-    /// bank so the NMI and IRQ vectors never move.
+    /// bank. Measured on this cartridge: NMI (`$FFFA` = `$C086`) and IRQ
+    /// (`$FFFE` = `$C000`) name addresses in the fixed window, so those handlers
+    /// are pinned. RESET (`$FFFC` = `$8000`) names the *switchable* window, so
+    /// the first code the CPU executes does move with the bank -- which is why
+    /// `POWER_ON_BANK` is load-bearing.
     pub fn cpu_read(&self, addr: u16) -> u8 {
         let bank = if addr < 0xC000 {
             self.bank
@@ -101,6 +106,19 @@ mod tests {
         h
     }
 
+    /// Four 16 KiB PRG banks where bank `i` is filled with the byte `i`, so the
+    /// mapped bank is observable through `cpu_read`. `patch` is written into the
+    /// power-on bank's `addr` so a matching write carries a value the power-on
+    /// bank does not already select.
+    fn banks_filled_with_their_own_index(addr: usize, patch: u8) -> Cartridge {
+        let mut bytes = ines_header(4, 2).to_vec();
+        for fill in 0..4u8 {
+            bytes.extend(std::iter::repeat(fill).take(BANK));
+        }
+        bytes[16 + POWER_ON_BANK * BANK + addr - 0x8000] = patch;
+        Cartridge::load(&bytes).expect("synthetic image must load")
+    }
+
     /// Four 16 KiB PRG banks. Banks 0-2 are `a`, the fixed bank 3 is `b`.
     fn four_banks_filled(a: u8, b: u8) -> Cartridge {
         let mut bytes = ines_header(4, 2).to_vec();
@@ -110,28 +128,33 @@ mod tests {
         Cartridge::load(&bytes).expect("synthetic image must load")
     }
 
+    // The conflict tests read at $8001, not $8000: $8000 holds the patched byte,
+    // so reading it back could return the value written rather than the identity
+    // of the bank now mapped.
+
     #[test]
     fn a_write_that_does_not_match_the_rom_does_not_switch_banks() {
-        let mut c = four_banks_filled(0xAA, 0xBB);
-        let before = c.cpu_read(0x8000);
-        c.cpu_write(0x8000, 0x01); // 0x01 != 0xAA
-        assert_eq!(c.cpu_read(0x8000), before);
+        let mut c = banks_filled_with_their_own_index(0x8000, 0x03);
+        assert_eq!(c.cpu_read(0x8001), 2);
+        c.cpu_write(0x8000, 0x01); // the ROM reads 0x03 there
+        assert_eq!(c.cpu_read(0x8001), 2);
     }
 
     #[test]
     fn a_write_that_matches_the_rom_switches_banks() {
-        let mut c = four_banks_filled(0xAA, 0xBB);
-        // $8000 currently reads the power-on bank, which holds 0xAA.
-        c.cpu_write(0x8000, 0xAA); // matches -> 0xAA % 4 selects bank 2
-        assert_eq!(c.cpu_read(0x8000), 0xAA);
+        let mut c = banks_filled_with_their_own_index(0x8000, 0x05);
+        assert_eq!(c.cpu_read(0x8001), 2);
+        c.cpu_write(0x8000, 0x05); // matches -> 0x05 % 4 == 1
+        assert_eq!(c.cpu_read(0x8001), 1);
     }
 
     #[test]
     fn the_fixed_window_always_shows_the_last_bank() {
-        let mut c = four_banks_filled(0xAA, 0xBB);
-        assert_eq!(c.cpu_read(0xC000), 0xBB);
-        c.cpu_write(0x8000, 0xBB); // matching write, moves the switchable bank
-        assert_eq!(c.cpu_read(0xC000), 0xBB); // fixed bank did not move
+        let mut c = banks_filled_with_their_own_index(0x8000, 0x05);
+        assert_eq!(c.cpu_read(0xC000), 3);
+        c.cpu_write(0x8000, 0x05); // matching write, moves the switchable bank
+        assert_eq!(c.cpu_read(0x8001), 1); // ...and it really landed
+        assert_eq!(c.cpu_read(0xC000), 3); // fixed bank did not move
     }
 
     /// The conflict check must stop at `$BFFF`. Reset writes `$FFFD` for OAM
