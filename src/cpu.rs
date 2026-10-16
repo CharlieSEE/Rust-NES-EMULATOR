@@ -16,25 +16,27 @@
 //!   the earliest sample point is the top of `step`; see the `nmi` comment.
 
 // TEMPORARY: nothing calls these until the bus task exists, so without this
-// `cargo build` emits dead_code warnings for the whole CPU. Same as rom.rs.
+// `cargo build` emits 16 dead_code warnings for the whole CPU. Removed for good
+// once `Bus` exists. Same as rom.rs.
 #![allow(dead_code)]
 
 /// Everything an instruction needs from the rest of the machine.
 ///
-/// `tick` is one CPU cycle's worth of PPU dots. `step` calls it three times per
-/// consumed cycle -- the PPU runs three dots per CPU cycle, and SMB's
-/// sprite-0 hit depends on that ratio -- so the bus owns PPU, CPU and APU
-/// timing and `Cpu` only ever asks for the next cycle. `Bus` implements this
-/// once (a later task).
+/// `tick` advances the PPU by **one dot**, not by one CPU cycle. The NES PPU
+/// runs three dots per CPU cycle, so `step` calls `tick` three times for every
+/// cycle it consumes -- SMB's sprite-0 hit depends on that ratio. A `Bus` whose
+/// `tick` runs a whole CPU cycle will put the PPU three times too far ahead.
+/// `Bus` implements this once (a later task).
 pub trait BusLike {
     fn read(&mut self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, val: u8);
     fn tick(&mut self);
 }
 
-/// Cycles an `nmi` or `irq` sequence costs. `nmi` and `irq` push the stack
-/// themselves and return nothing, so whoever calls them ticks the bus and
-/// needs the number spelled out somewhere.
+/// Cycles an `nmi` or `irq` sequence costs. Both push the stack themselves and
+/// **tick the bus 21 dots internally** (see `interrupt`), returning nothing --
+/// so a caller must NOT tick for them, only read this constant if it needs to
+/// account for the 7 cycles. Ticking on top of that double-advances vblank.
 pub const INTERRUPT_CYCLES: u8 = 7;
 
 // Processor status bits. `B` and `U` are not real registers on the 2A03: `B`
@@ -71,8 +73,9 @@ enum Mode {
 /// Base cycles per opcode: the documented counts with no page-cross or
 /// taken-branch penalty. Those two adjustments are added in `operand` and
 /// `branch`, never baked in here, so this table is the reference a human can
-/// check against a 6502 datasheet row by row. Entries for the 105
-/// undocumented opcodes are 1 and are never reached -- `step` panics on them.
+/// check against a 6502 datasheet row by row. Every one of the 105
+/// undocumented slots is 1 and none is reached -- `step` panics on them, and
+/// nothing branches on the value, so the uniform 1 is deliberately unchecked.
 #[rustfmt::skip]
 const CYCLES: [u8; 256] = [
 //    0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
@@ -84,10 +87,10 @@ const CYCLES: [u8; 256] = [
       2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 50
       6,  6,  1,  1,  1,  3,  5,  1,  4,  2,  2,  1,  5,  4,  6,  1, // 60
       2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 70
-      2,  6,  1,  1,  3,  3,  3,  1,  2,  2,  2,  1,  4,  4,  4,  1, // 80
+      2,  6,  1,  1,  3,  3,  3,  1,  2,  1,  2,  1,  4,  4,  4,  1, // 80
       2,  6,  1,  1,  4,  4,  4,  1,  2,  5,  2,  1,  1,  5,  1,  1, // 90
       2,  6,  2,  1,  3,  3,  3,  1,  2,  2,  2,  1,  4,  4,  4,  1, // a0
-      2,  5,  1,  1,  4,  4,  4,  1,  2,  4,  2,  4,  4,  4,  4,  1, // b0
+      2,  5,  1,  1,  4,  4,  4,  1,  2,  4,  2,  1,  4,  4,  4,  1, // b0
       2,  6,  1,  1,  3,  3,  5,  1,  2,  2,  2,  1,  4,  4,  6,  1, // c0
       2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // d0
       2,  6,  1,  1,  3,  3,  5,  1,  2,  2,  2,  1,  4,  4,  6,  1, // e0
@@ -101,22 +104,22 @@ const CYCLES: [u8; 256] = [
 /// mode is ever read.
 #[rustfmt::skip]
 const MODE: [Mode; 256] = [
-    M::Imp, M::IndX, M::Imp,  M::Imp, M::Imp,  M::Zp,  M::Zp,  M::Imp, M::Imp, M::Imm, M::Acc, M::Imp, M::Imp, M::Abs,  M::Abs,  M::Imp, // 00
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::Imp,  M::ZpX, M::ZpX, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::AbsX, M::Imp, // 10
-    M::Abs, M::IndX, M::Imp,  M::Imp, M::Zp,   M::Zp,  M::Zp,  M::Imp, M::Imp, M::Imm, M::Acc, M::Imp, M::Abs, M::Abs,  M::Abs,  M::Imp, // 20
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::Imp,  M::ZpX, M::ZpX, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::AbsX, M::Imp, // 30
-    M::Imp, M::IndX, M::Imp,  M::Imp, M::Imp,  M::Zp,  M::Zp,  M::Imp, M::Imp, M::Imm, M::Acc, M::Imp, M::Abs, M::Abs,  M::Abs,  M::Imp, // 40
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::Imp,  M::ZpX, M::ZpX, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::AbsX, M::Imp, // 50
-    M::Imp, M::IndX, M::Imp,  M::Imp, M::Imp,  M::Zp,  M::Zp,  M::Imp, M::Imp, M::Imm, M::Acc, M::Imp, M::Ind, M::Abs,  M::Abs,  M::Imp, // 60
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::Imp,  M::ZpX, M::ZpX, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::AbsX, M::Imp, // 70
-    M::Imm, M::IndX, M::Imp,  M::Imp, M::Zp,   M::Zp,  M::Zp,  M::Imp, M::Imp, M::Imm, M::Imp, M::Imp, M::Abs, M::Abs,  M::Abs,  M::Imp, // 80
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::ZpX,  M::ZpX, M::ZpY, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::Imp, M::Imp, // 90
-    M::Imm, M::IndX, M::Imm,  M::Imp, M::Zp,   M::Zp,  M::Zp,  M::Imp, M::Imp, M::Imm, M::Imp, M::Imp, M::Abs, M::Abs,  M::Abs,  M::Imp, // a0
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::ZpX,  M::ZpX, M::ZpY, M::Imp, M::Imp, M::AbsY, M::Imp, M::AbsX, M::AbsX, M::AbsX, M::AbsY, M::Imp, // b0
-    M::Imm, M::IndX, M::Imp,  M::Imp, M::Zp,   M::Zp,  M::Zp,  M::Imp, M::Imm, M::Imm, M::Imp, M::Imp, M::Abs, M::Abs,  M::Abs,  M::Imp, // c0
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::Imp,  M::ZpX, M::ZpX, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::AbsX, M::Imp, // d0
-    M::Imm, M::IndX, M::Imp,  M::Imp, M::Zp,   M::Zp,  M::Zp,  M::Imp, M::Imm, M::Imm, M::Imp, M::Imp, M::Abs, M::Abs,  M::Abs,  M::Imp, // e0
-    M::Rel, M::IndY, M::Imp,  M::Imp, M::Imp,  M::ZpX, M::ZpX, M::Imp, M::Imp, M::AbsY, M::Imp, M::Imp, M::Imp, M::AbsX, M::AbsX, M::Imp, // f0
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Imp, // 00
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 01
+    M::Abs,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::AbsX, M::Abs,  M::Abs,  M::Imp, // 02
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 03
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 04
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 05
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Ind,  M::Abs,  M::Abs,  M::Imp, // 06
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 07
+    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 08
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp, // 09
+    M::Imm,  M::IndX, M::Imm,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 0a
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::AbsY, M::Imp, // 0b
+    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 0c
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 0d
+    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 0e
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 0f
 ];
 use Mode as M;
 
@@ -267,10 +270,11 @@ impl Cpu {
                 cycles += crossed as u8;
             }
             0x24 | 0x2C => {
-                let v = self.fetch(bus, mode).0;
+                let (v, crossed) = self.fetch(bus, mode);
                 self.set(Z, self.a & v == 0);
                 self.set(N, v & 0x80 != 0);
                 self.set(V, v & 0x40 != 0);
+                cycles += crossed as u8;
             }
             0x69 | 0x65 | 0x75 | 0x6D | 0x7D | 0x79 | 0x71 | 0x61 => {
                 let (v, crossed) = self.fetch(bus, mode);
@@ -576,7 +580,7 @@ impl Cpu {
         let r = sum as u8;
         self.set(C, sum > 0xFF);
         // Overflow: the operands agreed in sign and the result disagreed.
-        self.set(V, (a ^ v) & 0x80 != 0 && (a ^ r) & 0x80 != 0);
+        self.set(V, (a ^ v) & 0x80 == 0 && (a ^ r) & 0x80 != 0);
         self.a = r;
         self.nz(r);
     }
@@ -781,6 +785,81 @@ mod tests {
         assert_eq!(cycles_at(0, 0, b"\xBD\xFF\x12"), 4); // X = 0 never crosses
                                                          // (zp),Y: pointer $0000, index $01 -> $0001, still page $00.
         assert_eq!(cycles_at(0, 0, b"\xB1\x00\x01"), 5);
+    }
+
+    /// Runs one `ADC #v` / `SBC #v` and returns the flags it left behind as
+    /// `(C, V, N, Z, A)` -- the whole status byte, so a test that is only after
+    /// V still catches a fix that broke a neighbour.
+    fn alu(op: u8, a: u8, carry: bool, v: u8) -> (bool, bool, bool, bool, u8) {
+        let mut bus = TestBus::new();
+        load(&mut bus, PROG, &[op, v]);
+        let mut c = Cpu::new();
+        c.pc = PROG;
+        c.a = a;
+        c.p = if carry { C } else { 0 };
+        assert_eq!(c.step(&mut bus), 2, "both forms are immediate");
+        (c.flag(C), c.flag(V), c.flag(N), c.flag(Z), c.a)
+    }
+
+    #[test]
+    fn adc_sets_overflow_when_two_positives_go_negative() {
+        // V = the operands agreed in sign and the result did not.
+        for (a, v, carry, expect_v) in [
+            (0x00, 0x7F, true, true),   // $00 + $7F + 1 = $80, out of range
+            (0x00, 0x80, false, false), // $00 + $80 = $80, operands disagreed
+            (0x50, 0x50, false, true),  // $50 + $50 = $A0
+            (0x50, 0x10, false, false), // $50 + $10 = $60, agreed all the way
+            (0x7F, 0x01, false, true),  // $7F + $01 = $80
+            (0x80, 0x80, true, true),   // $80 + $80 + 1 = $01, out of range
+            (0x80, 0xFF, true, false),  // $80 + $FF + 1 = $80, agreed all the way
+            (0x80, 0x01, false, false), // $80 + $01 = $81, agreed
+        ] {
+            let (c, got_v, n, z, r) = alu(0x69, a, carry, v);
+            assert_eq!(got_v, expect_v, "ADC #${v:02X} with A=${a:02X}, C={carry}");
+            // The other flags must not move as a side effect of the fix.
+            assert_eq!(
+                c,
+                (a as u16 + v as u16 + u16::from(carry)) > 0xFF,
+                "C after ADC #${v:02X} with A=${a:02X}, C={carry}"
+            );
+            assert_eq!(n, r & 0x80 != 0, "N after ADC #${v:02X} with A=${a:02X}");
+            assert_eq!(z, r == 0, "Z after ADC #${v:02X} with A=${a:02X}");
+        }
+    }
+
+    #[test]
+    fn sbc_sets_overflow_when_two_negatives_go_positive() {
+        for (a, v, carry, expect_v) in [
+            (0x00, 0x00, false, false), // $00 - $00 - 1 = $FF, operands disagreed
+            (0x00, 0x00, true, false),  // $00 - $00 = $00, disagreed
+            (0x80, 0x7F, true, true),   // $80 - $7F = $01, the mirror of $00 + $7F
+            (0x80, 0x7F, false, true),  // $80 - $7F - 1 = $00, still underflowed
+            (0xA0, 0x70, true, true),   // $A0 - $70 = $30
+            (0x50, 0x10, true, false),  // $50 - $10 = $40
+            (0x50, 0x30, true, false),  // $50 - $30 = $20, agreed all the way
+            (0x80, 0xFF, true, false),  // $80 - $FF = $81, operands disagreed
+        ] {
+            let (c, got_v, n, z, r) = alu(0xE9, a, carry, v);
+            assert_eq!(got_v, expect_v, "SBC #${v:02X} with A=${a:02X}, C={carry}");
+            let sum = a as u16 + (!v) as u16 + u16::from(carry);
+            assert_eq!(
+                c,
+                sum > 0xFF,
+                "C after SBC #${v:02X} with A=${a:02X}, C={carry}"
+            );
+            assert_eq!(n, r & 0x80 != 0, "N after SBC #${v:02X} with A=${a:02X}");
+            assert_eq!(z, r == 0, "Z after SBC #${v:02X} with A=${a:02X}");
+        }
+    }
+
+    #[test]
+    fn bit_abs_x_owes_the_page_crossing_read_its_penalty() {
+        // $2C is an indexed read like any other: $12FF + $01 costs one more
+        // than $1200 + $01 does. $24 (zero page) can never cross, so it is
+        // covered by the base-count test and stays at 3.
+        assert_eq!(cycles(b"\x2C\xFF\x12"), 5); // BIT $12FF,X -> $1300
+        assert_eq!(cycles(b"\x2C\x00\x12"), 4); // BIT $1200,X -> $1201
+        assert_eq!(cycles(b"\x24\x00"), 3); // BIT $00: zero page wraps, never crosses
     }
 
     #[test]
