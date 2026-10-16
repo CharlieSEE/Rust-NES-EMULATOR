@@ -106,7 +106,7 @@ const CYCLES: [u8; 256] = [
 const MODE: [Mode; 256] = [
     M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Imp, // 00
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 10
-    M::Abs,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::AbsX, M::Abs,  M::Abs,  M::Imp, // 20
+    M::Abs,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 20
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 30
     M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 40
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 50
@@ -853,13 +853,30 @@ mod tests {
     }
 
     #[test]
-    fn bit_abs_x_owes_the_page_crossing_read_its_penalty() {
-        // $2C is an indexed read like any other: $12FF + $01 costs one more
-        // than $1200 + $01 does. $24 (zero page) can never cross, so it is
-        // covered by the base-count test and stays at 3.
-        assert_eq!(cycles(b"\x2C\xFF\x12"), 5); // BIT $12FF,X -> $1300
-        assert_eq!(cycles(b"\x2C\x00\x12"), 4); // BIT $1200,X -> $1201
-        assert_eq!(cycles(b"\x24\x00"), 3); // BIT $00: zero page wraps, never crosses
+    fn bit_absolute_reads_its_operand_address_and_never_indexes() {
+        // $2C is `BIT abs` on the NMOS 6502, NOT `BIT abs,X`. $2C and $3C share
+        // AAA (the BIT group) and differ only in BBB, the addressing field, so
+        // they cannot share a mode; `BIT abs,X` is the 65C02's $3C and does not
+        // exist here. So a $12FF operand with X=$01 reads $12FF, costs no
+        // page-cross cycle, and its N/V/Z come from $12FF -- never from $1300,
+        // which is the silent failure: PC still advances by two, so a stream
+        // desync never shows up.
+        let mut bus = TestBus::new();
+        // Placed at $2000, not at the $cycles helper's $12FE, because at $12FE
+        // the instruction's own operand bytes ARE the data under test.
+        load(&mut bus, 0x2000, &[0x2C, 0xFF, 0x12]); // BIT $12FF
+        bus.write(0x12FF, 0xC0); // N=1, V=1, and $40 & $C0 is not zero
+        bus.write(0x1300, 0x01); // N=0, V=0, and $40 & $01 is zero
+        let mut c = Cpu::new();
+        c.pc = 0x2000;
+        c.x = 0x01;
+        c.a = 0x40;
+        assert_eq!(c.step(&mut bus), 4, "$2C indexes nothing: no page cross");
+        assert_eq!(c.pc, 0x2003, "three bytes consumed");
+        assert!(c.flag(N), "N from $12FF bit 7, not $1300's");
+        assert!(c.flag(V), "V from $12FF bit 6, not $1300's");
+        assert!(!c.flag(Z), "$40 & $C0 is $40");
+        assert_eq!(cycles(b"\x24\x00"), 3); // BIT $00: zero page, never crosses
     }
 
     #[test]
