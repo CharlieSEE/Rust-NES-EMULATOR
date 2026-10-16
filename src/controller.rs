@@ -91,6 +91,18 @@ mod tests {
         assert_eq!(c.read() & 1, 1, "Right should read eighth");
     }
 
+    /// A game that polls `$4016` before it ever strobes -- or strobes and then
+    /// reads eight times without a button held -- must see "nothing pressed",
+    /// which on a 4021 means 1s, not 0s. So a fresh pad reads 1 forever.
+    #[test]
+    fn a_fresh_controller_reads_one_on_every_read() {
+        let mut c = Controller::new();
+        for i in 0..8 {
+            assert_eq!(c.read() & 1, 1, "unstrobed read {i} is not 1");
+        }
+        assert_eq!(c.read() & 1, 1, "and past the eighth");
+    }
+
     #[test]
     fn only_the_held_button_reads_back_one() {
         let mut c = Controller::new();

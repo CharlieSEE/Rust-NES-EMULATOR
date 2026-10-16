@@ -16,12 +16,17 @@
 //!
 //! Two deliberate ceilings:
 //!
-//! * OAM DMA is counted and ticked but does not *stop* the CPU: the stall dots
-//!   are added the instant `$4014` is written, inside the instruction that
-//!   wrote it, rather than after that instruction. The PPU therefore sees the
-//!   same 513 (or 514) cycles it would on hardware, but the CPU is never
-//!   actually held. SMB's own vblank loop polls `$2002`, so it still stops on
-//!   the dot it would have stopped on.
+//! * OAM DMA's stall is COUNTED but NOT ENFORCED. `dma_stall` is only ever
+//!   decremented by `tick`; it never becomes extra `ppu.tick()` calls and it
+//!   never stops the CPU. So a DMA makes neither clock skip ahead: the CPU
+//!   and the PPU are both short by the same 513 (or 514) cycles. The 3:1
+//!   dot:cycle ratio and every PPU-versus-CPU-instruction relationship
+//!   therefore survive intact, and the cost is a bounded timing skew of
+//!   513 of 29 780 cycles per frame -- 89342 dots / 3, so ~1.7% -- not a
+//!   desync. SMB's vblank `BIT $2002` poll loop is self-correcting and lands
+//!   within one poll iteration of the dot hardware would stop on. Enforce it
+//!   when a timing-sensitive case shows: Task 7 gates the CPU on
+//!   `dma_stall > 0`.
 //! * Unmapped and write-only reads return 0 where hardware returns open bus,
 //!   matching the PPU's own choice for `$2002` bits 4-0.
 
@@ -47,7 +52,8 @@ pub struct Bus {
     /// Dots into the current CPU cycle, 0..3. `tick` is one dot and the DMA
     /// stall is counted in whole cycles, so the conversion lives here.
     dot: u8,
-    /// CPU cycles of OAM DMA stall still owed to the PPU's clock.
+    /// CPU cycles the last OAM DMA cost on hardware. Counted and drained, but
+    /// never enforced -- see the module header.
     dma_stall: u16,
 }
 
@@ -130,7 +136,8 @@ impl Bus {
         }
     }
 
-    /// OAM DMA: copy `$XX00-$XXFF` into OAM through `$2004` and stall the CPU.
+    /// OAM DMA: copy `$XX00-$XXFF` into OAM through `$2004`, and record the
+    /// stall `$4014` costs on hardware. Nothing waits on that stall yet.
     ///
     /// The copy goes in through the PPU's existing registers -- `$2003` to aim,
     /// `$2004` to write and advance -- so no OAM API is added to the PPU, and
@@ -247,13 +254,6 @@ mod tests {
 
         fn dma_cycles_remaining(&self) -> u16 {
             self.dma_stall
-        }
-
-        /// Put the CPU cycle counter on the even or the odd cycle, which is the
-        /// only thing `$4014` looks at.
-        fn set_cycle_parity(&mut self, odd: bool) {
-            self.cycles = u64::from(odd);
-            self.dot = 0;
         }
     }
 
@@ -412,12 +412,27 @@ mod tests {
         assert_eq!(b.dma_cycles_remaining(), 513);
     }
 
+    /// `$4014` costs 513 cycles, or 514 when the write lands on an odd CPU
+    /// cycle. These two reach that parity through the real path -- `tick`, then
+    /// `cpu_write($4014, page)` -- rather than poking the counter, so a bus
+    /// that stopped counting cycles altogether (or never advanced them past 0)
+    /// fails instead of silently reading 513 twice.
     #[test]
-    fn an_odd_aligned_dma_write_stalls_one_cycle_longer() {
+    fn a_dma_stalled_on_an_odd_cycle_costs_one_more_cycle() {
         let mut b = Bus::new(blank_cart());
-        b.set_cycle_parity(true); // CPU cycle count is odd
+        for _ in 0..3 {
+            b.tick(); // exactly one whole CPU cycle -> `cycles` is now 1, odd
+        }
         b.write_dma_from(0x0200);
         assert_eq!(b.dma_cycles_remaining(), 514);
+    }
+
+    #[test]
+    fn a_dma_stalled_on_an_even_cycle_costs_513_cycles() {
+        let mut b = Bus::new(blank_cart());
+        b.tick(); // one dot: `cycles` is still 0, even
+        b.write_dma_from(0x0200);
+        assert_eq!(b.dma_cycles_remaining(), 513);
     }
 
     #[test]
