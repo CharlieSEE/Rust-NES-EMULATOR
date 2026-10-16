@@ -238,8 +238,11 @@ impl Ppu {
             self.background_dot();
             // "At dot 256 of each scanline ... the PPU increments the vertical
             // position in v", which skips the attribute table and wraps between
-            // nametables.
-            if self.dot == 256 {
+            // nametables. Not on the pre-render line: NESdev's Y-increment
+            // pseudocode is scoped to the scanlines the picture is drawn on,
+            // and its dots 280-304 copy every one of those bits out of `t`
+            // anyway.
+            if self.dot == 256 && self.scanline < VISIBLE_LINES {
                 self.increment_y();
             }
             // "At dot 257 of each scanline ... the PPU copies all bits related
@@ -397,8 +400,15 @@ impl Ppu {
         self.colour(self.palette[0])
     }
 
+    /// The single place a palette RAM byte becomes a framebuffer pixel, and
+    /// therefore the single place the mask's unimplemented bits would show.
     fn colour(&self, value: u8) -> u32 {
         // Greyscale ($2001 bit 0) ANDs the palette value with $30.
+        //
+        // ponytail: colour emphasis ($2001 bits 5-7) and backdrop override (a
+        // `v` pointing into palette RAM drawing that entry with rendering off)
+        // are NOT implemented -- no test ROM in this repo exercises them and
+        // SMB plays at $1E. Add when a game needs them.
         let value = if self.mask & 0x01 != 0 {
             value & 0x30
         } else {
@@ -596,8 +606,11 @@ impl Ppu {
         self.write_vram_for_test(0x2000 + y as u16 * 32 + x as u16, tile);
         // One attribute byte covers a 4x4 block of tiles; its four 2-bit fields
         // pick the palette of each 2x2 sub-block, at column 0, column 1, row 0,
-        // row 1 counted from the bottom.
-        let attr = 0x23C0 + (y as u16 / 4) + (x as u16 / 4) * 8;
+        // row 1 counted from the bottom. NESdev's attribute address puts the
+        // coarse Y block in bits 3-5 of the offset and coarse X in bits 0-2:
+        // `$23C0 | (v & $0C00) | ((v >> 4) & $38) | ((v >> 2) & $07)`, i.e. the
+        // `*8` is on Y, not on X.
+        let attr = 0x23C0 + (y as u16 / 4) * 8 + (x as u16 / 4);
         let shift = ((y as u16 / 2) & 1) * 4 + ((x as u16 / 2) & 1) * 2;
         let byte = self.read_vram_for_test(attr);
         self.write_vram_for_test(attr, (byte & !(0x03 << shift)) | ((palette & 3) << shift));
@@ -773,6 +786,21 @@ mod tests {
             p.chr_write_for_test(tile as u16 * 16 + row, 0xFF);
             p.chr_write_for_test(tile as u16 * 16 + row + 8, 0x00);
         }
+    }
+
+    /// Which of the four palettes the attribute byte hands the tile at nametable
+    /// column `c`, row `r`: coarse X bit 1 in the low field, coarse Y bit 1 in
+    /// the high one.
+    fn palette_of(c: u32, r: u32) -> u8 {
+        (((c >> 1) & 1) | (((r >> 1) & 1) << 1)) as u8
+    }
+
+    /// The pattern byte the tile at nametable column `c` shows on pixel row
+    /// `j`: the column in bits 7-5 and 1, the pixel row in bits 4-2, and bit 0
+    /// forced on so the LAST pixel of every tile is opaque rather than
+    /// transparent.
+    fn row_pattern(c: u32, j: u32) -> u8 {
+        ((((c & 7) << 5) | (((c >> 3) & 1) << 1) | ((j & 7) << 2)) | 1) as u8
     }
 
     /// Fine X is the reason the shifters hold two tiles. Pixel 0 of the screen is
@@ -1019,5 +1047,219 @@ mod tests {
         p.cpu_write(0x2000, 0x04); // increment by 32
         p.cpu_write(0x2007, 0x22);
         assert_eq!(p.vram_addr(), 0x2121, "$2000 bit 2 must make it 32");
+    }
+
+    /// The whole 256x240 screen, not just its first 22 pixels and 8 scanlines.
+    ///
+    /// Every nametable tile is distinct. The tile index carries the tile row,
+    /// because the PPU addresses CHR as `tile * 16 + fine_y` and one index per
+    /// column cannot tell two tile rows apart; the pattern byte carries the
+    /// column and the pixel row; and the four attribute quadrants get four
+    /// different colour-1 entries, so no two neighbouring tiles share a colour.
+    /// A shifter that stops advancing, or a last pixel that is never written,
+    /// then shows up as a wrong colour rather than as an invisible repeat.
+    #[test]
+    fn the_whole_screen_renders_where_the_nametable_says_it_should() {
+        const COLOURS: [u8; 4] = [0x30, 0x21, 0x11, 0x01];
+        let mut p = Ppu::new();
+        for r in 0..30u32 {
+            for c in 0..32u32 {
+                // Tile rows cycle every 8 so that 30 rows fit inside the 256
+                // tiles one nametable column can name. Rows 8 apart look alike,
+                // which costs nothing: `j` still separates their pixel rows.
+                let tile = ((r & 7) * 32 + c) as u8;
+                for j in 0..8u32 {
+                    p.chr_write_for_test(tile as u16 * 16 + j as u16, row_pattern(c, j));
+                    p.chr_write_for_test(tile as u16 * 16 + j as u16 + 8, 0x00);
+                }
+                p.upload_tile_for_test(tile, c as u8, r as u8, palette_of(c, r));
+            }
+        }
+        p.write_vram_for_test(0x3F00, 0x0F); // backdrop: $000000, distinct
+                                             // from all four colour-1 entries
+        for (n, val) in COLOURS.iter().enumerate() {
+            p.write_vram_for_test(0x3F00 + 4 * n as u16 + 1, *val);
+        }
+        show(&mut p, 0, 0);
+        p.run_to(&[239]); // every visible scanline, x=0..255 inclusive
+        for y in 0..240u32 {
+            for x in 0..256u32 {
+                let bit = (row_pattern(x / 8, y % 8) >> (7 - x % 8)) & 1;
+                let want = if bit == 0 {
+                    BACKDROP
+                } else {
+                    PALETTE[COLOURS[palette_of(x / 8, y / 8) as usize] as usize]
+                };
+                assert_eq!(p.pixel(x, y), want, "wrong pixel at x={x} y={y}");
+            }
+        }
+    }
+
+    /// The nametable select in `t` (bits 11-10) belongs to `$2000` and to
+    /// nothing else. NESdev's register table gives the second `$2005` write as
+    /// `t: FGH..AB CDE.....`, and `t` is 15 bits with the rightmost character
+    /// bit 0: `F`,`G`,`H` are bits 14-12 (fine Y), `A`,`B`,`C`,`D`,`E` are bits
+    /// 9-5 (coarse Y), and the two dots are bits 11 and 10. Masking with `$73E0`
+    /// therefore leaves the nametable bits alone; the `$7BE0` mask clears them
+    /// too and would throw away the `$2000` write on the very next `$2005`,
+    /// which is how a game switches nametables.
+    #[test]
+    fn a_2005_second_write_leaves_the_nametable_bits_in_t() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x03); // nametable select 3 -> t bits 11-10 = 11;
+                                   // d's bits 0-1 land in t's bits 0-1
+        p.cpu_write(0x2005, 0x98); // coarse_x = 19 (already ends in 11), fine_x = 0
+        p.cpu_write(0x2005, 0xC8); // coarse_y = 25, fine_y = 0
+        assert_eq!(
+            p.temp_vram_addr(),
+            (3 << 10) | (25 << 5) | 19,
+            "the second $2005 write must not touch t's nametable select"
+        );
+    }
+
+    /// Task 5 hangs sprite-0 hit and overflow clearing off this exact dot, so it
+    /// is pinned here: the vblank flag goes up at 241.1, survives dots 242-260
+    /// of the pre-render line's approach, and comes back down at 261.1.
+    #[test]
+    fn vblank_flag_is_cleared_at_scanline_261_dot_1() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x80);
+        p.cpu_write(0x2001, 0x00); // rendering off: no odd-frame dot to skip
+        while !p.frame_ready() {
+            p.tick();
+        }
+        assert_eq!(
+            p.status() & 0x80,
+            0x80,
+            "vblank must be set on scanline 241"
+        );
+        while p.scanline != 261 || p.dot != 1 {
+            p.tick();
+        }
+        assert_eq!(
+            p.status() & 0x80,
+            0x80,
+            "vblank must survive dots 242 through 260"
+        );
+        p.tick(); // the work of dot 1 of the pre-render line
+        assert_eq!((p.scanline, p.dot), (261, 2));
+        assert_eq!(p.status() & 0x80, 0x00, "vblank must be cleared at 261.1");
+    }
+
+    /// The vblank flag rises whether or not NMI is enabled; only the NMI is
+    /// gated on `$2000` bit 7.
+    #[test]
+    fn nmi_needs_2000_bit_7() {
+        for (ctrl, want) in [(0x00u8, false), (0x80, true)] {
+            let mut p = Ppu::new();
+            p.cpu_write(0x2000, ctrl);
+            p.cpu_write(0x2001, 0x00); // rendering off: a full 89342-dot frame
+            while !p.frame_ready() {
+                p.tick();
+            }
+            assert_eq!(p.scanline, 241);
+            assert_eq!(p.status() & 0x80, 0x80, "$2000 = {ctrl:#04X}: no flag");
+            assert_eq!(
+                p.nmi_pending(),
+                want,
+                "$2000 = {ctrl:#04X}: vblank raised the NMI anyway"
+            );
+        }
+    }
+
+    /// Coarse X is five bits that count 0-31 across a nametable, and the increment
+    /// that takes 31 to 0 also toggles bit 10, the horizontal nametable select.
+    /// NESdev puts those increments "at dots 328 and 336, and it will continue
+    /// through the next scanline at 8, 16, 24 ... 256", so with `t` holding 31
+    /// the first wrap lands at dot 328 of the pre-render line, the second at dot
+    /// 248 of scanline 0, and dot 257 then puts bit 10 back from `t`.
+    #[test]
+    fn coarse_x_wraps_into_the_other_horizontal_nametable() {
+        let mut p = Ppu::new();
+        show(&mut p, 31 * 8, 0); // coarse_x = 31, fine_x = 0
+                                 // Power-on is already on the pre-render line; dot 257 has just copied
+                                 // the horizontal bits out of `t`.
+        while p.dot != 258 {
+            p.tick(); // the copy itself is at dot 257; nothing increments at 264
+        }
+        assert_eq!(
+            p.vram_addr() & 0x001F,
+            31,
+            "dot 257 must copy coarse X out of t"
+        );
+        while p.dot != 329 {
+            p.tick(); // the increment itself is at dot 328
+        }
+        assert_eq!(p.vram_addr() & 0x001F, 0, "coarse X 31 must wrap to 0");
+        assert_eq!(
+            p.vram_addr() & 0x0400,
+            0x0400,
+            "the wrap must toggle the horizontal nametable"
+        );
+        while p.scanline != 0 || p.dot != 249 {
+            p.tick(); // the increment itself is at dot 248
+        }
+        assert_eq!(
+            p.vram_addr() & 0x001F,
+            0,
+            "coarse X must wrap a second time"
+        );
+        assert_eq!(
+            p.vram_addr() & 0x0400,
+            0x0000,
+            "the second wrap must toggle the nametable back"
+        );
+        while p.scanline != 0 || p.dot != 258 {
+            p.tick(); // the copy itself is at dot 257
+        }
+        assert_eq!(
+            p.vram_addr() & 0x001F,
+            31,
+            "dot 257 must put coarse X back from t"
+        );
+    }
+
+    /// `$2001` bit 0 ANDs the palette value with `$30`, so `$01` ($000C8E) is
+    /// drawn as entry `$00` ($575757).
+    #[test]
+    fn greyscale_ands_the_palette_value_with_30() {
+        let mut p = Ppu::new();
+        solid(&mut p, 0);
+        p.upload_tile_for_test(0, 0, 0, 0);
+        p.write_vram_for_test(0x3F00, 0x00); // backdrop looks the same either way
+        p.write_vram_for_test(0x3F01, 0x01);
+        show(&mut p, 0, 0);
+        p.run_to(&[0]);
+        assert_eq!(
+            p.pixel(0, 0),
+            0x00_00_0C_8E,
+            "palette entry $01 must look like $01"
+        );
+        p.cpu_write(0x2001, 0x1F); // $1E plus bit 0
+        p.run_to(&[0]);
+        assert_eq!(
+            p.pixel(0, 0),
+            0x00_57_57_57,
+            "$2001 bit 0 must AND the palette value with $30"
+        );
+    }
+
+    /// The Y increment is not done on the pre-render line, whose dots 280-304
+    /// reload every vertical bit from `t` regardless. A PPU that comes out of
+    /// reset at (261, 0) with `v` = 0 has fine Y 0 there either way, so this
+    /// reads `v` at the one dot where the increment would still be visible.
+    #[test]
+    fn the_pre_render_line_does_not_increment_y() {
+        let mut p = Ppu::new();
+        show(&mut p, 0, 0);
+        while p.dot != 257 {
+            p.tick();
+        }
+        assert_eq!(p.scanline, 261, "power-on position is the pre-render line");
+        assert_eq!(
+            p.vram_addr() & 0x7000,
+            0,
+            "dot 256 of the pre-render line must not increment fine Y"
+        );
     }
 }
