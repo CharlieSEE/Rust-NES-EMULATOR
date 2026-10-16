@@ -115,7 +115,12 @@ impl Bus {
             }
             // `$4010-$4013`, `$4015` and `$4017` are the APU, and there is no
             // APU; `$4020-$7FFF` is mapper 66's unmapped window. Both drop.
-            0x8000..=0xFFFF => self.cart.cpu_write(addr, val),
+            0x8000..=0xFFFF => {
+                self.cart.cpu_write(addr, val);
+                // The CHR bank is bits 1-0 of the same register the PRG bank is,
+                // so it moves on writes that the PPU cares about too.
+                self.ppu.set_chr_bank(self.cart.chr_bank());
+            }
             _ => {}
         }
     }
@@ -185,15 +190,17 @@ mod tests {
     use super::*;
     use crate::cpu::Cpu;
 
-    const BANK: usize = 0x4000;
-    const POWER_ON_BANK: usize = 2;
+    /// The mapper-66 window is 32 KiB, so 64 KiB of PRG is TWO banks.
+    const BANK: usize = 0x8000;
+    const POWER_ON_BANK: usize = 0;
 
     /// 16-byte iNES header: mapper 66, vertical mirroring, 2x8 KiB of CHR ROM
-    /// claimed by a board that actually carries 8 KiB of CHR RAM.
+    /// claimed by a board that actually carries 8 KiB of CHR RAM. `h[4]` is in
+    /// 16 KiB units, which is why four of them is 64 KiB.
     fn ines_header() -> [u8; 16] {
         let mut h = [0u8; 16];
         h[..4].copy_from_slice(b"NES\x1a");
-        h[4] = 4; // 64 KiB PRG, four 16 KiB banks
+        h[4] = 4; // 64 KiB PRG, two 32 KiB windows
         h[5] = 2;
         h[6] = 0x21;
         h[7] = 0x48;
@@ -204,16 +211,15 @@ mod tests {
     /// vector points there, so `Cpu::reset` lands on real code.
     fn cart_running(code: &[u8]) -> Cartridge {
         let mut bytes = ines_header().to_vec();
-        for fill in 0..4u8 {
+        for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
         let at = 16 + POWER_ON_BANK * BANK;
         bytes[at..at + code.len()].copy_from_slice(code);
-        // The vectors live in the FIXED window, i.e. the last bank, not in the
-        // power-on bank: `Cpu::reset` reads $FFFC through `cpu_read`, and
-        // `Cartridge` pins $C000-$FFFF to the last bank.
-        let fixed = 16 + 3 * BANK + (0xFFFC & 0x3FFF);
-        bytes[fixed..fixed + 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        // $FFFC is in the power-on bank: the window is one 32 KiB block, so the
+        // vectors live at the top of the same bank the reset code is in.
+        let vectors = 16 + POWER_ON_BANK * BANK + (0xFFFC - 0x8000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
         Cartridge::load(&bytes).expect("synthetic image must load")
     }
 
@@ -221,18 +227,18 @@ mod tests {
         cart_running(&[])
     }
 
-    /// Same image, except the power-on bank's `$8000` byte is patched to 1. Each
-    /// bank is filled with its own index, so writing that 1 matches the ROM and
-    /// banks `1 % 4 = 1` -- a bank that reads 1 at `$8001` instead of 2. A bus
-    /// that drops cartridge writes leaves the bank at 2.
+    /// Same image, except the power-on bank's `$8000` byte is patched to `$11`.
+    /// Each bank is filled with its own index, so writing `$11` matches the ROM
+    /// and bits 5-4 select bank 1 -- a bank that reads 1 at `$8001` instead of 0.
+    /// A bus that drops cartridge writes leaves the bank at 0.
     fn cart_bankable_at_8000() -> Cartridge {
         let mut bytes = ines_header().to_vec();
-        for fill in 0..4u8 {
+        for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
-        bytes[16 + POWER_ON_BANK * BANK] = 1;
-        let fixed = 16 + 3 * BANK + (0xFFFC & 0x3FFF);
-        bytes[fixed..fixed + 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        bytes[16 + POWER_ON_BANK * BANK] = 0x11;
+        let vectors = 16 + POWER_ON_BANK * BANK + (0xFFFC - 0x8000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
         Cartridge::load(&bytes).expect("synthetic image must load")
     }
 
@@ -337,16 +343,16 @@ mod tests {
 
     /// Mapper 66 banks by bus conflict, so a matching write to `$8000-$BFFF`
     /// must reach the cartridge from the bus. The synthetic image fills each
-    /// bank with its own index and patches bank 2, so writing the byte the CPU
-    /// already reads there selects a different bank -- visible through
-    /// `cpu_read`.
+    /// 32 KiB bank with its own index and patches bank 0's `$8000` to `$11`, so
+    /// writing the byte the CPU already reads there selects bank 1 -- visible
+    /// through `cpu_read`.
     #[test]
     fn a_bus_conflicting_write_reaches_the_cartridge_and_switches_banks() {
         let mut b = Bus::new(cart_bankable_at_8000());
-        assert_eq!(b.cpu_read(0x8001), 2, "power-on bank 2 reads 2 at $8001");
-        // A matching write banks 1 % 4 = 1, and bank 1 reads 1 at $8001. If the
-        // bus dropped the write, this still reads 2.
-        b.cpu_write(0x8000, 1);
+        assert_eq!(b.cpu_read(0x8001), 0, "power-on bank 0 reads 0 at $8001");
+        // A matching write takes bits 5-4 of $11 = 0b01, so bank 1 is mapped
+        // and reads 1 at $8001. If the bus dropped the write, this still reads 0.
+        b.cpu_write(0x8000, 0x11);
         assert_eq!(
             b.cpu_read(0x8001),
             1,
@@ -441,13 +447,24 @@ mod tests {
         assert_eq!(b.dma_cycles_remaining(), 513);
     }
 
+    /// Bank 0 filled with `$BB` rather than with its own index: this test needs
+    /// the whole `$8000-$FFFF` window to be non-zero, and an index fill would
+    /// make bank 0 read as open bus, which is the same value the third case
+    /// below asserts for unmapped space.
+    fn cart_all_banks_bb() -> Cartridge {
+        let mut bytes = ines_header().to_vec();
+        for _ in 0..2 {
+            bytes.extend(std::iter::repeat_n(0xBB, BANK));
+        }
+        Cartridge::load(&bytes).expect("synthetic image must load")
+    }
+
     #[test]
     fn oam_dma_reads_its_source_through_the_cpu_address_decode() {
-        // RAM is nowhere zero, and the power-on bank of PRG is filled with its
-        // own index, 2, so RAM and cartridge are distinguishable across all 256
-        // bytes. A copy that indexed `cpu_ram` directly gets every non-RAM
-        // source page wrong.
-        let mut b = Bus::new(blank_cart());
+        // RAM is $AA, PRG is $BB and unmapped is $00, so RAM, cartridge and open
+        // bus are three different values across all 256 bytes. A copy that
+        // indexed `cpu_ram` directly gets every non-RAM source page wrong.
+        let mut b = Bus::new(cart_all_banks_bb());
         for i in 0..0x2000u16 {
             b.cpu_write(i, 0xAA);
         }
@@ -458,7 +475,7 @@ mod tests {
         );
         b.write_dma_from(0x8000);
         assert!(
-            b.oam().iter().all(|&v| v == 2),
+            b.oam().iter().all(|&v| v == 0xBB),
             "a DMA out of $8000 must read PRG, not the RAM mirror"
         );
         b.write_dma_from(0x7F00); // unmapped: open bus

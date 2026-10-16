@@ -60,6 +60,9 @@ fn main() -> Result<(), String> {
 
     let bytes = ::std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut bus = Bus::new(Cartridge::load(&bytes)?);
+    // The PPU fetches pattern memory every dot, so the CHR ROM the cartridge
+    // parsed out of the file is loaded once into the PPU's banks.
+    bus.ppu.load_chr_rom(bus.cart.chr_rom());
     let mut cpu = Cpu::new();
     bus.reset();
     cpu.reset(&mut bus);

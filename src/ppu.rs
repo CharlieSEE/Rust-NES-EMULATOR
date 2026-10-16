@@ -1,5 +1,5 @@
-//! PPU: registers, VRAM, palette RAM, the 8 KiB of CHR RAM this cartridge
-//! carries, and the dot-by-dot background and sprite pipelines.
+//! PPU: registers, VRAM, palette RAM, the two banked 8 KiB pages of CHR ROM
+//! this cartridge carries, and the dot-by-dot background and sprite pipelines.
 //!
 //! References, all fetched 2026-10-16:
 //! - NESdev "PPU registers" -- register bits, the v/t/x/w internal registers,
@@ -125,10 +125,14 @@ fn palette_index(addr: u16) -> usize {
 pub struct Ppu {
     vram: [u8; 2048],
     palette: [u8; 32],
-    /// The cartridge carries 8 KiB of CHR **RAM** that the game uploads tile
-    /// data into at boot, and CHR RAM is PPU-bus memory the PPU fetches from
-    /// every dot, so the PPU owns it and `Cartridge` holds PRG only.
-    chr: [u8; 8192],
+    /// The cartridge carries 16 KiB of CHR ROM (two 8 KiB banks), and pattern
+    /// memory is PPU-bus memory the PPU fetches from every dot, so the PPU holds
+    /// the banks and `Cartridge` keeps the bytes and the register that swaps them.
+    chr: [u8; 16384],
+    /// Which 8 KiB bank is mapped at `$0000-$1FFF`. Mapper 66's `xxPPxxCC`
+    /// register puts it in bits 1-0, and the game flips it mid-frame to show
+    /// both games' logos at once.
+    chr_bank: usize,
     /// Power-on OAM is dynamic RAM with no defined contents, and Y = $FF is the
     /// documented way to hide a sprite ("Hide a sprite by moving it down
     /// offscreen, by writing any values between #$EF-#$FF here"). Filling it
@@ -237,7 +241,8 @@ impl Ppu {
         Ppu {
             vram: [0; 2048],
             palette: [0; 32],
-            chr: [0; 8192],
+            chr: [0; 16384],
+            chr_bank: 0,
             oam: [0xFF; 256],
             secondary_oam: [0; 32],
             secondary_sprite0: [false; 8],
@@ -468,10 +473,11 @@ impl Ppu {
     /// higher-priority one is the sprite sitting behind an opaque background
     /// pixel, which is the "sprite priority quirk" the same page describes.
     fn draw_sprite_pixel(&mut self, x: u32, bg: u8) {
-        // Bit 3 off, or the leftmost 8 pixels clipped, means no sprite pixels.
-        // NESdev puts no sprite-0 hit at x=0..7 while either clip window is
-        // enabled, so returning without touching the flag is right here.
-        if self.mask & 0x04 == 0 || (x < 8 && self.mask & 0x02 == 0) {
+        // PPUMASK is `BGRs bMmG` (NESdev "PPU registers"): bit 4 (`s`) enables
+        // sprites, bit 2 (`M`) shows them in the leftmost 8 pixels. NESdev puts
+        // no sprite-0 hit at x=0..7 while either clip window is enabled, so
+        // returning without touching the flag is right here.
+        if self.mask & 0x10 == 0 || (x < 8 && self.mask & 0x04 == 0) {
             return;
         }
         for s in self.sprites {
@@ -609,10 +615,7 @@ impl Ppu {
                 fine
             };
             let addr = self.sprite_pattern_address(tile, row);
-            let (lo, hi) = (
-                self.chr[addr as usize & 0x1FFF],
-                self.chr[(addr + 8) as usize & 0x1FFF],
-            );
+            let (lo, hi) = (self.chr[self.crbank(addr)], self.chr[self.crbank(addr + 8)]);
             let (lo, hi) = if attr & 0x40 != 0 {
                 (lo.reverse_bits(), hi.reverse_bits())
             } else {
@@ -674,7 +677,7 @@ impl Ppu {
             0x0000
         };
         let addr = base + self.fetch.tile as u16 * 16 + ((self.v >> 12) & 7) + plane;
-        self.chr[addr as usize & 0x1FFF]
+        self.chr[self.crbank(addr)]
     }
 
     /// The backdrop is palette RAM `$3F00`: a stock NES grounds the EXT pins,
@@ -769,12 +772,12 @@ impl Ppu {
                 // access performs the shadowed nametable read underneath it.
                 if addr >= 0x3F00 {
                     let value = self.palette[palette_index(addr)] & 0x3F;
-                    self.read_buffer = self.vram[vram_index(addr)];
+                    self.read_buffer = self.ppu_bus_read(addr);
                     self.increment_v();
                     return value;
                 }
                 let value = self.read_buffer;
-                self.read_buffer = self.vram[vram_index(addr)];
+                self.read_buffer = self.ppu_bus_read(addr);
                 self.increment_v();
                 value
             }
@@ -841,10 +844,38 @@ impl Ppu {
         }
     }
 
+    /// The `$2007` read buffer is filled from PPU memory: pattern memory below
+    /// `$2000`, nametable RAM above it (palette RAM is handled by the caller).
+    fn ppu_bus_read(&self, addr: u16) -> u8 {
+        if addr < 0x2000 {
+            self.chr[self.crbank(addr)]
+        } else {
+            self.vram[vram_index(addr)]
+        }
+    }
+
     /// `$2007` advances `v` by 1, or by 32 when `$2000` bit 2 is set.
     fn increment_v(&mut self) {
         let step = if self.ctrl & 0x04 != 0 { 32 } else { 1 };
         self.v = self.v.wrapping_add(step) & 0x7FFF;
+    }
+
+    /// Index into the whole CHR ROM for a `$0000-$1FFF` pattern address, via the
+    /// bank the mapper's register currently maps there.
+    fn crbank(&self, addr: u16) -> usize {
+        self.chr_bank * 8192 + (addr as usize & 0x1FFF)
+    }
+
+    /// Map a different 8 KiB CHR bank at `$0000-$1FFF`. The bus calls this after
+    /// every cartridge write, because the CHR bits live in the same register as
+    /// the PRG ones.
+    pub fn set_chr_bank(&mut self, bank: usize) {
+        self.chr_bank = bank;
+    }
+
+    /// The CHR ROM image, which the `Cartridge` parsed out of the file.
+    pub fn load_chr_rom(&mut self, data: &[u8]) {
+        self.chr.copy_from_slice(data);
     }
 }
 
@@ -880,7 +911,7 @@ impl Ppu {
     /// Write one byte of CHR RAM. The game does this through the PPU bus too,
     /// but the bus does not exist yet, so the tests go in through this door.
     fn chr_write_for_test(&mut self, addr: u16, val: u8) {
-        self.chr[(addr as usize) & 0x1FFF] = val;
+        self.chr[self.crbank(addr)] = val;
     }
 
     /// Point nametable tile `(x, y)` at `tile` and give it `palette` through the
@@ -1081,6 +1112,56 @@ mod tests {
         for x in 8..16 {
             assert_eq!(p.pixel(x, 0), BACKDROP, "tile bled past its 8 pixels");
         }
+    }
+
+    /// Mapper 66's register bits 1-0 pick which 8 KiB CHR bank is mapped at
+    /// `$0000-$1FFF`, and the game flips that bank mid-frame to show both
+    /// games' logos on the title screen at once. The nametable is identical
+    /// either way -- here bank 0's tile 0 is solid colour 1 and bank 1's copy of
+    /// the same 16 bytes is all zero -- so only the picture can say which bank
+    /// is mapped.
+    #[test]
+    fn the_chr_bank_register_decides_which_8_kib_pattern_table_is_fetched() {
+        let mut chr = [0u8; 16384];
+        for row in 0..8 {
+            chr[row] = 0xFF; // bank 0, tile 0 low plane: opaque, colour 1
+        }
+        for bank in 0..2 {
+            let mut p = Ppu::new();
+            p.load_chr_rom(&chr);
+            p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
+            p.write_vram_for_test(0x3F01, 0x30); // colour 1 = white
+            p.upload_tile_for_test(0, 0x00, 0x00, 0); // tile 0 at (0, 0)
+            p.set_chr_bank(bank);
+            show(&mut p, 0, 0);
+            p.run_to(&[0]);
+            let want = if bank == 0 { 0x00_FF_FF_FF } else { BACKDROP };
+            for x in 0..8u32 {
+                assert_eq!(p.pixel(x, 0), want, "CHR bank {bank}: x={x}");
+            }
+        }
+    }
+
+    /// `$2001` is `BGRs bMmG`: bit 4 (`s`) is the sprite enable and bit 2 (`M`)
+    /// only lets sprites into the leftmost 8 pixels. The game writes `$18` at
+    /// boot to show both layers, and a PPU that reads the enable as bit 2 shows
+    /// no sprite at all -- on any scanline, not just a clipped one.
+    #[test]
+    fn bit_4_of_2001_is_the_sprite_enable() {
+        let mut p = Ppu::new();
+        p.setup_sprite0_over_background_for_test(100, 0xFF);
+        p.cpu_write(0x2001, 0x18); // bg + sprites, nothing clipped
+        p.run_to(&[21]);
+        assert_eq!(
+            p.pixel(100, 21),
+            0x00_4A_9F_FF,
+            "bit 4 alone must switch the sprite layer on"
+        );
+        assert_eq!(
+            p.pixel(60, 21),
+            0x00_FF_FF_FF,
+            "bit 3 alone must switch the background layer on"
+        );
     }
 
     /// Turn rendering on at a scroll position. Call this LAST: `$2006`/`$2007`
@@ -2088,10 +2169,10 @@ mod tests {
             !p.sprite0_hit(),
             "a clipped leftmost column cannot produce a sprite-0 hit"
         );
-        // $1C is $1E without bit 1: only the BACKGROUND is clipped, but the
-        // left-side window still covers the sprite layer, which is the other
-        // half of NESdev's "bit 2 or bit 1 of PPUMASK is 0" -- and the reason
-        // the sprite-0 hit cannot happen at x=0..7 in either case.
+        // $1C is $1E without bit 1 (`b`): only the BACKGROUND is clipped, and
+        // sprites keep bit 2 (`M`), so the sprite is drawn over the backdrop at
+        // x=0..7. The sprite-0 hit still cannot happen there, because NESdev
+        // puts that at x=0..7 whenever EITHER clip window is enabled.
         let mut p = Ppu::new();
         p.setup_sprite0_over_background_for_test(0, 0xFF);
         p.cpu_write(0x2001, 0x1C);
@@ -2099,8 +2180,8 @@ mod tests {
         for x in 0..8u32 {
             assert_eq!(
                 p.pixel(x, 21),
-                BACKDROP,
-                "x={x} is inside the left-side window and must be clipped"
+                0x00_4A_9F_FF,
+                "x={x}: sprites are not clipped, so the sprite wins over the backdrop"
             );
         }
         assert!(

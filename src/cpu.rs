@@ -476,13 +476,17 @@ impl Cpu {
                 self.pc = self.pc.wrapping_add(1);
                 (self.fetch16(bus, zp as u16), false)
             }
+            // `(zp),Y`: ONE operand byte. The 16-bit pointer is the word at
+            // `$Z` and `$Z+1`, wrapping INSIDE the zero page -- `$FF` takes its
+            // high byte from `$00`, never from `$0100` -- and Y is added after.
+            // The wrap is why this does not call `fetch16`, whose high-byte read
+            // is a plain `at + 1`.
             Mode::IndY => {
-                // Two operand bytes: the zero-page pointer and the Y index.
-                // The index is an operand byte, NOT the Y register.
-                let ptr = bus.read(self.pc) as u16;
-                let idx = bus.read(self.pc.wrapping_add(1));
-                self.pc = self.pc.wrapping_add(2);
-                index(self.fetch16(bus, ptr), idx)
+                let zp = bus.read(self.pc);
+                self.pc = self.pc.wrapping_add(1);
+                let ptr =
+                    bus.read(zp as u16) as u16 | (bus.read(zp.wrapping_add(1) as u16) as u16) << 8;
+                index(ptr, self.y)
             }
             Mode::Ind => (self.next16(bus), false),
         }
@@ -660,23 +664,23 @@ mod tests {
         }
     }
 
-    /// Where `cycles*` puts a program. $12FE and not $0000, because
-    /// `LDA ($12FF),Y` reads its pointer back out of the zero page, and at
-    /// $12FE the instruction's own operand bytes ARE that pointer -- so the
-    /// page-crossing case needs no extra memory setup.
+    /// Where `cycles*` puts a program. `$12FE` and not `$0000`, because the
+    /// page-crossing absolute cases want an operand byte of `$FF` on a `$12`
+    /// base -- the program's last byte is its own operand.
     const PROG: u16 = 0x12FE;
 
-    /// The zero page at `$00FF`/`$0100` holds `$01F0`, so the brief's
-    /// `LDA ($12FF),Y` case -- whose second operand byte is the index $12 --
-    /// is the page crossing it claims to be: `$01F0 + $12 = $0202`. Without it
-    /// a zero-page pointer of zeros never crosses and the test would be
-    /// measuring nothing.
+    /// The zero page at `$00FF`/`$0000` holds `$01F0` (the high byte wrapped
+    /// inside the page, which is where `(zp),Y` reads it from). So
+    /// `LDA ($FF),Y` with Y = $10 is the page crossing: `$01F0 + $10 = $0200`.
     const ZP_PTR: u16 = 0x00FF;
     const ZP_PTR_VALUE: [u8; 2] = [0xF0, 0x01];
 
     fn cycles_at(x: u8, y: u8, program: &[u8]) -> u8 {
         let mut bus = TestBus::new();
-        load(&mut bus, ZP_PTR, &ZP_PTR_VALUE);
+        // The pointer at $00FF/$0000: the high byte goes in the byte `(zp)+1`
+        // really wraps to, which is $00 and not $0100.
+        bus.write(ZP_PTR, ZP_PTR_VALUE[0]);
+        bus.write(0x0000, ZP_PTR_VALUE[1]);
         load(&mut bus, PROG, program);
         let mut c = Cpu::new();
         c.pc = PROG;
@@ -700,12 +704,10 @@ mod tests {
         assert_eq!(cycles(b"\xAD\x34\x12"), 4); // LDA $1234
                                                 // absolute,X with a page crossing costs one more
         assert_eq!(cycles(b"\xBD\xFF\x12"), 5); // LDA $12FF,X
-                                                // indirect,Y with a page crossing costs one more
-                                                // The brief pairs these bytes with 6, but B9 is LDA abs,Y: 4 base, 5
-                                                // crossed, and 6 is unreachable for that opcode. B1 is the indirect,Y
-                                                // form its comment describes and it takes the brief's 6; both run, so
-                                                // neither reading of the case is lost.
-        assert_eq!(cycles(b"\xB1\xFF\x12"), 6); // LDA ($FF),Y: $01F0 + $12
+                                                // (zp),Y: 5 cycles, 6 on a page cross
+        assert_eq!(cycles_at(0, 0x10, b"\xB1\xFF"), 6); // pointer $01F0 + $10 = $0200
+        assert_eq!(cycles_at(0, 0x01, b"\xB1\xFF"), 5); // pointer $01F0 + $01 = $01F1
+                                                        // absolute,Y for comparison
         assert_eq!(cycles(b"\xB9\xFF\x12"), 5); // LDA $12FF,Y -> $1300
                                                 // stores always take the base count, crossing or not
         assert_eq!(cycles(b"\x9D\xFF\x12"), 5); // STA $12FF,X
@@ -755,31 +757,54 @@ mod tests {
         assert_eq!(c.pc, 0x1171);
     }
 
+    /// `(zp),Y` has ONE operand byte and indexes with the Y REGISTER. The
+    /// distinguishing part is the wrap: the pointer is the word at `$Z`/`$Z+1`
+    /// taken inside the zero page, so `$FF` reads its high byte from `$00` and
+    /// never from `$0100`. Here the pointer is `$20FF` and `$0100` is bait.
     #[test]
-    fn indirect_y_indexes_with_the_operand_byte_not_the_y_register() {
-        // ($12),Y spends three bytes and takes the Y byte as an immediate
-        // operand, not from the register. Both are wired up here, so a CPU
-        // that reads the register instead lands somewhere else entirely.
+    fn indirect_y_is_one_operand_byte_and_its_pointer_wraps_inside_the_zero_page() {
         let mut bus = TestBus::new();
-        load(&mut bus, 0x2000, &[0xB1, 0x00, 0x03]); // LDA ($00),Y
-        bus.write(0x0000, 0x00); // the zero-page pointer: $0000
-        bus.write(0x0001, 0x00);
-        bus.write(0x0003, 0x11); // $0000 + $03, the operand byte
-        bus.write(0x0030, 0x22); // $0000 + $30, what Y would have fetched
+        load(&mut bus, 0x2000, &[0xB1, 0xFF]); // LDA ($FF),Y -- two bytes
+        bus.write(0x00FF, 0xFF); // pointer low byte
+        bus.write(0x0000, 0x20); // pointer high byte: ($FF)+1 wraps to $00
+        bus.write(0x0100, 0x30); // NOT the high byte: this is what a CPU that
+                                 // failed to wrap would read instead
+        bus.write(0x2100, 0x77); // $20FF + Y
+        bus.write(0x30FF, 0x88); // and this is what that CPU would fetch
         let mut c = Cpu::new();
         c.pc = 0x2000;
-        c.y = 0x30;
-        assert_eq!(c.step(&mut bus), 5);
-        assert_eq!(c.a, 0x11, "the index came from the operand byte");
-        assert_eq!(c.pc, 0x2003, "three bytes consumed");
+        c.y = 0x01;
+        assert_eq!(c.step(&mut bus), 6, "$20FF + $01 crosses a page");
+        assert_eq!(c.a, 0x77, "the pointer's high byte came from $0000");
+        assert_eq!(c.pc, 0x2002, "two bytes consumed, not three");
+    }
+
+    /// The index is the Y register, never a second operand byte: `$2001` here
+    /// is the low byte of the pointer, and both $3005 (Y) and $3010 (what an
+    /// invented immediate-indexed-Y would fetch) are loaded so either reading
+    /// of the mode is caught.
+    #[test]
+    fn indirect_y_indexes_with_the_y_register_and_costs_five_cycles() {
+        let mut bus = TestBus::new();
+        load(&mut bus, 0x2000, &[0xB1, 0x10]); // LDA ($10),Y
+        bus.write(0x0010, 0x00);
+        bus.write(0x0011, 0x30); // pointer $3000
+        bus.write(0x3005, 0x5A); // what Y = 5 fetches
+        bus.write(0x3010, 0x66); // what an operand-byte index of $10 would fetch
+        let mut c = Cpu::new();
+        c.pc = 0x2000;
+        c.y = 0x05;
+        assert_eq!(c.step(&mut bus), 5, "$3000 + $05 crosses nothing");
+        assert_eq!(c.a, 0x5A, "the index came from the Y register");
+        assert_eq!(c.pc, 0x2002, "two bytes consumed, not three");
     }
 
     #[test]
     fn an_index_that_does_not_cross_a_page_gets_no_penalty() {
         assert_eq!(cycles(b"\xBD\xFE\x12"), 4); // LDA $12FE,X -> $12FF
         assert_eq!(cycles_at(0, 0, b"\xBD\xFF\x12"), 4); // X = 0 never crosses
-                                                         // (zp),Y: pointer $0000, index $01 -> $0001, still page $00.
-        assert_eq!(cycles_at(0, 0, b"\xB1\x00\x01"), 5);
+                                                         // (zp),Y: pointer $0000, Y = $10 -> $0010, still page $00.
+        assert_eq!(cycles_at(0, 0x10, b"\xB1\x00"), 5);
     }
 
     /// Runs one `ADC #v` / `SBC #v` and returns the flags it left behind as
