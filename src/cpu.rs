@@ -87,7 +87,7 @@ const CYCLES: [u8; 256] = [
       2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 50
       6,  6,  1,  1,  1,  3,  5,  1,  4,  2,  2,  1,  5,  4,  6,  1, // 60
       2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 70
-      2,  6,  1,  1,  3,  3,  3,  1,  2,  1,  2,  1,  4,  4,  4,  1, // 80
+      1,  6,  1,  1,  3,  3,  3,  1,  2,  1,  2,  1,  4,  4,  4,  1, // 80
       2,  6,  1,  1,  4,  4,  4,  1,  2,  5,  2,  1,  1,  5,  1,  1, // 90
       2,  6,  2,  1,  3,  3,  3,  1,  2,  2,  2,  1,  4,  4,  4,  1, // a0
       2,  5,  1,  1,  4,  4,  4,  1,  2,  4,  2,  1,  4,  4,  4,  1, // b0
@@ -105,21 +105,21 @@ const CYCLES: [u8; 256] = [
 #[rustfmt::skip]
 const MODE: [Mode; 256] = [
     M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Imp, // 00
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 01
-    M::Abs,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::AbsX, M::Abs,  M::Abs,  M::Imp, // 02
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 03
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 04
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 05
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Ind,  M::Abs,  M::Abs,  M::Imp, // 06
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 07
-    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 08
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp, // 09
-    M::Imm,  M::IndX, M::Imm,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 0a
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::AbsY, M::Imp, // 0b
-    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 0c
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 0d
-    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 0e
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 0f
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 10
+    M::Abs,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::AbsX, M::Abs,  M::Abs,  M::Imp, // 20
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 30
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 40
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 50
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Ind,  M::Abs,  M::Abs,  M::Imp, // 60
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 70
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 80
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp, // 90
+    M::Imm,  M::IndX, M::Imm,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // a0
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::AbsY, M::Imp, // b0
+    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // c0
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // d0
+    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // e0
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // f0
 ];
 use Mode as M;
 
@@ -860,6 +860,52 @@ mod tests {
         assert_eq!(cycles(b"\x2C\xFF\x12"), 5); // BIT $12FF,X -> $1300
         assert_eq!(cycles(b"\x2C\x00\x12"), 4); // BIT $1200,X -> $1201
         assert_eq!(cycles(b"\x24\x00"), 3); // BIT $00: zero page wraps, never crosses
+    }
+
+    #[test]
+    fn and_immediate_consumes_two_bytes_and_two_cycles() {
+        // $29's mode is the byte after it. A `MODE[$29]` of `Acc` or `Imp` makes
+        // `operand` hand the instruction stream back unadvanced, so the operand
+        // is then executed as the next opcode and the stream desyncs.
+        let mut bus = TestBus::new();
+        load(&mut bus, 0x2000, &[0x29, 0x3C, 0xEA]); // AND #$3C, then a NOP
+        let mut c = Cpu::new();
+        c.pc = 0x2000;
+        c.a = 0xFF; // so the AND is visible: $FF & $3C = $3C
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.pc, 0x2002, "PC is past the operand");
+        assert_eq!(c.a, 0x3C);
+    }
+
+    #[test]
+    fn every_documented_immediate_opcode_consumes_two_bytes() {
+        // $29 was one cell of a family. Every documented immediate opcode spends
+        // its operand byte and costs two cycles.
+        for op in [
+            0x09, 0x29, 0x49, 0x69, 0xE9, 0xC9, // ORA AND EOR ADC SBC CMP
+            0xA9, 0xA2, 0xA0, // LDA LDX LDY
+            0xE0, 0xC0, // CPX CPY
+        ] {
+            let mut bus = TestBus::new();
+            load(&mut bus, 0x2000, &[op, 0x5A, 0xEA]);
+            let mut c = Cpu::new();
+            c.pc = 0x2000;
+            assert_eq!(c.step(&mut bus), 2, "opcode ${op:02X}");
+            assert_eq!(c.pc, 0x2002, "opcode ${op:02X} left the operand behind");
+        }
+    }
+
+    #[test]
+    fn and_absolute_costs_four_cycles_and_three_bytes() {
+        let mut bus = TestBus::new();
+        load(&mut bus, 0x2000, &[0x2D, 0x00, 0x03, 0xEA]); // AND $0300, then a NOP
+        bus.write(0x0300, 0x5A);
+        let mut c = Cpu::new();
+        c.pc = 0x2000;
+        c.a = 0xFF; // so the AND is visible: $FF & $5A = $5A
+        assert_eq!(c.step(&mut bus), 4);
+        assert_eq!(c.pc, 0x2003, "PC is past both operand bytes");
+        assert_eq!(c.a, 0x5A);
     }
 
     #[test]
