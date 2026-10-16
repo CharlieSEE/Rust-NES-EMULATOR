@@ -120,6 +120,12 @@ impl Bus {
         }
     }
 
+    /// Whether an OAM DMA is mid-stall, i.e. whether the CPU must not execute
+    /// an instruction. `tick` is what drains it.
+    pub fn dma_busy(&self) -> bool {
+        self.dma_stall > 0
+    }
+
     /// Advance the PPU by **one dot**. `Cpu::step` calls `tick` three times per
     /// cycle it consumes (see `BusLike`), and SMB's sprite-0 hit depends on
     /// that ratio, so nothing here may add a factor of three.
@@ -535,6 +541,23 @@ mod tests {
             assert!(ticks < 200_000, "frame never completed");
         }
         assert_eq!(ticks, 341 + 241 * 341 + 2);
+    }
+
+    /// The stall is what the run loop gates the CPU on, so it has to be
+    /// observable from outside: true the instant `$4014` is written, false the
+    /// moment the last counted cycle has been ticked away, and false before any
+    /// DMA at all.
+    #[test]
+    fn dma_busy_is_set_by_a_4014_write_and_cleared_when_the_stall_drains() {
+        let mut b = Bus::new(blank_cart());
+        assert!(!b.dma_busy(), "no DMA has run, so the CPU is not stalled");
+        b.write_dma_from(0x0200);
+        assert!(b.dma_busy(), "$4014 must stall the CPU");
+        while b.dma_busy() {
+            b.tick();
+        }
+        assert!(!b.dma_busy(), "the stall drained, so the CPU runs again");
+        assert_eq!(b.dma_cycles_remaining(), 0);
     }
 
     #[test]

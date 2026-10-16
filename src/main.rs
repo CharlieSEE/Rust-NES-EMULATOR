@@ -11,17 +11,30 @@ use bus::Bus;
 use cpu::Cpu;
 use rom::Cartridge;
 
-/// The cartridge this emulator is built for, next to `Cargo.toml`.
-const ROM_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/Super Mario Bros. + Duck Hunt (USA).nes"
-);
-
 const W: usize = 256;
 const H: usize = 240;
 const SCALE: u32 = 3;
 
+/// Where `--dump N` writes its frame.
+const DUMP_PATH: &str = "frame.ppm";
+
+const USAGE: &str = "usage: nes <rom.nes> [--dump N]\n\
+    \x20 <rom.nes>  the cartridge to boot, quoted if it has spaces\n\
+    \x20 --dump N   after N frames write frame.ppm and exit (no extra dependency)";
+
 fn main() -> Result<(), String> {
+    let mut args = ::std::env::args().skip(1);
+    let rom_path = args.next().ok_or_else(|| USAGE.to_string())?;
+    let dump_after: Option<u32> = match args.next().as_deref() {
+        None => None,
+        Some("--dump") => Some(
+            args.next()
+                .and_then(|n| n.parse().ok())
+                .ok_or_else(|| format!("--dump needs a frame count\n{USAGE}"))?,
+        ),
+        Some(other) => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
+    };
+
     let sdl = sdl2::init().map_err(|e| e.to_string())?;
     let video = sdl.video().map_err(|e| e.to_string())?;
     let window = video
@@ -45,7 +58,7 @@ fn main() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    let bytes = ::std::fs::read(ROM_PATH).map_err(|e| format!("{}: {e}", ROM_PATH))?;
+    let bytes = ::std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut bus = Bus::new(Cartridge::load(&bytes)?);
     let mut cpu = Cpu::new();
     bus.reset();
@@ -70,6 +83,7 @@ fn main() -> Result<(), String> {
 
     let mut buttons = 0u8;
     let mut running = true;
+    let mut frames = 0u32;
     while running {
         for event in events.poll_iter() {
             match event {
@@ -101,6 +115,12 @@ fn main() -> Result<(), String> {
         // its NMI handler on `$2002`, so this is where the machine actually
         // lives; Task 7 takes the timing and audio from here.
         while !bus.ppu.frame_ready() {
+            // An OAM DMA halts the CPU for its 513 cycles while the PPU keeps
+            // clocking; `tick` is one dot, so three of them per cycle drain it.
+            if bus.dma_busy() {
+                bus.tick();
+                continue;
+            }
             cpu.step(&mut bus);
             if bus.ppu.nmi_pending() {
                 bus.ppu.take_nmi();
@@ -126,6 +146,11 @@ fn main() -> Result<(), String> {
         // two.
         let _ = bus.ppu.take_frame();
         let frame = bus.ppu.framebuffer();
+        frames += 1;
+        if dump_after == Some(frames) {
+            write_ppm(DUMP_PATH, frame)?;
+            return Ok(());
+        }
         // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
         // all len*4 bytes of the frame are valid to read as u8.
         let frame_bytes =
@@ -141,4 +166,19 @@ fn main() -> Result<(), String> {
         ::std::thread::sleep(::std::time::Duration::from_micros(16_667));
     }
     Ok(())
+}
+
+/// One framebuffer pixel is `0x00RRGGBB` (see `Ppu::colour`), and binary PPM
+/// `P6` wants three bytes per pixel in R, G, B order, so the only work is
+/// dropping the byte the mask left clear. Convert to PNG outside the crate --
+/// `sdl2` is the only dependency this project has.
+fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
+    let rgb: Vec<u8> = frame
+        .iter()
+        .flat_map(|&px| [(px >> 16) as u8, (px >> 8) as u8, px as u8])
+        .collect();
+    let mut out = Vec::with_capacity(rgb.len() + 32);
+    out.extend_from_slice(format!("P6\n{W} {H}\n255\n").as_bytes());
+    out.extend_from_slice(&rgb);
+    ::std::fs::write(path, out).map_err(|e| format!("{path}: {e}"))
 }
