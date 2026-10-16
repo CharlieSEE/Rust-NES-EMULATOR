@@ -143,6 +143,11 @@ pub struct Ppu {
     /// (0,0) for any test that renders a frame without touching OAM.
     oam: [u8; 256],
     secondary_oam: [u8; 32],
+    /// Which of the eight secondary-OAM slots hold OAM entry 0. Secondary OAM
+    /// fills COMPACTLY -- "the OAM data for each sprite found to be within range
+    /// is copied into the secondary OAM" -- so a slot's index says nothing about
+    /// which sprite it is, and the sprite-0 hit has to be told explicitly.
+    secondary_sprite0: [bool; 8],
     ctrl: u8,
     mask: u8,
     status: u8,
@@ -180,23 +185,25 @@ pub struct Ppu {
     attr_cur: u8,
     /// The eight sprite output units holding the data for the scanline being
     /// drawn. Loaded at dot 257 of the previous scanline (hardware spreads it
-    /// over dots 257-320) and indexed in OAM order, because the 2C02
-    /// reference says priority is "passed to the next serializer" and so
-    /// unit 0 wins wherever sprites overlap. Unit 0 is sprite 0 whenever
-    /// sprite 0 is in range, which is what the sprite-0 hit needs.
+    /// over dots 257-320) and indexed in OAM order, because the 2C02 reference
+    /// says priority is "passed to the next serializer" and so unit 0 wins
+    /// wherever sprites overlap. Evaluation fills them COMPACTLY, so a unit's
+    /// index is not its OAM index: `is_sprite0` says which one is sprite 0.
     sprites: [Sprite; 8],
 }
 
 /// One sprite output unit: the X counter the 2C02 reference describes, the two
-/// pattern bytes it serialises, and the attribute bits. A unit with no sprite
-/// keeps `lo` and `hi` at 0, which is the "completely transparent bitmap
-/// patterns" the hardware loads into the unused slots.
+/// pattern bytes it serialises, the attribute bits, and whether this unit is
+/// sprite 0. A unit with no sprite keeps `lo` and `hi` at 0, which is the
+/// "completely transparent bitmap patterns" the hardware loads into the unused
+/// slots.
 #[derive(Clone, Copy, Default)]
 struct Sprite {
     x: u8,
     lo: u8,
     hi: u8,
     attr: u8,
+    is_sprite0: bool,
 }
 
 impl Sprite {
@@ -238,6 +245,7 @@ impl Ppu {
             chr: [0; 8192],
             oam: [0xFF; 256],
             secondary_oam: [0; 32],
+            secondary_sprite0: [false; 8],
             ctrl: 0,
             mask: 0,
             status: 0,
@@ -486,14 +494,26 @@ impl Ppu {
             self.framebuffer[y] = self.colour(self.palette[palette_index(palette)]);
             break;
         }
-        // Sprite 0 hit. Output unit 0 IS sprite 0 whenever sprite 0 is in range,
-        // so the condition is that unit's pixel and the background's, both
-        // non-zero, at neither of the two dots the pipeline cannot report it:
-        // "Sprite 0 hit cannot detect collision at X=255, nor anywhere where
-        // either sprites or backgrounds are disabled via PPUMASK", plus x=0,
-        // which this PPU suppresses every frame rather than only while a clip
-        // window is enabled. SMB's HUD split is timed off this flag.
-        if self.sprites[0].pixel(x) != 0 && bg != 0 && x != 0 && x != 255 && self.status & 0x40 == 0
+        // Sprite-0 hit (NESdev "PPU OAM" -> Sprite 0 hits): "when an opaque
+        // pixel of sprite 0 overlaps an opaque pixel of the background". The
+        // unit carries an explicit is_sprite0 flag because evaluation fills
+        // secondary OAM compactly, so unit 0 is only sprite 0 when sprite 0 was
+        // found first in range.
+        //
+        // Two dots cannot report it, and only two. x = 255 never can: NESdev
+        // says it is "an obscure reason related to the pixel pipeline",
+        // unconditional. x = 0..7 can, unless a left-side clipping window is
+        // enabled -- "sprite 0 hit does not happen at x=0 to x=7 if the
+        // left-side clipping window is enabled (if bit 2 or bit 1 of PPUMASK
+        // ($2001) is 0)" -- and that is exactly the `return` at the top of this
+        // function: bit 2 clear means no sprite pixel anywhere, bit 1 clear means
+        // none for x < 8. SMB's HUD split is timed off this flag and its status
+        // bar sprite sits at x = 0, so x = 0 suppressing unconditionally was a
+        // live timing deviation, not a shortcut.
+        if bg != 0
+            && x != 255
+            && self.status & 0x40 == 0
+            && self.sprites.iter().any(|s| s.is_sprite0 && s.pixel(x) != 0)
         {
             self.status |= 0x40;
         }
@@ -508,39 +528,65 @@ impl Ppu {
         }
     }
 
-    /// Sprite evaluation for the NEXT scanline: secondary OAM is refilled with
-    /// the first eight OAM entries in range, in OAM address order, and a ninth
-    /// in-range entry raises the overflow flag.
+    /// Sprite evaluation for the NEXT scanline: the first eight OAM entries in
+    /// range are copied into secondary OAM COMPACTLY, and a ninth in-range entry
+    /// raises the overflow flag and stops. "Compactly" is the whole point: the
+    /// eight-sprite cap and the destination slot both count sprites FOUND, not
+    /// their OAM index, so eight in-range sprites at OAM 20..27 are all drawn
+    /// and raise nothing, and unit 0 is only sprite 0 when sprite 0 was found
+    /// first -- which is what `secondary_sprite0` records.
     ///
-    /// The OAM Y coordinate is "scanline coordinate minus one of object's top
-    /// pixel row" (2C02 reference), and an entry is in range when
-    /// `scanline - (y + 1)` lands in 0..8 or 0..16. That comparator is 9 bits
-    /// wide, so y = $F0 and up wraps to a range off the top of the screen,
-    /// which is why writing $EF-$FF there is the documented way to hide a
-    /// sprite.
+    /// In range is the 9-bit comparator, not `y + 1 <= row < y + 1 + height`:
+    /// `scanline - Y` wraps, which is what makes $EF-$FF the documented way to
+    /// hide a sprite. See `in_range`.
     fn evaluate_sprites(&mut self) {
         self.secondary_oam = [0xFF; 32];
+        self.secondary_sprite0 = [false; 8];
         // "Sprite evaluation does not happen on the pre-render scanline.
         // Because evaluation applies to the next line's sprite rendering, no
         // sprites will be rendered on the first scanline" (NESdev "PPU sprite
         // evaluation"). Leaving secondary OAM at $FF makes the pre-render line
-        // load eight transparent units, which is that same outcome.
+        // load eight transparent units, which is that same outcome. It also
+        // matters for the flags: the comparator at the pre-render line sees row
+        // 262, where Y = $FF is 7 rows in range, so evaluating there with the
+        // power-on all-$FF OAM would raise overflow every frame.
         if self.scanline >= VISIBLE_LINES {
             return;
         }
         let next = self.scanline + 1;
-        let height = self.sprite_height();
+        let mut found = 0usize;
         for n in 0..64usize {
-            let top = self.oam[n * 4] as u32 + 1;
-            if next < top || next >= top + height {
+            if !self.in_range(next, self.oam[n * 4]) {
                 continue;
             }
-            if n >= 8 {
+            if found >= 8 {
                 self.status |= 0x20; // sprite overflow, $2002 bit 5
                 return;
             }
-            self.secondary_oam[n * 4..n * 4 + 4].copy_from_slice(&self.oam[n * 4..n * 4 + 4]);
+            self.secondary_oam[found * 4..found * 4 + 4]
+                .copy_from_slice(&self.oam[n * 4..n * 4 + 4]);
+            self.secondary_sprite0[found] = n == 0;
+            found += 1;
         }
+    }
+
+    /// Is an OAM entry with Y `y` in range for screen row `screen_row`?
+    ///
+    /// The OAM Y coordinate is "scanline coordinate minus one of object's top
+    /// pixel row" (2C02 reference), so the in-range rows are `y + 1 ..= y +
+    /// height`. The comparator that produces that range is only NINE bits wide,
+    /// so `screen_row - y` WRAPS modulo 512: an OAM Y of $EF-$FF is far below
+    /// every visible scanline in that arithmetic and lands off the top of the
+    /// screen, which is why NESdev "PPU OAM" documents those values as the way
+    /// to hide a sprite. Without the wrap $FF would be the largest Y and would
+    /// hide nothing.
+    ///
+    /// This same 9-bit comparator output is the 2C02 reference's "range result"
+    /// value, and that is all it is: it is constant across a scanline, so it is
+    /// never a per-row bit and never selects a pattern table.
+    fn in_range(&self, screen_row: u32, y: u8) -> bool {
+        let diff = (screen_row as i32 - y as i32) & 0x1FF;
+        (1..=self.sprite_height() as i32).contains(&diff)
     }
 
     /// Load the eight sprite output units for the NEXT scanline. Hardware
@@ -552,13 +598,13 @@ impl Ppu {
         for i in 0..8usize {
             self.sprites[i] = Sprite::default();
             let o = i * 4;
-            let top = self.secondary_oam[o] as u32 + 1;
-            if next < top || next >= top + height {
+            let y = self.secondary_oam[o];
+            if !self.in_range(next, y) {
                 continue; // an unused slot: transparent, by construction
             }
             let tile = self.secondary_oam[o + 1];
             let attr = self.secondary_oam[o + 2];
-            let fine = (next - top) as u8;
+            let fine = (next - y as u32 - 1) as u8;
             // "Invert the 3/4-bit (8/16 scanlines/object mode) scanline address
             // used to access an object tile": for 8x16 that also exchanges the
             // two halves.
@@ -582,6 +628,7 @@ impl Ppu {
                 lo,
                 hi,
                 attr,
+                is_sprite0: self.secondary_sprite0[i],
             };
         }
     }
@@ -589,14 +636,22 @@ impl Ppu {
     /// The CHR address of row `row` of a sprite's pattern, in units of the LOW
     /// bitplane; the high one is 8 bytes above it (NESdev "PPU rendering").
     ///
-    /// For 8x16 sprites the pattern table comes from the LOW BIT of the tile
-    /// number and the row block from the rest of it, so tile `$02` is `$0020`
-    /// and tile `$03` is `$1020` (NESdev "PPU OAM" -> Sprite pattern tables).
-    /// Rows 8-15 are tile | 1: "If $2000.5 = 1, the MSB of the range result
-    /// value become the LSB of the indexed tile, and the LSB of the tile index
-    /// value determines pattern table selection. The lower 3 bits of the range
-    /// result value are always used as the fine vertical offset into the
-    /// selected pattern" (2C02 technical reference).
+    /// 8x8: the whole tile index, pattern table from `$2000` bit 3.
+    ///
+    /// 8x16: an 8x16 sprite whose top tile is `T` occupies 32 CONTIGUOUS
+    /// bytes -- bank from `T & 1`, block from `(T & 0xFE) * 16`, and the bottom
+    /// half is the next 16 bytes with NO bank change. So tile `$02` is
+    /// `$0020-$003F` inside one bank, NOT `$0020` top and `$1020` bottom
+    /// (NESdev "PPU OAM" -> Sprite pattern tables: `$00: $0000-$001F,
+    /// $01: $1000-$101F, $02: $0020-$003F, $03: $1020-$103F, $FE: $0FE0-$0FFF,
+    /// $FF: $1FE0-$1FFF`).
+    ///
+    /// `row & 7` is the offset inside the half: the 2C02's "lower 3 bits" fine
+    /// vertical offset. The 2C02's "MSB of the range result value become the LSB
+    /// of the indexed tile" describes the internal INDEX (whose low bit then
+    /// selects the table), not the address: the range result is the 9-bit
+    /// `scanline - Y` comparator output, constant across a scanline, so it
+    /// cannot be a per-row bit and cannot pick a pattern table.
     fn sprite_pattern_address(&self, tile: u8, row: u8) -> u16 {
         if self.ctrl & 0x20 == 0 {
             // "$2000 bit 3 applies to 8x8 sprites" (NESdev "PPU pattern
@@ -608,8 +663,10 @@ impl Ppu {
             };
             return base + tile as u16 * 16 + (row & 7) as u16;
         }
-        let tile = if row >= 8 { tile | 1 } else { tile & 0xFE };
-        (tile & 1) as u16 * 0x1000 + (tile & 0xFE) as u16 * 16 + (row & 7) as u16
+        (tile & 1) as u16 * 0x1000
+            + (tile & 0xFE) as u16 * 16
+            + (row & 7) as u16
+            + if row >= 8 { 16 } else { 0 }
     }
 
     /// A background pattern byte for the tile named by the nametable byte just
@@ -896,22 +953,21 @@ impl Ppu {
     /// An opaque background over the whole screen and an opaque 8x16 sprite 0
     /// whose leftmost pixel is at `x`. `bg_row` is the low-plane pattern byte
     /// every background tile shows on every row -- `$FF` opaque everywhere,
-    /// `$80` the leftmost pixel of each tile only, which is how a test can
-    /// make dot 0 the ONE dot where sprite 0 and the background can overlap.
+    /// `$00` transparent everywhere, `$80` the leftmost pixel of each tile only.
     ///
     /// Ends by writing `$2000` and `$2005`, so a test only has to add the
     /// `$2001` write (see `show`).
     fn setup_sprite0_over_background_for_test(&mut self, x: u8, bg_row: u8) {
-        // Background is tile 0 at $0000; sprite 0 is tile $02, whose 8x16
-        // top half is $0020 and whose bottom half is tile $03 at $1020. They
+        // Background is tile 0 at $0000; sprite 0 is tile $02, whose 8x16 top
+        // half is $0020 and whose bottom half is the next 16 bytes, $0030. They
         // must not share CHR or one would colour the other.
         for row in 0..8u16 {
             self.chr_write_for_test(row, bg_row);
             self.chr_write_for_test(row + 8, 0x00);
             self.chr_write_for_test(0x0020 + row, 0xFF);
             self.chr_write_for_test(0x0028 + row, 0x00);
-            self.chr_write_for_test(0x1020 + row, 0xFF);
-            self.chr_write_for_test(0x1028 + row, 0x00);
+            self.chr_write_for_test(0x0030 + row, 0xFF);
+            self.chr_write_for_test(0x0038 + row, 0x00);
         }
         for r in 0..30u8 {
             for c in 0..32u8 {
@@ -1050,16 +1106,15 @@ mod tests {
     }
 
     /// Sprite tile `$02` -- the top half of an 8x16 sprite -- in colour 1, and
-    /// its bottom half, tile `$03` at `$1020`, in colour 2. Which half of the
-    /// sprite a screen row shows then says which pattern table it was fetched
-    /// from. NESdev "PPU OAM" -> Sprite pattern tables: `$02: $0020-$003F`,
-    /// `$03: $1020-$103F`.
+    /// its bottom half, the next 16 bytes at `$0030`, in colour 2. Which half of
+    /// the sprite a screen row shows then says which half was fetched. NESdev
+    /// "PPU OAM" -> Sprite pattern tables: `$02: $0020-$003F`, ONE bank.
     fn two_colour_sprite(p: &mut Ppu) {
         for row in 0..8u16 {
             p.chr_write_for_test(0x0020 + row, 0xFF); // colour 1
             p.chr_write_for_test(0x0028 + row, 0x00);
-            p.chr_write_for_test(0x1020 + row, 0x00);
-            p.chr_write_for_test(0x1028 + row, 0xFF); // colour 2
+            p.chr_write_for_test(0x0030 + row, 0x00);
+            p.chr_write_for_test(0x0038 + row, 0xFF); // colour 2
         }
         p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
         p.write_vram_for_test(0x3F01, 0x30); // colour 1 = $FFFFFF
@@ -1572,55 +1627,40 @@ mod tests {
 
     // ---------------------------------------------------------------- sprites
 
-    /// The 8x16 pattern address, straight off NESdev's OAM memory map: the low
-    /// bit of the tile number picks the pattern TABLE and the rest picks the
-    /// row block, so tile `$02` is `$0020` and tile `$03` is `$1020`.
+    /// The 8x16 pattern address, straight off NESdev's OAM memory map: an 8x16
+    /// sprite whose top tile is `T` occupies 32 CONTIGUOUS bytes -- the bank is
+    /// `T & 1`, the block is `(T & 0xFE) * 16`, and the bottom half is the next
+    /// 16 bytes with NO bank change.
     ///
-    /// The brief's formula, `0x1000 + (tile & 1) * 0x1000 + ((tile >> 1) * 16
-    /// + fine_y) % 256`, is wrong on both terms: it adds `$1000` to every 8x16
-    /// sprite and it shifts the row block down, which puts tile `$02` in
-    /// `$1010` and tile `$FF` in `$20F8` -- off the top of CHR entirely. This
-    /// test is the map from "PPU OAM" -> Sprite pattern tables:
+    /// This test IS the map from "PPU OAM" -> Sprite pattern tables:
     /// `$00: $0000-$001F, $01: $1000-$101F, $02: $0020-$003F, $03: $1020-$103F,
-    /// ... $FE: $0FE0-$0FFF, $FF: $1FE0-$1FFF`, and the first byte of each of
-    /// those ranges is what the function has to return.
+    /// ... $FE: $0FE0-$0FFF, $FF: $1FE0-$1FFF`, and the first byte of each half of
+    /// each of those ranges is what the function has to return. `$02` spans
+    /// `$0020-$003F` inside ONE bank, which is the fact that pins the formula:
+    /// rows 8-15 are `base + 16`, not `base + $1000`.
     ///
-    /// The 2C02 technical reference gives the rule this implements: "If
-    /// $2000.5 = 1, the MSB of the range result value become the LSB of the
-    /// indexed tile, and the LSB of the tile index value determines pattern
-    /// table selection. The lower 3 bits of the range result value are always
-    /// used as the fine vertical offset into the selected pattern." So rows
-    /// 8-15 come from the OTHER pattern table at the same row block, not from
-    /// rows 8-15 of the same table.
+    /// The tempting wrong formula is `(tile | 1)` for the bottom half followed by
+    /// `(tile & 1) * 0x1000 + (tile & 0xFE) * 16`, which flips the pattern table
+    /// instead of advancing within it. It gets tile `$00` right (both halves in
+    /// bank 0 is the only case where the two rules agree) and 96 of the other 128
+    /// (tile, row) combinations wrong -- SMB draws tall Mario at 8x16, so his
+    /// legs would come from another sprite. Note it is *not* the 2C02's wording
+    /// that forbids it: "If $2000.5 = 1, the MSB of the range result value become
+    /// the LSB of the indexed tile" is a statement about the internal INDEX, and
+    /// the range result is the 9-bit `scanline - Y` comparator output, which is
+    /// constant across a scanline -- it cannot be a per-row bit, and it cannot
+    /// select a pattern table either.
     #[test]
-    fn an_8x16_pattern_address_is_the_table_from_the_tile_low_bit() {
+    fn an_8x16_pattern_address_is_32_contiguous_bytes_from_the_tile_low_bit() {
         let mut p = Ppu::new();
         p.cpu_write(0x2000, 0x20); // 8x16 sprites
-                                   // Rows 0-7 are the TOP half of the sprite and rows 8-15 the bottom
-                                   // one, so these are the two addresses each OAM tile index really
-                                   // fetches. NESdev "PPU OAM" -> Sprite pattern tables lists where each
-                                   // EFFECTIVE tile index lives: `$00: $0000-$001F, $01: $1000-$101F,
-                                   // $02: $0020-$003F, $03: $1020-$103F ... $FE: $0FE0-$0FFF,
-                                   // $FF: $1FE0-$1FFF`.
-                                   //
-                                   // The bottom half is the tile AFTER the one OAM names, so index $00
-                                   // reads $1000 and index $02 reads $1020 -- the +$1000 comes from the
-                                   // low bit of the tile the bottom half becomes, not from the low bit of
-                                   // the one the game wrote.
-                                   //
-                                   // The brief's formula, `0x1000 + (tile & 1) * 0x1000 + ((tile >> 1) * 16
-                                   // + fine_y) % 256`, is wrong on both terms: it adds $1000 to EVERY 8x16
-                                   // sprite, and `(tile >> 1) * 16` shifts the row block down, which puts
-                                   // index $00's bottom half in $0000 instead of $1000, index $02's in
-                                   // $1000 instead of $1020, and index $FF's in $20F8 -- past the end of
-                                   // CHR, where it wraps to $00F8 and reads somebody else's tile.
         for (tile, top, bottom) in [
-            (0x00u8, 0x0000u16, 0x1000u16),
-            (0x01, 0x0000, 0x1000),
-            (0x02, 0x0020, 0x1020),
-            (0x03, 0x0020, 0x1020),
-            (0xFE, 0x0FE0, 0x1FE0),
-            (0xFF, 0x0FE0, 0x1FE0),
+            (0x00u8, 0x0000u16, 0x0010u16),
+            (0x01, 0x1000, 0x1010),
+            (0x02, 0x0020, 0x0030),
+            (0x03, 0x1020, 0x1030),
+            (0xFE, 0x0FE0, 0x0FF0),
+            (0xFF, 0x1FE0, 0x1FF0),
         ] {
             assert_eq!(
                 p.sprite_pattern_address(tile, 0),
@@ -1633,12 +1673,10 @@ mod tests {
                 "tile ${tile:02X} bottom half must come from ${bottom:04X}"
             );
         }
-        // And the fine vertical offset is THREE bits, never four: the 2C02
-        // technical reference says "the lower 3 bits of the range result value
-        // are always used as the fine vertical offset into the selected
-        // pattern", which is what keeps row 8 out of row 0's high plane at +8.
+        // And the offset inside a half is THREE bits, never four: row 8 must not
+        // land in row 0's high plane at +8.
         assert_eq!(p.sprite_pattern_address(0x02, 7), 0x0027);
-        assert_eq!(p.sprite_pattern_address(0x02, 15), 0x1027);
+        assert_eq!(p.sprite_pattern_address(0x02, 15), 0x0037);
     }
 
     /// 8x8 sprites still take the whole tile index and the pattern table from
@@ -1673,9 +1711,10 @@ mod tests {
     }
 
     /// An 8x16 sprite end to end: its top half is fetched from `$0020` and its
-    /// bottom half from `$1020`, it is drawn one row BELOW its OAM Y ("you must
-    /// subtract 1 from the sprite's Y coordinate before writing it here"), and
-    /// the bytes the brief's formula would have read stay untouched.
+    /// bottom half from the next 16 bytes, `$0030`, it is drawn one row BELOW its
+    /// OAM Y ("you must subtract 1 from the sprite's Y coordinate before writing
+    /// it here"), and the bytes the brief's formula would have read stay
+    /// untouched.
     #[test]
     fn an_8x16_sprite_draws_its_halves_from_the_two_pattern_tables() {
         let mut p = Ppu::new();
@@ -1707,7 +1746,7 @@ mod tests {
             assert_eq!(
                 p.pixel(64, y),
                 0x00_4A_9F_FF,
-                "row {y} is the sprite's bottom half and comes from $1020"
+                "row {y} is the sprite's bottom half and comes from $0030"
             );
         }
         for y in 30..47 {
@@ -1739,7 +1778,7 @@ mod tests {
             assert_eq!(
                 p.pixel(64, y),
                 0x00_4A_9F_FF,
-                "row {y} should show the flipped bottom half ($1020)"
+                "row {y} should show the flipped bottom half ($0030)"
             );
         }
         for y in 39..47 {
@@ -1807,24 +1846,46 @@ mod tests {
         assert!(p.sprite0_hit());
     }
 
-    /// Both suppressed dots, on one test because both are the same rule.
-    ///
-    /// x = 0: the background is opaque only in the LEFTMOST pixel of each tile,
-    /// so the only dot where sprite 0 and the background can both be opaque is
-    /// x = 0 -- the sprite is 8 wide, so dots 1..7 have a transparent
-    /// background and cannot hit anyway.
-    ///
-    /// x = 255: the sprite's only visible pixel is at 255. NESdev: "At x=255,
-    /// for an obscure reason related to the pixel pipeline" the hit does not
-    /// happen; NESdev "PPU registers" says the same.
+    /// x = 0..7 is suppressed only while a left-side clipping window is enabled,
+    /// i.e. "if bit 2 or bit 1 of PPUMASK ($2001) is 0" (NESdev "PPU OAM" ->
+    /// Sprite 0 hits). Sprite 0 is parked at x = 0 and the background is opaque
+    /// only in the LEFTMOST pixel of each tile, so dot 0 is the ONE dot where
+    /// sprite 0 and the background are both opaque and the mask alone decides:
+    /// without the `$80` background, dots 1..7 would hit as well and the x = 0
+    /// rule could not be seen at all.
     #[test]
-    fn sprite_zero_hit_is_suppressed_at_x_0_and_x_255() {
+    fn sprite_zero_hit_at_x_0_needs_the_clip_window_switched_off() {
+        // $1A is $1E without bit 2: sprites are not shown at all, so the left
+        // 8 pixels show the background and cannot hit.
+        let mut p = Ppu::new();
+        p.setup_sprite0_over_background_for_test(0, 0x80);
+        p.cpu_write(0x2001, 0x1A);
+        p.run_to(&[21]);
+        assert!(
+            !p.sprite0_hit(),
+            "a left-side clipping window must suppress the hit at x=0..7"
+        );
+
+        // $1E has both clip bits set, so there is no clipping window and x = 0 is
+        // an ordinary dot: NESdev says the hit DOES happen there. SMB's status
+        // bar sprite 0 sits at x = 0, so this is live behaviour.
         let mut p = Ppu::new();
         p.setup_sprite0_over_background_for_test(0, 0x80);
         p.cpu_write(0x2001, 0x1E);
         p.run_to(&[21]);
-        assert!(!p.sprite0_hit(), "sprite-0 hit must not be reported at x=0");
+        assert!(
+            p.sprite0_hit(),
+            "with no clipping window the hit must be reported at x=0"
+        );
+    }
 
+    /// x = 255: the sprite's only visible pixel is at 255. NESdev: "At x=255,
+    /// for an obscure reason related to the pixel pipeline" the hit does not
+    /// happen -- unconditionally, not only while clipping is on. NESdev "PPU
+    /// registers" says the same. So $2001 = $1E here, with no clipping window at
+    /// all.
+    #[test]
+    fn sprite_zero_hit_is_suppressed_at_x_255() {
         let mut p = Ppu::new();
         p.setup_sprite0_over_background_for_test(255, 0xFF);
         p.cpu_write(0x2001, 0x1E);
@@ -1911,7 +1972,7 @@ mod tests {
         p.setup_sprite0_over_background_for_test(100, 0xFF);
         for row in 0..8u16 {
             p.chr_write_for_test(0x0020 + row, 0x00);
-            p.chr_write_for_test(0x1020 + row, 0x00);
+            p.chr_write_for_test(0x0030 + row, 0x00);
         }
         p.cpu_write(0x2001, 0x1E);
         p.run_to(&[21]);
@@ -1957,7 +2018,7 @@ mod tests {
         // Sprite 0: only its leftmost pixel is opaque, the rest transparent.
         for row in 0..8u16 {
             p.chr_write_for_test(0x0020 + row, 0x80);
-            p.chr_write_for_test(0x1020 + row, 0x80);
+            p.chr_write_for_test(0x0030 + row, 0x80);
         }
         // Sprite 1, in a different palette, straight on top of the rest.
         for row in 0..8u16 {
@@ -2032,6 +2093,25 @@ mod tests {
             !p.sprite0_hit(),
             "a clipped leftmost column cannot produce a sprite-0 hit"
         );
+        // $1C is $1E without bit 1: only the BACKGROUND is clipped, but the
+        // left-side window still covers the sprite layer, which is the other
+        // half of NESdev's "bit 2 or bit 1 of PPUMASK is 0" -- and the reason
+        // the sprite-0 hit cannot happen at x=0..7 in either case.
+        let mut p = Ppu::new();
+        p.setup_sprite0_over_background_for_test(0, 0xFF);
+        p.cpu_write(0x2001, 0x1C);
+        p.run_to(&[21]);
+        for x in 0..8u32 {
+            assert_eq!(
+                p.pixel(x, 21),
+                BACKDROP,
+                "x={x} is inside the left-side window and must be clipped"
+            );
+        }
+        assert!(
+            !p.sprite0_hit(),
+            "the background's own clip window suppresses the hit at x=0..7 too"
+        );
         // Bit 2 back on: the sprite is drawn again, at x = 0..7. (The hit
         // test above already pins x=0 alone; with the background opaque all
         // the way across, dots 1..7 legitimately hit.)
@@ -2075,5 +2155,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Secondary OAM fills COMPACTLY: "the OAM data for each sprite found to be
+    /// within range is copied into the secondary OAM" (NESdev "PPU sprite
+    /// evaluation"). The eight-sprite cap counts sprites FOUND, not their OAM
+    /// index, so eight in-range sprites living at OAM 20..27 fill all eight
+    /// slots and raise no overflow, whatever sprite 0 is doing.
+    ///
+    /// Sprite 0 is parked out of range here, which also pins the reason unit 0
+    /// cannot be assumed to be sprite 0: with secondary OAM compacted, unit 0 is
+    /// the first sprite FOUND, so a PPU that recognises sprite 0 by unit index
+    /// would raise a sprite-0 hit out of OAM entry 20. Hence the last assertion.
+    #[test]
+    fn eight_sprites_found_anywhere_in_oam_fill_secondary_oam() {
+        let mut p = Ppu::new();
+        p.setup_sprite0_over_background_for_test(0, 0xFF);
+        p.put_sprite_for_test(0, 100, 0x02, 0x01, 0); // sprite 0: out of range at row 21
+        for k in 0..8usize {
+            p.put_sprite_for_test(20 + k, 20, 0x02, 0x01, 16 * (k + 1) as u8);
+        }
+        p.cpu_write(0x2001, 0x1E);
+        p.run_to(&[21]);
+        assert!(
+            !p.sprite_overflow(),
+            "eight in-range sprites must not raise overflow"
+        );
+        for k in 0..8usize {
+            assert_eq!(
+                p.pixel(16 * (k + 1) as u32, 21),
+                0x00_4A_9F_FF,
+                "sprite at OAM {} was dropped: secondary OAM does not fill by OAM index",
+                20 + k
+            );
+        }
+        assert!(
+            !p.sprite0_hit(),
+            "sprite 0 is out of range, so no hit may come out of OAM entry 20"
+        );
+    }
+
+    /// The in-range comparator is 9 bits wide, so `scanline - Y` WRAPS. That is
+    /// what makes writing $EF-$FF hide a sprite: on every visible scanline those
+    /// Y values land off the top of the screen (NESdev "PPU OAM": "Hide a sprite
+    /// by moving it down offscreen, by writing any values between #$EF-#$FF
+    /// here"). Without the wrap, $FF would be the largest Y and hide nothing.
+    ///
+    /// This is also the test that keeps the pre-render line's no-evaluation rule
+    /// honest. Evaluation prepares the NEXT scanline, so at the pre-render line
+    /// the comparator sees row 262; row 262 minus Y = $FF is 7, which IS in
+    /// range, so with the power-on all-$FF OAM a PPU that evaluated there would
+    /// raise overflow every single frame. Hardware does not evaluate on the
+    /// pre-render line at all, and this pins that it does not here either.
+    #[test]
+    fn a_sprite_at_oam_y_ff_is_hidden_and_raises_no_overflow() {
+        let mut p = Ppu::new();
+        p.setup_sprite0_over_background_for_test(100, 0xFF);
+        p.put_sprite_for_test(0, 0xFF, 0x02, 0x01, 100); // $FF: the hide value
+        p.put_sprite_for_test(1, 0xEF, 0x02, 0x01, 110); // $EF: the other end of it
+        p.cpu_write(0x2001, 0x1E);
+        p.run_to(&[239]);
+        for y in 21..37u32 {
+            assert_eq!(
+                p.pixel(100, y),
+                0x00_FF_FF_FF,
+                "row {y}: a sprite at OAM Y = $FF must be hidden, not drawn"
+            );
+        }
+        // $EF is the LOWEST hiding value, so it is the one that can come closest
+        // to the screen: with a 16-row sprite starting at row 240 its only
+        // reachable row is 239, and even that must stay background. A comparator
+        // off by one at the bottom (`0..=height`) shows the sprite here.
+        assert_eq!(
+            p.pixel(110, 239),
+            0x00_FF_FF_FF,
+            "a sprite at OAM Y = $EF must be hidden on the last visible row too"
+        );
+        assert!(
+            !p.sprite_overflow(),
+            "a hidden sprite must not count towards the eight-sprite cap"
+        );
+        assert!(!p.sprite0_hit(), "a hidden sprite 0 cannot hit");
     }
 }
