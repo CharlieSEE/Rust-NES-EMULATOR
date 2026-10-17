@@ -249,19 +249,19 @@ impl Cpu {
             0x09 | 0x05 | 0x15 | 0x0D | 0x1D | 0x19 | 0x11 | 0x01 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.a |= v;
-                self.nz(self.a);
+                self.nzcv(self.a);
                 cycles += crossed as u8;
             }
             0x29 | 0x25 | 0x35 | 0x2D | 0x3D | 0x39 | 0x31 | 0x21 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.a &= v;
-                self.nz(self.a);
+                self.nzcv(self.a);
                 cycles += crossed as u8;
             }
             0x49 | 0x45 | 0x55 | 0x4D | 0x5D | 0x59 | 0x51 | 0x41 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.a ^= v;
-                self.nz(self.a);
+                self.nzcv(self.a);
                 cycles += crossed as u8;
             }
             0x24 | 0x2C => {
@@ -566,6 +566,16 @@ impl Cpu {
     fn nz(&mut self, v: u8) {
         self.set(Z, v == 0);
         self.set(N, v & 0x80 != 0);
+    }
+
+    /// N, Z, C and V all from one result: what the logical instructions do
+    /// (ORA, AND, EOR), and the same four the adder sets. Only N and Z left
+    /// alone here is the bug that made Duck Hunt black -- see
+    /// `the_logic_instructions_set_carry_and_overflow_from_the_result`.
+    fn nzcv(&mut self, v: u8) {
+        self.set(C, v & 0x80 != 0);
+        self.set(V, v & 0x40 != 0);
+        self.nz(v);
     }
 
     fn compare(&mut self, reg: u8, v: u8) {
@@ -1021,6 +1031,57 @@ mod tests {
         c.irq(&mut bus);
         assert_eq!(c.pc, 0x0000, "the IRQ vector was not taken");
         assert_eq!(bus.dots, 0, "and no cycles were consumed");
+    }
+
+    /// ORA/AND/EOR are value results like ADC, so they set **all four** of
+    /// N, Z, C and V from the result -- not just N and Z. The game's own code
+    /// depends on it: Duck Hunt's VRAM uploader at bank 1 `$C38A` is
+    /// `LDA $08 / ORA #$04 / BCS +2 / AND #$FB / STA $2000`, i.e. it takes
+    /// `$2000`'s increment-by-32 bit straight out of the carry ORA produced.
+    /// With C left alone, `$2000` gets `$90` instead of `$94`, `$2007` steps by
+    /// 1 instead of 32, the palette upload lands on `$3F10` (which mirrors
+    /// `$3F00`) and the whole screen comes out `$0F` -- solid black.
+    #[test]
+    fn the_logic_instructions_set_carry_and_overflow_from_the_result() {
+        // (acc, ORA operand, AND operand, EOR operand) -> (result, C, V) each.
+        for (acc, ora, and, eor) in [(0x80u8, 0x00u8, 0x00, 0x40u8)] {
+            for (opcode, operand, result, name) in [
+                (0x09u8, ora, acc | ora, "ORA"),
+                (0x29u8, and, acc & and, "AND"),
+                (0x49u8, eor, acc ^ eor, "EOR"),
+            ] {
+                let mut bus = TestBus::new();
+                load(&mut bus, PROG, &[0xA9, acc, opcode, operand]);
+                let mut c = Cpu::new();
+                c.pc = PROG;
+                c.p &= !(C | V); // a run that never touches them must fail
+                c.step(&mut bus); // LDA
+                c.step(&mut bus); // the logic instruction
+                assert_eq!(
+                    c.flag(C),
+                    result & 0x80 != 0,
+                    "{name} ${acc:02X} #${operand:02X} = ${result:02X}: carry from bit 7"
+                );
+                assert_eq!(
+                    c.flag(V),
+                    result & 0x40 != 0,
+                    "{name} ${acc:02X} #${operand:02X} = ${result:02X}: overflow from bit 6"
+                );
+            }
+        }
+        // A carry that must go the other way too, so the test is not one that
+        // passes because every result happens to have bit 7 set.
+        let mut bus = TestBus::new();
+        load(&mut bus, PROG, &[0xA9, 0x40, 0x09, 0x00]);
+        let mut c = Cpu::new();
+        c.pc = PROG;
+        c.p |= C; // C arrives set...
+        c.step(&mut bus);
+        c.step(&mut bus);
+        assert!(
+            !c.flag(C),
+            "ORA #$00 onto $40 is $40: bit 7 clear, so the carry must be cleared"
+        );
     }
 
     #[test]
