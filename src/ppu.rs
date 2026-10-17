@@ -507,10 +507,11 @@ impl Ppu {
         // enabled -- "sprite 0 hit does not happen at x=0 to x=7 if the
         // left-side clipping window is enabled (if bit 2 or bit 1 of PPUMASK
         // ($2001) is 0)" -- and that is exactly the `return` at the top of this
-        // function: bit 2 clear means no sprite pixel anywhere, bit 1 clear means
-        // none for x < 8. SMB's HUD split is timed off this flag and its status
-        // bar sprite sits at x = 0, so x = 0 suppressing unconditionally was a
-        // live timing deviation, not a shortcut.
+        // function. PPUMASK is `BGRs bMmG` (NESdev "PPU registers"): bit 4
+        // enables sprites anywhere, bit 2 enables them in the leftmost 8 pixels.
+        // SMB's HUD split is timed off this flag and its status bar sprite sits
+        // at x = 0, so x = 0 suppressing unconditionally was a live timing
+        // deviation, not a shortcut.
         if bg != 0
             && x != 255
             && self.status & 0x40 == 0
@@ -833,9 +834,17 @@ impl Ppu {
                 let addr = self.v & 0x3FFF;
                 if addr >= 0x3F00 {
                     self.palette[palette_index(addr)] = val & 0x3F;
-                } else {
+                } else if addr >= 0x2000 {
                     self.vram[vram_index(addr)] = val;
                 }
+                // `$0000-$1FFF` is pattern memory and on this board it is CHR
+                // ROM, so the write goes NOWHERE. Storing it would be worse
+                // than dropping it: `vram_index` masks that range down to
+                // `$0000 + (addr & $07FF)` and would alias the byte onto a
+                // nametable tile. `v` advances either way -- hardware steps the
+                // address register on every `$2007` access whether or not the
+                // byte lands, and getting that wrong hangs any game that
+                // streams data through a fixed address window.
                 self.increment_v();
             }
             // $2002 is read-only: "Reading from $2002 clears the vblank flag
@@ -908,8 +917,9 @@ impl Ppu {
         self.t
     }
 
-    /// Write one byte of CHR RAM. The game does this through the PPU bus too,
-    /// but the bus does not exist yet, so the tests go in through this door.
+    /// Overwrite one byte of CHR **ROM** for a test. `$2000-$1FFF` is ROM on this
+    /// board, so nothing can reach it through the `$2007` write path and the
+    /// tests go through this door instead. No game code ever writes it.
     fn chr_write_for_test(&mut self, addr: u16, val: u8) {
         self.chr[self.crbank(addr)] = val;
     }
@@ -1450,6 +1460,35 @@ mod tests {
         for x in 8..16 {
             assert_eq!(p.pixel(x, 0), 0x00_FF_FF_FF, "clipping ran past 8 pixels");
         }
+    }
+
+    /// `$2000-$1FFF` is pattern memory, and on this board it is CHR **ROM**:
+    /// there is nothing there to write, so a `$2007` write to it is DROPPED.
+    /// `vram_index` masks that range down to `$0000 + (addr & $07FF)`, so storing
+    /// it would silently alias the byte onto a nametable tile -- an address range
+    /// that exists because CHR was once assumed to be RAM, and no longer does.
+    /// `$1FFF` aliases onto `$27FF`, the last tile of the second nametable. This
+    /// game never writes below `$2000`, which is how the bug sat here unnoticed.
+    #[test]
+    fn a_2007_write_below_2000_is_dropped_and_never_touches_the_nametable() {
+        let mut p = Ppu::new();
+        solid(&mut p, 0);
+        p.write_vram_for_test(0x27F0, 0x00); // nametable 1, column 31 -> x = 248
+        p.write_vram_for_test(0x1FFF, 0x2A); // must NOT alias onto $27FF
+        p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
+        p.write_vram_for_test(0x3F01, 0x30); // colour 1 = $FFFFFF
+        assert_eq!(
+            p.read_vram_for_test(0x27FF),
+            0x00,
+            "a $2007 write to $1FFF aliased onto nametable byte $27FF"
+        );
+        show_ctrl(&mut p, 0x01, 0, 0); // nametable 1
+        p.run_to(&[0]);
+        assert_eq!(
+            p.pixel(248, 0),
+            0x00_FF_FF_FF,
+            "the dropped write must leave the rendered tile alone"
+        );
     }
 
     /// Palette RAM is one 32-byte memory: `$3F10` is `$3F00`, and `$3F20` up is

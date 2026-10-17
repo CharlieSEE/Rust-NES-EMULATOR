@@ -1,8 +1,10 @@
 //! iNES loader and mapper 66 (UxROM variant with bus conflicts) for
 //! "Super Mario Bros. + Duck Hunt (USA)".
 //!
-//! The board contradicts its own iNES header in three ways. All three were
-//! checked against the real cartridge image, not taken from the header:
+//! The iNES header is honest about this cartridge: its `chr=2` really is 16 KiB
+//! of tile data, its `prg=4` really is 64 KiB, and its mirroring bit really is
+//! vertical. What the header does NOT carry is any of the below, so every one
+//! was measured against the real cartridge image instead:
 //!
 //! 1. PRG banking is by BUS CONFLICT, not by the written value. A write to
 //!    `$8000-$BFFF` only changes the bank when the byte written already equals
@@ -14,8 +16,10 @@
 //!    logo rendered as Mario's tiles: the game flips CHR bank mid-frame to
 //!    show both games' logos at once. The array lives in the PPU because the
 //!    PPU fetches pattern tables every dot; this struct owns the bytes.
-//! 3. Nametable mirroring is VERTICAL, hardwired in the board. Nothing in the
-//!    header selects it and nothing in `Cartridge` needs to.
+//! 3. Nametable mirroring is VERTICAL and hardwired in the board. The header's
+//!    mirroring bit agrees, but `Cartridge::load` never reads it -- the PPU
+//!    fixes the arrangement itself, because this board wires nametables
+//!    vertically and there is nothing to select.
 //! 4. PRG is 64 KiB = TWO 32 KiB windows over `$8000-$FFFF`, and the register
 //!    is `xxPPxxCC` -- PRG on bits 5-4, CHR on bits 1-0. The header's "four
 //!    16 KiB banks" is just the 16 KiB unit iNES counts in, and reading it as
@@ -119,8 +123,9 @@ impl Cartridge {
 mod tests {
     use super::*;
 
-    /// 16-byte iNES header: mapper 66, vertical mirroring, battery, and the
-    /// board's lying claim of `chr_banks` of CHR ROM.
+    /// 16-byte iNES header: mapper 66, vertical mirroring, battery, and 2x8 KiB
+    /// of CHR ROM, which is honest -- the file really does carry 16 KiB of
+    /// tile data and the register's low two bits bank it.
     fn ines_header(prg_banks: u8, chr_banks: u8) -> [u8; 16] {
         let mut h = [0u8; 16];
         h[..4].copy_from_slice(b"NES\x1a");

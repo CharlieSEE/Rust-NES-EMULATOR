@@ -52,8 +52,10 @@ pub struct Bus {
     /// Dots into the current CPU cycle, 0..3. `tick` is one dot and the DMA
     /// stall is counted in whole cycles, so the conversion lives here.
     dot: u8,
-    /// CPU cycles the last OAM DMA cost on hardware. Counted and drained, but
-    /// never enforced -- see the module header.
+    /// CPU cycles the last OAM DMA cost on hardware. Counted, drained by `tick`,
+    /// and now ENFORCED: `main`'s run loop gates the CPU on `dma_busy()` and
+    /// spends these cycles ticking the PPU, which keeps clocking during the
+    /// stall exactly as it does on hardware.
     dma_stall: u16,
 }
 
@@ -147,8 +149,10 @@ impl Bus {
         }
     }
 
-    /// OAM DMA: copy `$XX00-$XXFF` into OAM through `$2004`, and record the
-    /// stall `$4014` costs on hardware. Nothing waits on that stall yet.
+    /// OAM DMA: copy `$XX00-$XXFF` into OAM through `$2004`, and charge the
+    /// 513/514-cycle stall `$4014` costs on hardware. The stall lands in
+    /// `dma_stall` at the END of the copy, and `main` waits it out on
+    /// `dma_busy()`; see the note there.
     ///
     /// The copy goes in through the PPU's existing registers -- `$2003` to aim,
     /// `$2004` to write and advance -- so no OAM API is added to the PPU, and
@@ -194,9 +198,9 @@ mod tests {
     const BANK: usize = 0x8000;
     const POWER_ON_BANK: usize = 0;
 
-    /// 16-byte iNES header: mapper 66, vertical mirroring, 2x8 KiB of CHR ROM
-    /// claimed by a board that actually carries 8 KiB of CHR RAM. `h[4]` is in
-    /// 16 KiB units, which is why four of them is 64 KiB.
+    /// 16-byte iNES header: mapper 66, vertical mirroring, and 2x8 KiB of CHR
+    /// ROM -- 16 KiB of real tile data in the file, banked by register bits
+    /// 1-0. `h[4]` is in 16 KiB units, which is why four of them is 64 KiB.
     fn ines_header() -> [u8; 16] {
         let mut h = [0u8; 16];
         h[..4].copy_from_slice(b"NES\x1a");
