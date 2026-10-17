@@ -29,7 +29,8 @@ const USAGE: &str = "usage: nes <rom.nes> [--dump N[,N...]] [--play SCRIPT]\n\
     \x20 --play SCRIPT      hold scripted buttons, e.g. START,WAIT60,RIGHT120\n\
     \x20                    NAME is A, B, SELECT, START, UP, DOWN, LEFT, RIGHT,\n\
     \x20                    JUMP, RUN, FIRE or WAIT; trailing digits are the\n\
-    \x20                    frames to hold it (1 if none)";
+    \x20                    frames to hold it (1 if none); several names joined\n\
+    \x20                    with + are held together, e.g. RIGHT+A30";
 
 /// The pad, one row per bit of `Controller::set_buttons` in its report order --
 /// A, B, Select, Start, Up, Down, Left, Right -- as the SDL key that presses
@@ -108,8 +109,10 @@ fn mask_for_name(name: &str) -> Option<u8> {
 
 /// A `--play` script: the held mask for each step and how many frames it lasts.
 /// `RIGHT120` is Right held for 120 frames, `WAIT60` is nothing held for 60,
-/// and a bare name is one frame. Unreadable input is an error, never a step
-/// that silently holds nothing.
+/// and a bare name is one frame. `RIGHT+A30` is several buttons at once -- the
+/// names are OR-ed -- because a script that can only hold one mask cannot say
+/// "walk right and jump". Unreadable input is an error, never a step that
+/// silently holds nothing.
 fn parse_script(script: &str) -> Result<Vec<(u8, u32)>, String> {
     let names = "A, B, SELECT, START, UP, DOWN, LEFT, RIGHT, JUMP, RUN, FIRE or WAIT";
     if script.trim().is_empty() {
@@ -120,12 +123,14 @@ fn parse_script(script: &str) -> Result<Vec<(u8, u32)>, String> {
     let mut steps = Vec::new();
     for token in script.split(',') {
         let token = token.trim();
-        // Split the name from its trailing frame count: the count is digits, so
-        // the first non-letter ends the name.
+        // Split the names from the trailing frame count: the count is digits,
+        // so the first character that is neither a name character nor the `+`
+        // separator ends the names. `+` belongs to the separator scan and not
+        // to a name -- `WAIT+A5` is "WAIT and A", never a button "WAIT+".
         let split = token
-            .find(|c: char| !c.is_ascii_alphabetic())
+            .find(|c: char| !(c.is_ascii_alphabetic() || c == '+'))
             .unwrap_or(token.len());
-        let (name, count) = (&token[..split], &token[split..]);
+        let (held, count) = (&token[..split], &token[split..]);
         let frames: u32 = if count.is_empty() {
             1
         } else {
@@ -138,13 +143,22 @@ fn parse_script(script: &str) -> Result<Vec<(u8, u32)>, String> {
                 "--play step {token:?}: holding for 0 frames does nothing"
             ));
         }
-        let mask = if name.eq_ignore_ascii_case("WAIT") {
-            0
-        } else {
-            mask_for_name(name.to_ascii_uppercase().as_str()).ok_or_else(|| {
-                format!("--play step {token:?}: {name:?} is not a button; use {names}")
-            })?
-        };
+        // One lookup per name, OR-ed together. Splitting on `+` first is what
+        // makes an empty half an error naming that half, rather than a name
+        // that is never found.
+        let mut mask = 0;
+        for name in held.split('+') {
+            mask |= if name.eq_ignore_ascii_case("WAIT") {
+                0
+            } else {
+                mask_for_name(name.to_ascii_uppercase().as_str()).ok_or_else(|| {
+                    format!(
+                        "--play step {token:?}: {name:?} is not a button; \
+                         join several of them with + out of {names}"
+                    )
+                })?
+            };
+        }
         steps.push((mask, frames));
     }
     Ok(steps)
@@ -419,6 +433,116 @@ mod tests {
             [(0x08, 1), (0, 60), (0x80, 120)],
             "Start for a frame, nothing for 60, Right for 120"
         );
+    }
+
+    /// One step can hold several buttons at once: `RIGHT+A30` is Right AND A
+    /// for 30 frames. A single mask per step cannot express "walk right and
+    /// jump", which is what a 3-tile-high pipe in WORLD 1-1 asks for.
+    #[test]
+    fn a_step_can_hold_two_buttons_at_once() {
+        assert_eq!(
+            parse_script("RIGHT+A30").unwrap(),
+            [(0x80 | 0x01, 30)],
+            "Right and A are OR-ed into one mask and last 30 frames"
+        );
+    }
+
+    #[test]
+    fn a_step_can_hold_three_buttons_at_once() {
+        assert_eq!(
+            parse_script("LEFT+B+START4").unwrap(),
+            [(0x40 | 0x02 | 0x08, 4)],
+            "Left, B and Start in one mask for 4 frames"
+        );
+    }
+
+    /// The names are looked up one at a time, so the error has to say WHICH
+    /// one was wrong -- "not a button" naming the whole step leaves the reader
+    /// hunting for the bad half of it.
+    #[test]
+    fn an_unknown_name_inside_a_multi_button_step_names_that_name() {
+        // Both halves of the assertion matter. Naming "FOO" alone is worthless:
+        // the pre-fix error reads `"+FOO30" is not a frame count`, which also
+        // contains the letters FOO. It has to be rejected AS A NAME.
+        for bad in ["RIGHT+FOO30", "RIGHT+FOO+ALSONOPE30"] {
+            let err = parse_script(bad).expect_err(&format!("{bad:?} should not parse"));
+            assert!(
+                err.contains("is not a button"),
+                "{bad:?} must be rejected as an unknown name, not as a bad count: {err}"
+            );
+            for name in bad.split('+').skip(1).map(|s| {
+                &s[..s
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(s.len())]
+            }) {
+                assert!(err.contains(name), "error must name {name:?}: {err}");
+            }
+        }
+        // The same rejection as a single-name step: joining with + is not a way
+        // to smuggle an unknown name past the check.
+        assert!(parse_script("FOO30").is_err());
+    }
+
+    /// `+` with nothing on one side is a typo, not a step holding fewer
+    /// buttons. Treating it as nothing is the worst outcome: the run looks
+    /// like it works and simply does not press what was asked for.
+    #[test]
+    fn a_separator_with_no_button_on_one_side_is_rejected() {
+        for bad in [
+            "+RIGHT30",   // nothing before the separator
+            "RIGHT+30",   // nothing after it, and then a frame count
+            "RIGHT+",     // nothing after it at all
+            "RIGHT++A30", // an empty hole between two separators
+            "+",          // and a step that is only a separator
+            "+30",        // which also has no name at all
+        ] {
+            let err = parse_script(bad).expect_err(&format!("{bad:?} should not parse"));
+            assert!(!err.is_empty(), "{bad:?} gave an empty error");
+        }
+    }
+
+    /// `+` is a separator and nothing else. If it were part of the name,
+    /// `WAIT+A5` would look up one button called "WAIT+" and be rejected --
+    /// or worse, be accepted by a lookup that merely ignored the separator and
+    /// never pressed A.
+    #[test]
+    fn the_separator_is_never_part_of_a_button_name() {
+        assert_eq!(
+            parse_script("WAIT+A5").unwrap(),
+            [(0x01, 5)],
+            r#"WAIT contributes nothing, A contributes its bit: "WAIT+" is not a name"#
+        );
+        // And a name may not end in the separator, which is the same defect
+        // read from the other side.
+        assert!(parse_script("WAIT+5").is_err());
+    }
+
+    /// Every single-button form keeps meaning exactly what it meant before
+    /// `+` existed -- `--play "WAIT297,START10,..."` is load-bearing for every
+    /// verification in this project, aliases included.
+    #[test]
+    fn single_button_steps_are_unchanged_by_the_separator() {
+        for (script, want) in [
+            ("START", (0x08u8, 1u32)),
+            ("WAIT297", (0, 297)),
+            ("RIGHT200", (0x80, 200)),
+            ("A1", (0x01, 1)),
+            ("B1", (0x02, 1)),
+            ("SELECT1", (0x04, 1)),
+            ("UP1", (0x10, 1)),
+            ("DOWN1", (0x20, 1)),
+            ("LEFT1", (0x40, 1)),
+            ("JUMP60", (0x01, 60)),
+            ("RUN60", (0x02, 60)),
+            ("FIRE60", (0x02, 60)),
+            ("right60", (0x80, 60)), // still case-insensitive
+        ] {
+            assert_eq!(
+                parse_script(script).unwrap(),
+                [want],
+                "{script:?} must mean exactly what it always did"
+            );
+        }
     }
 
     #[test]
