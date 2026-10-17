@@ -54,6 +54,47 @@ fn button_for(key: Keycode) -> Option<u8> {
     BUTTONS.iter().find(|row| row.0 == key).map(|row| row.2)
 }
 
+/// Fold one SDL event into the held mask, returning whether the run continues.
+/// `false` quits. Out of `main` so the arms are reachable from a test: `Event`
+/// is a plain enum value, so a headless test can build a `FocusLost` without a
+/// window ever existing.
+fn apply_event(ev: Event, buttons: &mut u8) -> bool {
+    match ev {
+        Event::Quit { .. } => false,
+        Event::KeyDown {
+            keycode: Some(Keycode::Escape),
+            ..
+        } => false,
+        Event::KeyDown {
+            keycode: Some(key), ..
+        } => {
+            if let Some(bit) = button_for(key) {
+                *buttons |= bit;
+            }
+            true
+        }
+        Event::KeyUp {
+            keycode: Some(key), ..
+        } => {
+            if let Some(bit) = button_for(key) {
+                *buttons &= !bit;
+            }
+            true
+        }
+        // No KeyUp ever arrives for a key released while another window has the
+        // focus, so alt-tabbing away holding Right would latch it on for good.
+        // Forget the whole mask instead.
+        Event::Window {
+            win_event: WindowEvent::FocusLost,
+            ..
+        } => {
+            *buttons = 0;
+            true
+        }
+        _ => true,
+    }
+}
+
 /// Which button a `--play` name presses. Aliases resolve to the real name
 /// first, so there is still exactly one bit table in this file.
 fn mask_for_name(name: &str) -> Option<u8> {
@@ -157,6 +198,23 @@ fn frame_sleep(elapsed: ::std::time::Duration) -> ::std::time::Duration {
     FRAME_BUDGET.checked_sub(elapsed).unwrap_or_default()
 }
 
+/// With no script the dump list is the whole run, so the last frame named ends
+/// it. This is the maximum, not the position: `--dump 5,3` still has to reach
+/// frame 5, or the caller asked for a frame and silently got none of it.
+fn dump_list_ends_run(dump_at: &[u32], frames: u32) -> bool {
+    dump_at.iter().copied().max() == Some(frames)
+}
+
+/// The requested dump frames a run that reached `frames` never wrote. Reported
+/// on stderr rather than turned into an error: the frames are simply not
+/// there, and saying so is what stops it reading as "the game froze".
+fn missed_dumps(dump_at: &[u32], frames: u32) -> Vec<u32> {
+    let mut missed: Vec<u32> = dump_at.iter().copied().filter(|&n| n > frames).collect();
+    missed.sort_unstable();
+    missed.dedup();
+    missed
+}
+
 fn main() -> Result<(), String> {
     let mut args = ::std::env::args().skip(1);
     let rom_path = args.next().ok_or_else(|| USAGE.to_string())?;
@@ -169,9 +227,18 @@ fn main() -> Result<(), String> {
                     .next()
                     .ok_or_else(|| format!("--dump needs a frame count\n{USAGE}"))?;
                 for n in list.split(',') {
-                    dump_at.push(n.trim().parse().map_err(|_| {
-                        format!("--dump frame {n:?} is not a frame count\n{USAGE}")
-                    })?);
+                    let n: u32 = n
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("--dump frame {n:?} is not a frame count\n{USAGE}"))?;
+                    if n == 0 {
+                        // Frames are counted from one, so this would run until
+                        // it was killed and still write nothing.
+                        return Err(format!(
+                            "--dump frame 0: frames are counted from 1\n{USAGE}"
+                        ));
+                    }
+                    dump_at.push(n);
                 }
             }
             "--play" => {
@@ -226,34 +293,8 @@ fn main() -> Result<(), String> {
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
         for event in events.poll_iter() {
-            match event {
-                Event::Quit { .. } => running = false,
-                Event::KeyDown {
-                    keycode: Some(Keycode::Escape),
-                    ..
-                } => running = false,
-                Event::KeyDown {
-                    keycode: Some(key), ..
-                } => {
-                    if let Some(bit) = button_for(key) {
-                        buttons |= bit;
-                    }
-                }
-                Event::KeyUp {
-                    keycode: Some(key), ..
-                } => {
-                    if let Some(bit) = button_for(key) {
-                        buttons &= !bit;
-                    }
-                }
-                // No KeyUp ever arrives for a key released while another window
-                // has the focus, so alt-tabbing away holding Right would latch
-                // it on for good. Forget the whole mask instead.
-                Event::Window {
-                    win_event: WindowEvent::FocusLost,
-                    ..
-                } => buttons = 0,
-                _ => {}
+            if !apply_event(event, &mut buttons) {
+                running = false;
             }
         }
         // A script is not a second input path: it assigns the same mask a key
@@ -261,14 +302,23 @@ fn main() -> Result<(), String> {
         if let Some(script) = play.as_mut() {
             match script.mask_for_next_frame() {
                 Some(mask) => buttons = mask,
-                None => running = false,
+                // The script is over. Release what its last step held instead of
+                // emulating one more frame with it still down -- the frame that
+                // `running = false` still runs would be played with a key that
+                // the script already let go of.
+                None => {
+                    buttons = 0;
+                    running = false;
+                }
             }
         }
         bus.controllers[0].set_buttons(buttons);
         // Run the CPU until the PPU has a whole frame, taking the NMI the
         // vblank flag raises. SMB gates its status bar on a sprite-0 hit and
         // its NMI handler on `$2002`, so this is where the machine actually
-        // lives; Task 7 takes the timing and audio from here.
+        // lives. There is no APU yet, so nothing below this is timing- or
+        // audio-driven; the frame's wall-clock budget is handled by
+        // `frame_sleep` and nothing else in the loop touches the clock.
         while !bus.ppu.frame_ready() {
             // An OAM DMA halts the CPU for its 513 cycles while the PPU keeps
             // clocking; `tick` is one dot, so three of them per cycle drain it.
@@ -305,7 +355,7 @@ fn main() -> Result<(), String> {
         if let Some(n) = dump_at.iter().find(|&&n| n == frames) {
             write_ppm(&format!("frame-{n}.ppm"), frame)?;
         }
-        if play.is_none() && dump_at.last() == Some(&frames) {
+        if play.is_none() && dump_list_ends_run(&dump_at, frames) {
             // With no script the dump list is the whole run, so the last frame
             // named ends it.
             return Ok(());
@@ -323,6 +373,16 @@ fn main() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         canvas.present();
         ::std::thread::sleep(frame_sleep(frame_start.elapsed()));
+    }
+    // The run stopped early -- the script ran out, or the user quit -- so any
+    // dump frame past here was never written. Name them: a missing file with
+    // exit code 0 is indistinguishable from a frozen game.
+    let missed = missed_dumps(&dump_at, frames);
+    if !missed.is_empty() {
+        eprintln!(
+            "--dump asked for frame{} {missed:?} but the run only reached frame {frames}",
+            if missed.len() == 1 { "" } else { "s" },
+        );
     }
     Ok(())
 }
@@ -344,7 +404,11 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{button_for, frame_sleep, mask_for_name, parse_script, Play, FRAME_BUDGET};
+    use super::{
+        apply_event, button_for, dump_list_ends_run, frame_sleep, mask_for_name, missed_dumps,
+        parse_script, Play, FRAME_BUDGET,
+    };
+    use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::Keycode;
     use std::time::Duration;
 
@@ -461,5 +525,104 @@ mod tests {
         ] {
             assert_eq!(frame_sleep(over), Duration::ZERO, "{over:?} overran");
         }
+    }
+
+    /// `--dump 5,3` used to end the run after frame 3: frame 5 was never
+    /// written, nothing was said, and the exit code was still 0. Task 9 reads
+    /// dumps, so a silently dropped frame reads as "the game froze". The end of
+    /// the run is the highest frame named, in whatever order they were named.
+    #[test]
+    fn an_unsorted_dump_list_still_runs_to_its_highest_frame() {
+        for list in [&[5u32, 3][..], &[9, 3, 5][..], &[3, 5][..]] {
+            let highest = list.iter().copied().max().unwrap();
+            for frames in 1..=highest {
+                assert_eq!(
+                    dump_list_ends_run(list, frames),
+                    frames == highest,
+                    "--dump {list:?} must end at {highest}, not at {frames}"
+                );
+            }
+        }
+    }
+
+    /// SDL sends no `KeyUp` for a key released while another window has the
+    /// focus, so the FocusLost arm is the only thing that un-latches a held
+    /// button. `Event` is a plain enum value, so this runs with no window and
+    /// no X server -- it needed the handler extracted from `main` to be
+    /// reachable at all, not a real alt-tab.
+    #[test]
+    fn a_focus_loss_clears_the_held_mask() {
+        let mut buttons = 0xFF;
+        let lost = Event::Window {
+            timestamp: 0,
+            window_id: 0,
+            win_event: WindowEvent::FocusLost,
+        };
+        assert!(
+            apply_event(lost, &mut buttons),
+            "losing focus is not a quit"
+        );
+        assert_eq!(buttons, 0, "every held bit must be forgotten");
+    }
+
+    #[test]
+    fn a_key_up_clears_only_its_own_bit() {
+        let down = |key| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(key),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat: false,
+        };
+        let up = |key| Event::KeyUp {
+            timestamp: 1,
+            window_id: 0,
+            keycode: Some(key),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat: false,
+        };
+        let mut buttons = 0u8;
+        for key in [Keycode::Z, Keycode::Right, Keycode::Return] {
+            assert!(apply_event(down(key), &mut buttons), "{key:?} down");
+        }
+        assert_eq!(buttons, 0x01 | 0x80 | 0x08, "Z, Right and Return held");
+        assert!(apply_event(up(Keycode::Right), &mut buttons), "Right up");
+        assert_eq!(
+            buttons,
+            0x01 | 0x08,
+            "only Right's bit goes; Z and Return are still down"
+        );
+        // Escape quits, a key with no bit does nothing, and both still say the
+        // run continues.
+        assert!(
+            !apply_event(down(Keycode::Escape), &mut buttons),
+            "Escape ends the run"
+        );
+        let before = buttons;
+        assert!(
+            apply_event(down(Keycode::F5), &mut buttons),
+            "F5 is not a quit"
+        );
+        assert_eq!(buttons, before, "F5 is not on the pad");
+    }
+
+    /// A dump frame past the end of the run is written nowhere and reported
+    /// nowhere, which is the same silent under-delivery as stopping early.
+    #[test]
+    fn a_dump_frame_past_the_end_of_the_run_is_named_as_missed() {
+        assert_eq!(
+            missed_dumps(&[600, 1400], 1400),
+            Vec::<u32>::new(),
+            "all reached"
+        );
+        assert_eq!(missed_dumps(&[600, 1400], 7), [600, 1400], "none reached");
+        assert_eq!(
+            missed_dumps(&[600, 1400], 1000),
+            [1400],
+            "the later one only"
+        );
+        assert_eq!(missed_dumps(&[9, 3, 5], 7), [9], "order does not matter");
     }
 }
