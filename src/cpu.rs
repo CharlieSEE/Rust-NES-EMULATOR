@@ -249,19 +249,19 @@ impl Cpu {
             0x09 | 0x05 | 0x15 | 0x0D | 0x1D | 0x19 | 0x11 | 0x01 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.a |= v;
-                self.nzcv(self.a);
+                self.nz(self.a);
                 cycles += crossed as u8;
             }
             0x29 | 0x25 | 0x35 | 0x2D | 0x3D | 0x39 | 0x31 | 0x21 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.a &= v;
-                self.nzcv(self.a);
+                self.nz(self.a);
                 cycles += crossed as u8;
             }
             0x49 | 0x45 | 0x55 | 0x4D | 0x5D | 0x59 | 0x51 | 0x41 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.a ^= v;
-                self.nzcv(self.a);
+                self.nz(self.a);
                 cycles += crossed as u8;
             }
             0x24 | 0x2C => {
@@ -563,19 +563,16 @@ impl Cpu {
         }
     }
 
+    /// N and Z from a result; C and V are left exactly as the instruction
+    /// before it left them. ORA, AND and EOR set only these two (the 2A03's
+    /// `## 4. Flags` lists "N, Z" for all three). SMB depends on it: the level
+    /// loader does `ASL A / PHA / LDA $0778 / ORA #$04 / BCS +2 / AND #$FB /
+    /// STA $2000`, taking the increment-by-32 bit out of the carry that `ASL A`
+    /// made. Setting C from the ORA result clears that bit every time, and the
+    /// level is written 26 tiles ACROSS instead of 26 tiles DOWN each column.
     fn nz(&mut self, v: u8) {
         self.set(Z, v == 0);
         self.set(N, v & 0x80 != 0);
-    }
-
-    /// N, Z, C and V all from one result: what the logical instructions do
-    /// (ORA, AND, EOR), and the same four the adder sets. Only N and Z left
-    /// alone here is the bug that made Duck Hunt black -- see
-    /// `the_logic_instructions_set_carry_and_overflow_from_the_result`.
-    fn nzcv(&mut self, v: u8) {
-        self.set(C, v & 0x80 != 0);
-        self.set(V, v & 0x40 != 0);
-        self.nz(v);
     }
 
     fn compare(&mut self, reg: u8, v: u8) {
@@ -1033,54 +1030,80 @@ mod tests {
         assert_eq!(bus.dots, 0, "and no cycles were consumed");
     }
 
-    /// ORA/AND/EOR are value results like ADC, so they set **all four** of
-    /// N, Z, C and V from the result -- not just N and Z. The game's own code
-    /// depends on it: Duck Hunt's VRAM uploader at bank 1 `$C38A` is
-    /// `LDA $08 / ORA #$04 / BCS +2 / AND #$FB / STA $2000`, i.e. it takes
-    /// `$2000`'s increment-by-32 bit straight out of the carry ORA produced.
-    /// With C left alone, `$2000` gets `$90` instead of `$94`, `$2007` steps by
-    /// 1 instead of 32, the palette upload lands on `$3F10` (which mirrors
-    /// `$3F00`) and the whole screen comes out `$0F` -- solid black.
+    /// ORA/AND/EOR set only N and Z. C and V are untouched, and the games
+    /// lean on that: SMB's level loader (bank 0 `$8E9C`) is
+    /// `LDA ($00),Y / ASL A / PHA / LDA $0778 / ORA #$04 / BCS +2 / AND #$FB /
+    /// JSR $8EED`, where `$8EED` is `STA $2000`. The `BCS` reads the carry the
+    /// `ASL A` made, three instructions back. Make ORA set C from its result
+    /// and the branch is decided by the shadow's bit 7 instead: with `$0778` at
+    /// `$10`, `$10|$04 = $14` has bit 7 clear, so bit 2 is cleared, `$2000`
+    /// gets `$10`, and `$2007` steps across instead of down. The level lands as
+    /// 26 tiles per row for two rows and nothing else -- a blue screen with no
+    /// ground.
     #[test]
-    fn the_logic_instructions_set_carry_and_overflow_from_the_result() {
-        // (acc, ORA operand, AND operand, EOR operand) -> (result, C, V) each.
-        for (acc, ora, and, eor) in [(0x80u8, 0x00u8, 0x00, 0x40u8)] {
-            for (opcode, operand, result, name) in [
-                (0x09u8, ora, acc | ora, "ORA"),
-                (0x29u8, and, acc & and, "AND"),
-                (0x49u8, eor, acc ^ eor, "EOR"),
-            ] {
+    fn the_logic_instructions_leave_carry_and_overflow_alone() {
+        for (opcode, operand, result, name) in [
+            (0x09u8, 0x04u8, 0x94u8, "ORA #$04 onto $90"),
+            (0x29u8, 0x7E, 0x10, "AND #$7E onto $94"),
+            (0x49u8, 0x80, 0x10, "EOR #$80 onto $90"),
+        ] {
+            for (carry_in, overflow_in) in
+                [(false, false), (true, true), (false, true), (true, false)]
+            {
                 let mut bus = TestBus::new();
-                load(&mut bus, PROG, &[0xA9, acc, opcode, operand]);
+                load(&mut bus, PROG, &[0xA9, 0x90, opcode, operand]);
                 let mut c = Cpu::new();
                 c.pc = PROG;
-                c.p &= !(C | V); // a run that never touches them must fail
-                c.step(&mut bus); // LDA
+                c.p = (c.p & !(C | V))
+                    | if carry_in { C } else { 0 }
+                    | if overflow_in { V } else { 0 };
+                c.step(&mut bus); // LDA #$90
                 c.step(&mut bus); // the logic instruction
-                assert_eq!(
-                    c.flag(C),
-                    result & 0x80 != 0,
-                    "{name} ${acc:02X} #${operand:02X} = ${result:02X}: carry from bit 7"
-                );
-                assert_eq!(
-                    c.flag(V),
-                    result & 0x40 != 0,
-                    "{name} ${acc:02X} #${operand:02X} = ${result:02X}: overflow from bit 6"
-                );
+                let before = format!("{name}: C in {carry_in}, V in {overflow_in}");
+                assert_eq!(c.a, result, "{before}: wrong result");
+                assert_eq!(c.flag(C), carry_in, "{before}: C must be untouched");
+                assert_eq!(c.flag(V), overflow_in, "{before}: V must be untouched");
+                assert_eq!(c.flag(N), result & 0x80 != 0, "{before}: N from bit 7");
+                assert_eq!(c.flag(Z), result == 0, "{before}: Z from zero");
             }
         }
-        // A carry that must go the other way too, so the test is not one that
-        // passes because every result happens to have bit 7 set.
+    }
+
+    /// The shape SMB's loader actually uses, run end to end: the carry from an
+    /// `ASL A` has to survive an `LDA` and an `ORA #$04` to decide the branch.
+    #[test]
+    fn a_carry_from_asl_survives_the_lda_and_ora_before_the_branch() {
+        // The value $80 shifts to $00 with C set; $00 has bit 7 clear, so a
+        // logic instruction that set C from its own result could only clear it.
         let mut bus = TestBus::new();
-        load(&mut bus, PROG, &[0xA9, 0x40, 0x09, 0x00]);
+        load(
+            &mut bus,
+            PROG,
+            &[
+                0xA9, 0x80, // LDA #$80
+                0x0A, // ASL A      -> A = $00, C = 1
+                0x48, // PHA
+                0xA9, 0x10, // LDA #$10   (the $0778 shadow, bit 7 clear)
+                0x09, 0x04, // ORA #$04   -> A = $14, carry must stay 1
+                0xB0, 0x02, // BCS +2     -> taken
+                0x29, 0xFB, // AND #$FB   (skipped)
+                0x85, 0x10, // STA $10
+            ],
+        );
         let mut c = Cpu::new();
         c.pc = PROG;
-        c.p |= C; // C arrives set...
-        c.step(&mut bus);
-        c.step(&mut bus);
-        assert!(
-            !c.flag(C),
-            "ORA #$00 onto $40 is $40: bit 7 clear, so the carry must be cleared"
+        c.step(&mut bus); // LDA
+        c.step(&mut bus); // ASL
+        c.step(&mut bus); // PHA
+        c.step(&mut bus); // LDA
+        c.step(&mut bus); // ORA
+        assert!(c.flag(C), "ORA must not have disturbed the ASL's carry");
+        c.step(&mut bus); // BCS
+        c.step(&mut bus); // STA
+        assert_eq!(
+            bus.read(0x10),
+            0x14,
+            "the increment-by-32 bit survived, so $2000 would get $94"
         );
     }
 
