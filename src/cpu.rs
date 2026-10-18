@@ -556,7 +556,8 @@ impl Cpu {
         let target = (self.pc as i16).wrapping_add(offset) as u16;
         let crossed = self.pc & 0xFF00 != target & 0xFF00;
         self.pc = target;
-        Self::branch_penalty(true, crossed)
+        // One cycle for taking it, one more when it crosses a page.
+        1 + u8::from(crossed)
     }
 
     // --- ALU ---
@@ -634,16 +635,6 @@ impl Cpu {
         r
     }
 
-    /// Cycles a branch costs on top of the base 2 every branch already has.
-    /// Shared with the test that pins 2 and 3.
-    fn branch_penalty(taken: bool, crossed: bool) -> u8 {
-        u8::from(taken) + u8::from(crossed)
-    }
-
-    #[cfg(test)]
-    fn take_branch_cycles(&self, taken: bool) -> u8 {
-        2 + Self::branch_penalty(taken, false)
-    }
 }
 
 #[cfg(test)]
@@ -737,16 +728,6 @@ mod tests {
         assert_eq!(cycles(b"\x60"), 6); // RTS
         assert_eq!(cycles(b"\x48"), 3); // PHA
         assert_eq!(cycles(b"\xEA"), 2); // NOP
-    }
-
-    #[test]
-    fn a_taken_branch_costs_one_more_than_a_not_taken_one() {
-        let mut bus = TestBus::new();
-        load(&mut bus, 0x1000, &[0xD0, 0x02, 0xEA]); // BNE +2, then NOP
-        let mut c = Cpu::new();
-        c.pc = 0x1000;
-        assert_eq!(c.take_branch_cycles(false), 2);
-        assert_eq!(c.take_branch_cycles(true), 3);
     }
 
     #[test]

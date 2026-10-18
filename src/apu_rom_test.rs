@@ -21,12 +21,7 @@ use crate::bus::Bus;
 use crate::cpu::Cpu;
 use crate::rom::Cartridge;
 
-/// The ROM, or `None` when the gitignored file is not in the working tree.
-/// Resolved from the manifest directory, so the suites read this checkout's
-/// `test_roms/` whatever directory the test binary was started in.
-fn rom_bytes(rel: &str) -> Option<Vec<u8>> {
-    ::std::fs::read(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel)).ok()
-}
+use crate::rom::test_rom;
 
 /// A powered-on NES with the two pieces the tests drive.
 pub struct Machine {
@@ -47,7 +42,7 @@ impl Machine {
     /// runs the next frame.
     fn frame(&mut self) {
         self.bus.run_frame(&mut self.cpu);
-        let _ = self.bus.ppu.take_frame();
+        self.bus.ppu.take_frame();
     }
 
     fn read(&mut self, addr: u16) -> u8 {
@@ -73,7 +68,7 @@ impl Machine {
 /// alone, and that nothing in the game's first 60 frames clears or inhibits it.
 #[test]
 fn smb_runs_sixty_frames_with_the_frame_irq_flag_up() {
-    let Some(bytes) = rom_bytes("Super Mario Bros. + Duck Hunt (USA).nes") else {
+    let Some(bytes) = test_rom("Super Mario Bros. + Duck Hunt (USA).nes") else {
         return;
     };
     let mut m = Machine::boot(&bytes);
@@ -173,7 +168,7 @@ fn the_2005_frame_counter_suite_reports_one_beep() {
     let roms: Vec<(&str, Vec<u8>)> = APU_2005_ROMS
         .iter()
         .filter_map(|name| {
-            rom_bytes(&format!("test_roms/apu_2005/{name}")).map(|bytes| (*name, bytes))
+            test_rom(&format!("test_roms/apu_2005/{name}")).map(|bytes| (*name, bytes))
         })
         .collect();
     if roms.is_empty() {
@@ -213,7 +208,7 @@ fn the_apu_reset_suite_reports_the_expected_codes() {
     let roms: Vec<(&str, u8, Vec<u8>)> = APU_RESET_ROMS
         .iter()
         .filter_map(|(name, want)| {
-            rom_bytes(&format!("test_roms/apu_reset/{name}")).map(|bytes| (*name, *want, bytes))
+            test_rom(&format!("test_roms/apu_reset/{name}")).map(|bytes| (*name, *want, bytes))
         })
         .collect();
     if roms.is_empty() {

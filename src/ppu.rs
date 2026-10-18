@@ -751,9 +751,10 @@ impl Ppu {
         &self.framebuffer
     }
 
-    pub fn take_frame(&mut self) -> Vec<u32> {
+    /// Consume the frame-ready flag. The framebuffer is left in place and read
+    /// through `framebuffer()`, so a frame costs no copy at all.
+    pub fn take_frame(&mut self) {
         self.frame_done = false;
-        self.framebuffer.clone()
     }
 
     pub fn nmi_pending(&self) -> bool {
@@ -908,12 +909,6 @@ impl Ppu {
         self.chr = [0; 16384];
         let n = data.len().min(self.chr.len());
         self.chr[..n].copy_from_slice(&data[..n]);
-    }
-}
-
-impl Default for Ppu {
-    fn default() -> Self {
-        Ppu::new()
     }
 }
 
@@ -1517,7 +1512,8 @@ mod tests {
             "the vblank flag was not set"
         );
         assert!(!p.nmi_pending(), "a $2002 read must clear the pending NMI");
-        assert_eq!(p.take_frame().len(), 256 * 240);
+        p.take_frame();
+        assert_eq!(p.framebuffer().len(), 256 * 240);
         assert!(!p.frame_ready(), "taking the frame must clear frame_ready");
     }
 

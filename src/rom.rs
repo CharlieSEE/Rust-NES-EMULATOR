@@ -164,29 +164,46 @@ impl Cartridge {
     }
 }
 
+/// 16-byte iNES header for a synthetic image, shared by every image builder in
+/// the crate. `mapper` is split the way iNES has it: low nibble in byte 6, high
+/// nibble in byte 7. 66 is the SMB + Duck Hunt GxROM board, which this repo also
+/// declares vertical mirroring and battery for; 0 is a plain NROM.
+#[cfg(test)]
+pub(crate) fn ines_header(prg_banks: u8, chr_banks: u8, mapper: u8) -> [u8; 16] {
+    let mut h = [0u8; 16];
+    h[..4].copy_from_slice(b"NES\x1a");
+    h[4] = prg_banks;
+    h[5] = chr_banks;
+    h[6] = (mapper & 0x0F) << 4 | if mapper == 66 { 0x01 } else { 0x00 };
+    h[7] = mapper & 0xF0 | if mapper == 66 { 0x08 } else { 0x00 };
+    h
+}
+
+/// A ROM under the manifest directory, or `None` when it is not on disk. The
+/// ROM images are gitignored, so every test that needs one must be able to skip
+/// on a clean checkout.
+#[cfg(test)]
+pub(crate) fn test_rom(rel: &str) -> Option<Vec<u8>> {
+    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel);
+    match std::fs::read(&path) {
+        Ok(b) => Some(b),
+        Err(_) => {
+            println!("note: {path} not present, skipping");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 16-byte iNES header: mapper 66, vertical mirroring, battery, and 2x8 KiB
-    /// of CHR ROM, which is honest -- the file really does carry 16 KiB of
-    /// tile data and the register's low two bits bank it.
-    fn ines_header(prg_banks: u8, chr_banks: u8) -> [u8; 16] {
-        let mut h = [0u8; 16];
-        h[..4].copy_from_slice(b"NES\x1a");
-        h[4] = prg_banks;
-        h[5] = chr_banks;
-        h[6] = 0x21; // vertical mirroring + battery
-        h[7] = 0x48; // mapper 66
-        h
-    }
 
     /// Two 32 KiB PRG banks where bank `i` is filled with the byte `i`, so the
     /// mapped bank is observable through `cpu_read`. `patch` is written into
     /// the power-on bank's `addr` so a matching write carries a value the
     /// power-on bank does not already select.
     fn banks_filled_with_their_own_index(addr: usize, patch: u8) -> Cartridge {
-        let mut bytes = ines_header(4, 2).to_vec();
+        let mut bytes = ines_header(4, 2, 66).to_vec();
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
@@ -197,7 +214,7 @@ mod tests {
 
     /// Two 32 KiB PRG banks, filled with `a` and `b`, and two 8 KiB CHR banks.
     fn two_banks_filled(a: u8, b: u8) -> Cartridge {
-        let mut bytes = ines_header(4, 2).to_vec();
+        let mut bytes = ines_header(4, 2, 66).to_vec();
         for fill in [a, b] {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
@@ -208,49 +225,14 @@ mod tests {
     /// The real cartridge, or `None` when it is not on disk: the ROM is
     /// gitignored, so a test that needs its actual bytes has to be able to skip.
     fn real_rom() -> Option<Vec<u8>> {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/Super Mario Bros. + Duck Hunt (USA).nes"
-        );
-        match std::fs::read(path) {
-            Ok(b) => Some(b),
-            Err(_) => {
-                println!("note: {path} not present, skipping");
-                None
-            }
-        }
-    }
-
-    /// A ROM under `test_roms/`, or `None` when it is not on disk. Those
-    /// images are gitignored too, so the tests that need them must be able to
-    /// skip on a clean checkout.
-    fn test_rom(rel: &str) -> Option<Vec<u8>> {
-        let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel);
-        match std::fs::read(&path) {
-            Ok(b) => Some(b),
-            Err(_) => {
-                println!("note: {path} not present, skipping");
-                None
-            }
-        }
-    }
-
-    /// 16-byte iNES header for a plain NROM board: mapper 0, no trainer.
-    fn nrom_header(prg_banks: u8, chr_banks: u8) -> [u8; 16] {
-        let mut h = [0u8; 16];
-        h[..4].copy_from_slice(b"NES\x1a");
-        h[4] = prg_banks;
-        h[5] = chr_banks;
-        h[6] = 0x00; // no mirroring bits that matter to the PPU
-        h[7] = 0x00; // mapper 0
-        h
+        test_rom("Super Mario Bros. + Duck Hunt (USA).nes")
     }
 
     /// A synthesized NROM image: 16 KiB PRG block `i` filled with
     /// `0x11 * (i + 1)` so the mapped block is observable through `cpu_read`,
     /// and `chr_banks` 8 KiB CHR banks filled with zero.
     fn nrom_cart(prg_banks: u8, chr_banks: u8) -> Cartridge {
-        let mut bytes = nrom_header(prg_banks, chr_banks).to_vec();
+        let mut bytes = ines_header(prg_banks, chr_banks, 0).to_vec();
         for i in 0..prg_banks {
             bytes.extend(std::iter::repeat_n(0x11 * (i + 1), PRG_UNIT));
         }
@@ -307,7 +289,7 @@ mod tests {
     fn a_bad_image_is_rejected() {
         assert!(Cartridge::load(b"nope").is_err(), "bad magic");
         assert!(Cartridge::load(b"NES\x1a").is_err(), "truncated");
-        let mut other_mapper = ines_header(4, 2);
+        let mut other_mapper = ines_header(4, 2, 66);
         other_mapper[7] = 0x43; // mapper 4, MMC3
         assert!(Cartridge::load(&other_mapper).is_err(), "wrong mapper");
     }
@@ -381,7 +363,7 @@ mod tests {
     /// in BOTH halves, so a model that stops reading after 16 KiB fails.
     #[test]
     fn nrom_mirrors_16k_prg_across_the_whole_window() {
-        let mut bytes = nrom_header(1, 0).to_vec();
+        let mut bytes = ines_header(1, 0, 0).to_vec();
         bytes.extend((0..PRG_UNIT).map(|o| o as u8)); // byte at offset o is o & $FF
         let c = Cartridge::load(&bytes).expect("16 KiB NROM image must load");
         assert_eq!(c.cpu_read(0x8000 + 0x1234), 0x34, "lower half");

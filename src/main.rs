@@ -406,10 +406,9 @@ fn main() -> Result<(), String> {
         }
         // `take_frame` is what clears the ready flag, and it is the ONLY thing that
         // does -- without this the loop above exits once and never runs again.
-        // Its returned clone is dropped; the upload reads the PPU's own buffer
-        // by reference instead, so a frame costs one 240 KiB copy rather than
-        // two.
-        let _ = bus.ppu.take_frame();
+        // The upload reads the PPU's own buffer by reference; a frame is never
+        // copied.
+        bus.ppu.take_frame();
         let frame = bus.ppu.framebuffer();
         frames += 1;
         if let Some(n) = dump_at.iter().find(|&&n| n == frames) {

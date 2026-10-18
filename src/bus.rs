@@ -111,6 +111,15 @@ impl Bus {
     pub fn power_on(&mut self) {
         self.cpu_ram = [0; 2048];
         self.prg_ram = [0; 8192];
+        self.clear_clock();
+        self.apu.power_on();
+    }
+
+    /// The clock's own state, shared by power-on and RESET: neither RAM is
+    /// touched -- hardware keeps RAM across a reset and power-on zeroes it
+    /// separately. Restarting on an even cycle is the alignment `$4014` counts
+    /// from.
+    fn clear_clock(&mut self) {
         self.cycles = 0;
         self.dot = 0;
         self.dma_stall = 0;
@@ -118,7 +127,6 @@ impl Bus {
         self.instr_cycles = 0;
         self.irq_line = false;
         self.irq_line_delayed = false;
-        self.apu.power_on();
     }
 
     /// The RESET button: both RAMs keep their contents -- hardware does not
@@ -128,13 +136,7 @@ impl Bus {
     /// yet; the `apu_reset` harness is what drives it.
     #[allow(dead_code)]
     pub fn reset(&mut self) {
-        self.cycles = 0;
-        self.dot = 0;
-        self.dma_stall = 0;
-        self.apu_skip = 0;
-        self.instr_cycles = 0;
-        self.irq_line = false;
-        self.irq_line_delayed = false;
+        self.clear_clock();
         self.apu.reset();
     }
 
@@ -338,17 +340,12 @@ mod tests {
     const BANK: usize = 0x8000;
     const POWER_ON_BANK: usize = 0;
 
-    /// 16-byte iNES header: mapper 66, vertical mirroring, and 2x8 KiB of CHR
-    /// ROM -- 16 KiB of real tile data in the file, banked by register bits
-    /// 1-0. `h[4]` is in 16 KiB units, which is why four of them is 64 KiB.
+    /// The GxROM header this suite keeps wanting: mapper 66, vertical
+    /// mirroring, 64 KiB PRG (two 32 KiB windows) and 2x8 KiB of CHR ROM --
+    /// 16 KiB of real tile data in the file, banked by register bits 1-0.
+    /// `h[4]` is in 16 KiB units, which is why four of them is 64 KiB.
     fn ines_header() -> [u8; 16] {
-        let mut h = [0u8; 16];
-        h[..4].copy_from_slice(b"NES\x1a");
-        h[4] = 4; // 64 KiB PRG, two 32 KiB windows
-        h[5] = 2;
-        h[6] = 0x21;
-        h[7] = 0x48;
-        h
+        crate::rom::ines_header(4, 2, 66)
     }
 
     /// A cartridge whose power-on bank holds `code` at `$8000` and whose RESET
@@ -374,9 +371,7 @@ mod tests {
     /// A 16 KiB NROM image with no CHR bytes at all, like blargg's 2005 suite:
     /// the PPU gets CHR RAM and the cartridge claims the `$6000-$7FFF` window.
     fn nrom_cart_no_chr() -> Cartridge {
-        let mut bytes = vec![0u8; 16];
-        bytes[..4].copy_from_slice(b"NES\x1a");
-        bytes[4] = 1; // 16 KiB PRG
+        let mut bytes = crate::rom::ines_header(1, 0, 0).to_vec(); // 16 KiB PRG
         bytes.resize(16 + 0x4000, 0);
         Cartridge::load(&bytes).expect("synthetic NROM image must load")
     }
