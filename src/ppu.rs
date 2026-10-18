@@ -1157,7 +1157,10 @@ mod tests {
         assert_eq!(p.chr[0], 0xAA, "the 8 KiB that exist");
         assert_eq!(p.chr[8192], 0x00, "the upper bank zero-fills");
         p.load_chr_rom(&[]); // the 2005 suite: no CHR bytes at all
-        assert_eq!(p.chr[0], 0x00, "an empty image leaves a zeroed pattern space");
+        assert_eq!(
+            p.chr[0], 0x00,
+            "an empty image leaves a zeroed pattern space"
+        );
     }
 
     /// With CHR ROM in the file, a `$2007` write into pattern space must still

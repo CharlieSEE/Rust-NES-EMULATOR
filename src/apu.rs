@@ -44,11 +44,12 @@ const CPU_HZ: u32 = 1_789_773;
 /// newest pair is dropped, which keeps memory bounded if no player drains it.
 const SAMPLE_QUEUE_CAP: usize = 96_000;
 
-/// CPU cycles after power-on or reset before the implied `$4017 = $00` write
-/// takes effect: blargg measured "as if $00 were written to $4017, then a 9-12
-/// clock delay, then execution" (`apu_reset`). Provisional; `09.reset_timing`
-/// and `4017_timing` are the arbiters.
-const RESET_DELAY: u8 = 12;
+/// How far into its frame the frame counter already is when power-on or reset
+/// hands control to the first instruction, in APU clocks. blargg measured the
+/// implied `$4017` write landing "9 to 12" CPU cycles before that instruction
+/// and "usually 9" (`apu_reset`); 5 APU clocks is 10 CPU cycles, which
+/// `4017_timing` reports as 9.
+const RESET_PRE: u32 = 3;
 
 /// The frame counter's output for one CPU cycle.
 #[derive(Clone, Copy, Default)]
@@ -74,7 +75,11 @@ struct Frame {
     pending_mode: u8,
     /// The last value written to `$4017`, reapplied on reset.
     last_write: u8,
-    /// Quarter/half signals raised by a write, delivered next CPU cycle.
+    /// Quarter/half signals raised by a write or by a step, delivered on the
+    /// next CPU cycle: "each step of the sequence will occur once that total
+    /// has reached the indicated amount (with an additional delay of one CPU
+    /// cycle for the quarter and half frame signals)" (NESdev "APU Frame
+    /// Counter"). `apu_2005`'s `05.len_timing_mode0` measures that cycle.
     quarter: bool,
     half: bool,
     /// The interrupt flag is still being re-raised for this many CPU cycles.
@@ -113,6 +118,19 @@ impl Frame {
         self.schedule(val, delay);
     }
 
+    /// Power-on and reset: as if `val` had been written to `$4017` before the
+    /// first instruction, late enough that its mode change has already taken
+    /// effect and the counter is `pre` APU clocks into its frame. blargg's
+    /// apu_reset suite measures the write 9-12 CPU cycles before that first
+    /// instruction and "usually 9" (readme.txt); `pre` of 5 puts this
+    /// implementation on 9.
+    fn start(&mut self, val: u8, pre: u32) {
+        self.schedule(val, 0);
+        self.mode = self.pending_mode;
+        self.cycle = pre;
+        self.reset_in = 0;
+    }
+
     fn schedule(&mut self, val: u8, delay: u8) {
         self.last_write = val;
         self.inhibit = val & 0x40 != 0;
@@ -141,7 +159,7 @@ impl Frame {
             self.set_flag();
         }
 
-        let mut clocks = Clocks {
+        let clocks = Clocks {
             quarter: self.quarter,
             half: self.half,
         };
@@ -157,14 +175,21 @@ impl Frame {
             }
         } else if self.phase {
             // The PUT half of APU cycle `cycle`: where the wiki's steps sit.
+            // "with an additional delay of one CPU cycle for the quarter and
+            // half frame signals": the step raises them, the next CPU cycle
+            // delivers them. The interrupt flag below is NOT delayed.
             match (self.mode, self.cycle) {
-                (_, 3728) | (_, 11185) => clocks.quarter = true,
+                (_, 3728) | (_, 11185) => self.quarter = true,
                 (_, 7456) | (0, 14914) | (1, 18640) => {
-                    clocks.quarter = true;
-                    clocks.half = true;
+                    self.quarter = true;
+                    self.half = true;
                 }
                 _ => {}
             }
+            // The frame IRQ flag is NOT delayed with them: the wiki's table
+            // sets it on three consecutive CPU cycles, 14914 GET through
+            // 14915 GET, which is what `apu_2005`'s `07.irq_flag_timing`
+            // measures.
             if self.mode == 0 && self.cycle == 14914 {
                 self.set_flag();
                 self.pulse = 2;
@@ -183,52 +208,85 @@ impl Frame {
 /// The length counter every channel owns.
 #[derive(Clone, Copy, Default)]
 struct LengthCounter {
-    /// Set by `$4015`; a disabled channel's counter is held at zero. Every
-    /// channel starts enabled at power and reset (blargg, `apu_reset`).
+    /// Set by `$4015`; a disabled channel's counter is held at zero. Power-on
+    /// and reset both leave every channel disabled until `$4015` is written
+    /// (blargg, `apu_reset` `4015_cleared`).
     enabled: bool,
-    /// The halt flag as written. The clocking circuits see it one CPU clock
-    /// later, through `halt_delayed`.
+    /// The halt flag as written, and the flag the clocking circuits see one
+    /// CPU clock later. Hardware registers the write on the next APU clock and
+    /// ours lands at the end of the write's own CPU cycle (see
+    /// `Bus::apu_advance_ahead`), so the circuits see it two clocks later.
     halt: bool,
+    halt_staged: bool,
     halt_delayed: bool,
     length: u8,
     reload_value: u8,
-    reload_pending: bool,
-    /// The reload flag was set during the clocking clock just now.
-    reload_recent: bool,
+    /// A load waiting for the same two clocks, and whether a length clock in
+    /// the CPU clock right after the write's own clock suppresses it.
+    load_pending: bool,
+    load_staged: bool,
+    load_suppressed: bool,
+    /// The counter was clocked while live in this CPU clock.
+    load_ignored: bool,
 }
 
 impl LengthCounter {
+    /// `$400x`: loaded straight away, not at the next half frame (NESdev
+    /// "APU Length Counter": "if the enabled flag is set, the length counter is
+    /// loaded with entry L of the length table"). A disabled channel cannot be
+    /// loaded at all. Like the halt flag, the load lands two CPU clocks later.
     fn write_length(&mut self, val: u8) {
         self.reload_value = val >> 3;
-        self.reload_pending = true;
-        self.reload_recent = true;
+        self.load_pending = true;
+        self.load_suppressed = false;
     }
 
-    /// One half-frame clock. blargg's four edge cases:
-    /// - a reload written in the clocking clock is dropped when the counter
-    ///   is live (the clock still runs);
-    /// - a reload written between clocks lands, and the clock still runs,
-    ///   because the "clocked while already zero" check uses the value from
-    ///   before the reload;
-    /// - with a zero counter the reload wins and nothing clocks;
-    /// - a halt write in the clocking clock does not stop that clock.
+    /// One half-frame clock (NESdev "APU Length Counter"): decrement, except
+    /// when the counter is zero or halted.
     fn clock(&mut self) {
         let was_zero = self.length == 0;
-        let dropped = self.reload_recent && !was_zero;
-        if self.reload_pending && self.enabled && !dropped {
-            self.length = LENGTH_TABLE[self.reload_value as usize];
-        }
         if !was_zero && !self.halt_delayed {
             self.length -= 1;
         }
-        self.reload_pending = false;
+        self.load_ignored = !was_zero;
     }
 
-    /// One CPU clock of bookkeeping: the halt flag arrives one clock late and
-    /// a write's "recent" mark lasts one clock.
+    /// One CPU cycle of bookkeeping, before the frame counter clocks: the halt
+    /// flag and any load arrive two clocks late (blargg, "Length Halt"), and
+    /// the "clocked while live" mark lasts one clock.
     fn tick(&mut self) {
+        self.halt_delayed = self.halt_staged;
+        self.halt_staged = self.halt;
+        // A length clock in the CPU clock right after the write's own clock
+        // ignores the load completely, when the counter was live before it
+        // (blargg, "Length Reload" -- "written during length clocking"). A
+        // clock in the write's own CPU clock came first and lets the load
+        // through afterwards.
+        if self.load_staged && self.load_ignored {
+            self.load_suppressed = true;
+        }
+        if self.load_staged {
+            self.load_staged = false;
+            if self.enabled && !self.load_suppressed {
+                self.length = LENGTH_TABLE[self.reload_value as usize];
+            }
+        }
+        self.load_staged = self.load_pending;
+        self.load_pending = false;
+        self.load_ignored = false;
+    }
+
+    /// Clearing `$4015`'s bit for this channel: the counter is forced to 0 and
+    /// stays there until enabled again. A reset clears every bit.
+    fn clear(&mut self) {
+        self.enabled = false;
+        self.length = 0;
+        self.load_pending = false;
+        self.load_staged = false;
+        self.load_suppressed = false;
+        self.load_ignored = false;
+        self.halt_staged = self.halt;
         self.halt_delayed = self.halt;
-        self.reload_recent = false;
     }
 }
 
@@ -588,31 +646,38 @@ impl Apu {
         apu
     }
 
-    /// Power-on: the counter behaves "as if $00 were written to $4017" a few
-    /// clocks before the first instruction, and every length counter starts
-    /// enabled.
+    /// Power-on: all channel state starts cleared, and the frame counter
+    /// behaves "as if $00 were written to $4017" a few clocks before the first
+    /// instruction.
     pub fn power_on(&mut self) {
-        self.restart(0x00);
+        self.pulses = [Pulse::new(true), Pulse::new(false)];
+        self.triangle = Triangle::default();
+        self.noise = Noise::new();
+        self.frame = Frame::new();
+        self.frame.start(0x00, RESET_PRE);
     }
 
-    /// The RESET button: RAM survives, the counter restarts, and `$4017` is
-    /// re-written with its last value (both measured by the apu_reset suite).
+    /// The RESET button: RAM survives, every channel register keeps its value,
+    /// `$4015` is cleared (which forces the length counters to 0), and the
+    /// counter restarts as if the last value written to `$4017` were written
+    /// again.
+    ///
+    /// The preserved registers are measured: `apu_reset`'s `len_ctrs_enabled`
+    /// halts the triangle before pressing RESET and expects its length counter
+    /// to survive, while the unhalted channels' counters expire.
+    ///
+    /// Nothing in the player's run loop presses RESET yet; the `apu_reset`
+    /// harness is what drives it.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         let last = self.frame.last_write;
-        self.restart(last);
-    }
-
-    fn restart(&mut self, val: u8) {
-        self.frame = Frame::new();
-        self.frame.schedule(val, RESET_DELAY);
-        self.pulses = [Pulse::new(true), Pulse::new(false)];
         for p in &mut self.pulses {
-            p.len.enabled = true;
+            p.len.clear();
         }
-        self.triangle = Triangle::default();
-        self.triangle.len.enabled = true;
-        self.noise = Noise::new();
-        self.noise.len.enabled = true;
+        self.triangle.len.clear();
+        self.noise.len.clear();
+        self.frame = Frame::new();
+        self.frame.start(last, RESET_PRE);
     }
 
     /// Sample rate for the mixer.
@@ -632,6 +697,14 @@ impl Apu {
         // ...except the triangle's and the noise's, which run at the CPU rate.
         self.triangle.tick();
         self.noise.tick();
+
+        // The channels' delayed control signals -- halt, and the "clocked while
+        // live" mark -- arrive before this cycle's clocks.
+        for p in &mut self.pulses {
+            p.len.tick();
+        }
+        self.triangle.len.tick();
+        self.noise.len.tick();
 
         let clocks = self.frame.tick();
         if clocks.quarter {
@@ -653,11 +726,6 @@ impl Apu {
             self.triangle.len.clock();
             self.noise.len.clock();
         }
-        for p in &mut self.pulses {
-            p.len.tick();
-        }
-        self.triangle.len.tick();
-        self.noise.len.tick();
 
         self.acc += self.rate;
         while self.acc >= CPU_HZ {
@@ -747,18 +815,21 @@ impl Apu {
 
     fn write_status(&mut self, val: u8) {
         for (i, p) in self.pulses.iter_mut().enumerate() {
-            p.len.enabled = val & (1 << i) != 0;
-            if !p.len.enabled {
-                p.len.length = 0;
+            if val & (1 << i) != 0 {
+                p.len.enabled = true;
+            } else {
+                p.len.clear();
             }
         }
-        self.triangle.len.enabled = val & 0x04 != 0;
-        if !self.triangle.len.enabled {
-            self.triangle.len.length = 0;
+        if val & 0x04 != 0 {
+            self.triangle.len.enabled = true;
+        } else {
+            self.triangle.len.clear();
         }
-        self.noise.len.enabled = val & 0x08 != 0;
-        if !self.noise.len.enabled {
-            self.noise.len.length = 0;
+        if val & 0x08 != 0 {
+            self.noise.len.enabled = true;
+        } else {
+            self.noise.len.clear();
         }
     }
 
@@ -775,37 +846,42 @@ impl Apu {
 mod tests {
     use super::*;
 
-    /// blargg's readme, mode 0, working backwards: a `$00` write takes effect
-    /// 3 CPU cycles later and the step clocks land on the PUT halves of APU
-    /// cycles 7456 and 14914 -- CPU 14915 and 29831 after the write.
+    /// blargg's readme, mode 0: after a `$00` write the steps land on CPU
+    /// cycles 7459, 14915, 22373 and 29831, and only steps 2 and 4 clock the
+    /// length counter.
     #[test]
-    fn the_frame_counter_clocks_length_only_on_the_steps_that_do() {
+    fn the_frame_counter_clocks_length_twice_a_mode_0_frame() {
         let mut apu = Apu::new();
         apu.cpu_write(0x4015, 0x01); // enable pulse 1
-        apu.cpu_write(0x4003, 0xF0); // length index 30 -> 32, on a clock
+        apu.cpu_write(0x4003, 0xF0); // length index 30 -> 32
+        apu.tick(); // into the write's staging slot
+        apu.tick(); // and into the counter
         assert_eq!(
-            apu.pulses[0].len.length, 0,
-            "the load waits for a half frame"
+            apu.pulses[0].len.length, 32,
+            "the load does not wait for a half frame"
         );
 
         apu.cpu_write(0x4017, 0x00); // begin mode 0
-        for _ in 0..10_000 {
-            apu.tick();
-        }
-        assert_eq!(apu.pulses[0].len.length, 0, "no half frame before 14915");
-        for _ in 0..10_000 {
+        for _ in 0..14_900 {
             apu.tick();
         }
         assert_eq!(
             apu.pulses[0].len.length, 32,
-            "the first half frame reloads and does not clock"
+            "step 1 at CPU 7459 clocks the linear counter only"
         );
         for _ in 0..10_000 {
             apu.tick();
         }
         assert_eq!(
             apu.pulses[0].len.length, 31,
-            "the fourth step clocks the length too"
+            "step 2 at CPU 14915 clocks the length too"
+        );
+        for _ in 0..15_100 {
+            apu.tick();
+        }
+        assert_eq!(
+            apu.pulses[0].len.length, 30,
+            "step 4 at CPU 29831 clocks it again"
         );
     }
 
@@ -876,54 +952,76 @@ mod tests {
         );
     }
 
-    /// blargg's four halt/reload edge cases, as unit tests of the counters.
+    /// blargg's halt and reload edge cases (readmes "Length Halt", "Length
+    /// Reload"), as unit tests of the counter.
     #[test]
     fn length_halt_and_reload_edges_follow_the_readme() {
-        // The clocking circuits see the halt flag one CPU clock late: a halt
-        // write in the clocking clock does not stop it, the next one does.
+        // The clocking circuits see the halt flag two CPU clocks late: the
+        // write lands at the end of its own clock, hardware registers it on
+        // the next APU clock. A halt write in the clocking clock therefore
+        // does not stop that clock, and one in the clock before it does.
         let mut p = Pulse::default();
         p.len.enabled = true;
         p.len.length = 32;
         p.write_ctrl(0x30); // halt set...
-        p.len.clock(); // ...but the clock fires anyway
+        p.len.clock(); // ...but the same-clock clock fires anyway
         assert_eq!(
             p.len.length, 31,
             "a same-clock halt write does not stop the clock"
         );
-        p.len.halt_delayed = p.len.halt;
+        p.len.tick();
+        p.len.tick();
         p.len.clock();
-        assert_eq!(p.len.length, 31, "the next clock sees the halt");
+        assert_eq!(p.len.length, 31, "the second clock sees the halt");
 
-        // A reload written in the clocking clock is dropped when the counter
-        // is live; a reload written between clocks lands (and still clocks).
+        // A write loads the counter two CPU clocks later (NESdev "APU Length
+        // Counter"), no half frame needed.
         let mut p = Pulse::default();
         p.len.enabled = true;
         p.len.length = 100;
         p.write_length(0xF0); // index 30 -> 32
-        p.len.reload_recent = true;
-        p.len.clock();
+        p.len.tick();
+        p.len.tick();
+        assert_eq!(p.len.length, 32, "the load does not wait for a half frame");
+
+        // A load written in the clock right after the write's own clock is
+        // ignored completely; the clock itself still runs. "Length reload is
+        // completely ignored if written during length clocking and length
+        // counter is non-zero before clocking."
+        p.len.length = 100;
+        p.write_length(0xF0);
+        p.len.tick();
+        p.len.clock(); // 100 -> 99, and this clock drops the load
+        p.len.tick();
         assert_eq!(
             p.len.length, 99,
             "reload dropped, the counter still clocked"
         );
-        p.write_length(0xF0);
-        p.len.reload_recent = false;
-        p.len.clock();
-        assert_eq!(
-            p.len.length, 31,
-            "a write between clocks reloads, then clocks"
-        );
 
-        // With a zero counter the reload wins even in the clocking clock, and
-        // the clock does not run: "clocked while already zero" silences.
+        // A load written between clocks lands, and the next clock clocks it.
+        p.write_length(0xF0);
+        p.len.tick();
+        p.len.tick();
+        assert_eq!(p.len.length, 32, "a write between clocks reloads");
+        p.len.clock();
+        assert_eq!(p.len.length, 31, "and then the clock runs");
+
+        // With a zero counter the load wins: "clocked while already zero"
+        // neither decrements nor ignores the load.
+        p.len.length = 0;
+        p.len.clock();
+        p.write_length(0xF0);
+        p.len.tick();
+        p.len.tick();
+        assert_eq!(p.len.length, 32, "a load during a zero clock lands in full");
+
+        // A disabled channel cannot be loaded at all.
+        p.len.enabled = false;
         p.len.length = 0;
         p.write_length(0xF0);
-        p.len.reload_recent = true;
-        p.len.clock();
-        assert_eq!(
-            p.len.length, 32,
-            "reloaded, and not clocked because it was zero"
-        );
+        p.len.tick();
+        p.len.tick();
+        assert_eq!(p.len.length, 0, "a disabled counter stays zero");
     }
 
     /// The four digitized waveforms (NESdev "APU Pulse"), stepped once per

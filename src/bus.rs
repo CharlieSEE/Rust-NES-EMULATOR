@@ -58,6 +58,20 @@ pub struct Bus {
     /// spends these cycles ticking the PPU, which keeps clocking during the
     /// stall exactly as it does on hardware.
     dma_stall: u16,
+    /// CPU cycles of APU advancement the instruction in progress still owes its
+    /// own ticks: an APU-register access is placed on the cycle it really
+    /// happens by advancing the APU now and skipping that many ticks. Always 0
+    /// at an instruction boundary; see `apu_advance_ahead`.
+    apu_skip: u8,
+    /// The cycle count `Cpu::step` announced for the instruction in progress,
+    /// or 0 when the bus has not been told (a DMA's reads, a test).
+    instr_cycles: u8,
+    /// The APU's frame interrupt line, and the same line one CPU cycle ago: the
+    /// CPU samples `/IRQ` during the penultimate cycle of an instruction, which
+    /// is what blargg's `08.irq_timing` measures, so `run_frame` asks about the
+    /// older one.
+    irq_line: bool,
+    irq_line_delayed: bool,
 }
 
 impl Bus {
@@ -72,6 +86,10 @@ impl Bus {
             cycles: 0,
             dot: 0,
             dma_stall: 0,
+            apu_skip: 0,
+            instr_cycles: 0,
+            irq_line: false,
+            irq_line_delayed: false,
         };
         // The PPU fetches pattern memory every dot, so the CHR image the
         // cartridge parsed out of the file is loaded once, here. A cartridge
@@ -94,18 +112,54 @@ impl Bus {
         self.cycles = 0;
         self.dot = 0;
         self.dma_stall = 0;
+        self.apu_skip = 0;
+        self.instr_cycles = 0;
+        self.irq_line = false;
+        self.irq_line_delayed = false;
         self.apu.power_on();
     }
 
     /// The RESET button: both RAMs keep their contents -- hardware does not
     /// clear RAM on reset, and apu_reset's `4015_cleared` ROM measures exactly
     /// that a `$4015` write survives one -- while the cycle count restarts at
-    /// an even cycle like power-on's.
+    /// an even cycle like power-on's. The player does not expose a reset key
+    /// yet; the `apu_reset` harness is what drives it.
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.cycles = 0;
         self.dot = 0;
         self.dma_stall = 0;
+        self.apu_skip = 0;
+        self.instr_cycles = 0;
+        self.irq_line = false;
+        self.irq_line_delayed = false;
         self.apu.reset();
+    }
+
+    /// Put an APU-register access on the cycle it really happens.
+    ///
+    /// `Cpu::step` performs every access of an instruction before ticking any of
+    /// its cycles, but on hardware the last access *is* the last cycle, and the
+    /// frame-counter ROMs are written in exactly those terms. So the APU is
+    /// advanced to the access's cycle here, and the instruction's own ticks skip
+    /// the same number of cycles: the APU still advances exactly one cycle per
+    /// CPU cycle, and `tick` is left to the PPU's pacing alone.
+    ///
+    /// A read then sees the state as of the end of the last cycle, which is what
+    /// `apu_2005` measures on both sides: `07.irq_flag_timing` wants the frame
+    /// IRQ flag the step raised in that cycle to be there, and `05` wants a read
+    /// landing on the cycle *after* a length clock to see it.
+    fn apu_advance_ahead(&mut self, cycles: u8) {
+        // Only the first APU access of an instruction is placed; a second one
+        // lands on the same cycle anyway, and `0` means nobody said how long the
+        // instruction is (a DMA's reads, a test), so leave the access alone.
+        if self.apu_skip > 0 || self.instr_cycles == 0 {
+            return;
+        }
+        for _ in 0..cycles {
+            self.apu.tick();
+        }
+        self.apu_skip = cycles;
     }
 
     pub fn cpu_read(&mut self, addr: u16) -> u8 {
@@ -116,7 +170,10 @@ impl Bus {
             // "$2000-$2007 ... $2008-$3FFF: mirrors of $2000-$2007 (repeats
             // every 8 bytes)"; the PPU does the `& 7` itself.
             0x2000..=0x3FFF => self.ppu.cpu_read(addr),
-            0x4015 => self.apu.cpu_read(addr),
+            0x4015 => {
+                self.apu_advance_ahead(self.instr_cycles);
+                self.apu.cpu_read(addr)
+            }
             0x4016 => self.controllers[0].read(),
             0x4017 => self.controllers[1].read(),
             // The cartridge may populate this window with PRG RAM. Both NROM
@@ -138,7 +195,10 @@ impl Bus {
             // `$4000-$4013` are the APU's channels -- `$4010-$4013` being the
             // DMC, which this APU drops -- and `$4015`/`$4017` its status and
             // frame counter.
-            0x4000..=0x4013 | 0x4015 | 0x4017 => self.apu.cpu_write(addr, val),
+            0x4000..=0x4013 | 0x4015 | 0x4017 => {
+                self.apu_advance_ahead(self.instr_cycles);
+                self.apu.cpu_write(addr, val)
+            }
             // One `$4016` write latches BOTH ports: "Though both are polled from
             // a write to $4016, controller 1 is read through $4016, and
             // controller 2 is separately read through $4017" (NESdev
@@ -180,7 +240,13 @@ impl Bus {
         }
         self.dot = 0;
         self.cycles += 1;
-        self.apu.tick();
+        if self.apu_skip > 0 {
+            self.apu_skip -= 1;
+        } else {
+            self.apu.tick();
+        }
+        self.irq_line_delayed = self.irq_line;
+        self.irq_line = self.apu.irq_pending();
         if self.dma_stall > 0 {
             self.dma_stall -= 1;
         }
@@ -199,8 +265,10 @@ impl Bus {
                 continue;
             }
             // `Cpu::irq` itself refuses while `I` is set, and the APU's flag
-            // stays up until `$4015` is read, so this line keeps re-asking.
-            if self.apu.irq_pending() {
+            // stays up until `$4015` is read, so this line keeps re-asking. It
+            // asks about the line as of one cycle ago: hardware samples `/IRQ`
+            // during the penultimate cycle of an instruction.
+            if self.irq_line_delayed {
                 cpu.irq(self);
             }
             cpu.step(self);
@@ -224,6 +292,10 @@ impl Bus {
     /// `$20xx` samples PPU registers and one out of `$40xx` the APU window.
     fn oam_dma(&mut self, page: u8) {
         let base = (page as u16) << 8;
+        // The DMA's 256 reads are not the instruction's access: nothing here may
+        // be placed on a cycle, and a page of `$40` reads APU registers (which
+        // `$4015` clears the frame IRQ flag on, as on hardware).
+        self.instr_cycles = 0;
         self.ppu.cpu_write(0x2003, 0);
         for offset in 0..256u16 {
             let byte = self.cpu_read(base + offset);
@@ -248,6 +320,10 @@ impl BusLike for Bus {
 
     fn tick(&mut self) {
         Bus::tick(self);
+    }
+
+    fn instruction_cycles(&mut self, cycles: u8) {
+        self.instr_cycles = cycles;
     }
 }
 

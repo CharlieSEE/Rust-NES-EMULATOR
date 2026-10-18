@@ -26,6 +26,14 @@ pub trait BusLike {
     fn read(&mut self, addr: u16) -> u8;
     fn write(&mut self, addr: u16, val: u8);
     fn tick(&mut self);
+    /// The instruction about to run costs this many CPU cycles. Its accesses
+    /// all happen up front, before `tick` is called for any of them, but on
+    /// hardware the last access *is* the last cycle. `Bus` uses this to put an
+    /// APU-register access on the cycle it really happens; a bus that does not
+    /// care (any test bus) keeps the default.
+    fn instruction_cycles(&mut self, cycles: u8) {
+        let _ = cycles;
+    }
 }
 
 /// Cycles an `nmi` or `irq` sequence costs. Both push the stack themselves and
@@ -183,6 +191,7 @@ impl Cpu {
         self.pc = self.pc.wrapping_add(1);
         let mode = MODE[op as usize];
         let mut cycles = CYCLES[op as usize];
+        bus.instruction_cycles(cycles);
         match op {
             // --- loads: the only reads that owe a page-cross cycle ---
             0xA9 | 0xA5 | 0xB5 | 0xAD | 0xBD | 0xB9 | 0xB1 | 0xA1 => {

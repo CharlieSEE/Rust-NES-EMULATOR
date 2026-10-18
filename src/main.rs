@@ -2,6 +2,8 @@ use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
 
 mod apu;
+#[cfg(test)]
+mod apu_rom_test;
 mod bus;
 mod controller;
 mod cpu;
