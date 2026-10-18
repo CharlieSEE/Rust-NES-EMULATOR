@@ -268,6 +268,21 @@ fn main() -> Result<(), String> {
 
     let sdl = sdl2::init().map_err(|e| e.to_string())?;
     let video = sdl.video().map_err(|e| e.to_string())?;
+    // Audio is best-effort: the picture is the primary output, so a machine
+    // with no audio subsystem, no device or a refused spec still emulates,
+    // silently, at full speed.
+    let audio: Option<sdl2::audio::AudioQueue<i16>> = sdl.audio().ok().and_then(|audio| {
+        sdl2::audio::AudioQueue::<i16>::open_queue(
+            &audio,
+            None,
+            &sdl2::audio::AudioSpecDesired {
+                freq: Some(48_000),
+                channels: Some(2),
+                samples: Some(1024),
+            },
+        )
+        .ok()
+    });
     let window = video
         .window("NES", (W as u32) * SCALE, (H as u32) * SCALE)
         .position_centered()
@@ -294,6 +309,12 @@ fn main() -> Result<(), String> {
     let mut cpu = Cpu::new();
     bus.power_on();
     cpu.reset(&mut bus);
+
+    if let Some(queue) = &audio {
+        // The device picks a rate it can actually do; the mixer follows it.
+        bus.apu.set_sample_rate(queue.spec().freq as u32);
+        queue.resume();
+    }
 
     let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
     let mut play = script.map(Play::new);
@@ -330,6 +351,14 @@ fn main() -> Result<(), String> {
         // gates its status bar on a sprite-0 hit and its NMI handler on
         // `$2002`, so this is where the machine actually lives.
         bus.run_frame(&mut cpu);
+        if let Some(queue) = &audio {
+            let samples = bus.apu.take_samples();
+            if !samples.is_empty() {
+                // A device that stops accepting samples must not stop the
+                // emulator: the picture is the primary output.
+                let _ = queue.queue_audio(&samples);
+            }
+        }
         // `take_frame` is what clears the ready flag, and it is the ONLY thing that
         // does -- without this the loop above exits once and never runs again.
         // Its returned clone is dropped; the upload reads the PPU's own buffer
