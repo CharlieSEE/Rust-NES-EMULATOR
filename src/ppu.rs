@@ -800,7 +800,7 @@ impl Ppu {
                 // Nothing else in `t` moves, and SMB does write $2000 mid-frame
                 // (NESdev "PPUCTRL - Bit 0 race condition" says so), so wiping
                 // the scroll here would lose it.
-                self.t = (self.t & !0x0C03) | (val as u16 & 0x03) | ((val as u16 & 0x03) << 10);
+                self.t = (self.t & !0x0C00) | ((val as u16 & 0x03) << 10);
                 // "Changing NMI enable from 0 to 1 while the vblank flag in
                 // PPUSTATUS is 1 will immediately trigger an NMI."
                 if val & 0x80 != 0 && self.status & 0x80 != 0 {
@@ -1473,21 +1473,28 @@ mod tests {
         assert!(!p.frame_ready(), "taking the frame must clear frame_ready");
     }
 
-    /// `$2000`'s nametable select lives in `t` at bits 10-11 and 0-1 and nothing
-    /// else in `t` moves: a game that changes nametables mid-frame must not lose
-    /// the scroll it parked there.
+    /// `$2000`'s nametable select lives in `t` at bits 10-11 and nowhere else.
+    /// The select values are chosen so their low two bits (00, then 11) differ
+    /// from coarse_x 18's (10): a write that also lands in `t`'s bits 0-1 would
+    /// reset coarse X's low two bits, and Super Mario Bros. does write `$2000`
+    /// mid-frame right after it parks the split scroll, so the playfield would
+    /// jump 8/16 pixels against the sprites as the camera moved.
     #[test]
     fn writing_2000_only_moves_the_nametable_bits() {
         let mut p = Ppu::new();
-        p.cpu_write(0x2005, 0x90); // coarse_x = 18 (bits 0-1 = 10), fine_x = 0
+        p.cpu_write(0x2005, 0x91); // coarse_x = 18 (bits 0-1 = 10), fine_x = 1
         p.cpu_write(0x2005, 0xC8); // coarse_y = 25, fine_y = 0
-        p.cpu_write(0x2000, 0x02); // nametable select 2: d's bits 0-1 also land
-                                   // in t's bits 0-1, which are coarse_x's low
-                                   // two bits -- 18 already ends in 10
+        p.cpu_write(0x2000, 0x00); // nametable select 0: d's bits 0-1 are 00
         assert_eq!(
             p.temp_vram_addr(),
-            (2 << 10) | (25 << 5) | 18,
-            "$2000 must not disturb the scroll in t"
+            (25 << 5) | 18,
+            "$2000's low bits must not land in t's bits 0-1, which are coarse X's"
+        );
+        p.cpu_write(0x2000, 0x03); // nametable select 3: d's bits 0-1 are 11
+        assert_eq!(
+            p.temp_vram_addr(),
+            (3 << 10) | (25 << 5) | 18,
+            "the nametable select must reach t's bits 10-11 and stop there"
         );
     }
 
