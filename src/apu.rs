@@ -25,6 +25,13 @@ const LENGTH_TABLE: [u8; 32] = [
 /// waveform starts at 0.
 const DUTY_SEQUENCES: [u8; 4] = [0x40, 0x60, 0x78, 0x9F];
 
+/// The triangle's 32-step ladder: 15 down to 0, then 0 back up to 15
+/// (NESdev "APU Triangle", "Sequencer operation").
+const TRIANGLE_SEQUENCE: [u8; 32] = [
+    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+    13, 14, 15,
+];
+
 /// CPU cycles after power-on or reset before the implied `$4017 = $00` write
 /// takes effect: blargg measured "as if $00 were written to $4017, then a 9-12
 /// clock delay, then execution" (`apu_reset`). Provisional; `09.reset_timing`
@@ -391,20 +398,79 @@ impl Pulse {
     }
 }
 
-/// The triangle channel.
+/// The triangle channel: sequencer, linear counter, length counter. Its
+/// timer runs at the CPU clock, twice the rate of every other channel's.
 #[derive(Clone, Copy, Default)]
 struct Triangle {
     len: LengthCounter,
+    /// `$4008` bit 7: the linear counter control flag, shared with the
+    /// length counter halt.
+    control: bool,
+    /// `$4008` bits 6-0.
+    reload_value: u8,
+    linear_reload: bool,
+    linear: u8,
+    timer: u16,
+    divider: u16,
+    /// The index of the next sequence step; the value of the step just
+    /// taken lives in `value`.
+    sequence: u8,
+    /// The held DAC output: 15..0..15 while clocked, frozen when silenced.
+    value: u8,
 }
 
 impl Triangle {
     fn write_ctrl(&mut self, val: u8) {
-        // The control flag is the length counter halt for this channel.
-        self.len.halt = val & 0x80 != 0;
+        self.control = val & 0x80 != 0;
+        self.reload_value = val & 0x7F;
+        self.len.halt = self.control;
+    }
+
+    fn write_timer_low(&mut self, val: u8) {
+        self.timer = (self.timer & 0x700) | val as u16;
     }
 
     fn write_length(&mut self, val: u8) {
+        self.timer = (self.timer & 0xFF) | ((val as u16 & 0x07) << 8);
         self.len.write_length(val);
+        // "Writing to this register sets the linear counter reload flag."
+        self.linear_reload = true;
+    }
+
+    /// One quarter-frame clock (NESdev "APU Triangle", "Sequencer operation",
+    /// step 1): "If the linear counter reload flag is set, the counter is
+    /// reloaded; otherwise, if the counter is non-zero, it is decremented.
+    /// If the control flag is clear, the reload flag is cleared."
+    fn clock_linear(&mut self) {
+        if self.linear_reload {
+            self.linear = self.reload_value;
+        } else if self.linear > 0 {
+            self.linear -= 1;
+        }
+        if !self.control {
+            self.linear_reload = false;
+        }
+    }
+
+    /// One CPU clock. "The triangle channel's timer is clocked at the CPU
+    /// clock rate, rather than the APU clock rate"; the sequencer advances
+    /// only while both counters are non-zero.
+    fn tick(&mut self) {
+        if self.divider == 0 {
+            self.divider = self.timer;
+            if self.len.length > 0 && self.linear > 0 {
+                self.value = TRIANGLE_SEQUENCE[self.sequence as usize];
+                self.sequence = (self.sequence + 1) & 31;
+            }
+        } else {
+            self.divider -= 1;
+        }
+    }
+
+    /// The held DAC value. There is no gate here: a silenced triangle keeps
+    /// feeding its last value to the mixer, which is the audible "pop".
+    fn output(&self) -> u8 {
+        self.value
     }
 }
 
@@ -482,21 +548,23 @@ impl Apu {
 
     /// One CPU cycle.
     pub fn tick(&mut self) {
-        // The channels' timers run at half the CPU rate.
+        // The channels' timers run at half the CPU rate...
         self.apu_phase = !self.apu_phase;
         if self.apu_phase {
             for p in &mut self.pulses {
                 p.tick();
             }
         }
+        // ...except the triangle's, which runs at the CPU rate.
+        self.triangle.tick();
 
         let clocks = self.frame.tick();
         if clocks.quarter {
             for p in &mut self.pulses {
                 p.envelope.clock();
             }
-            // The triangle's linear counter and the noise envelope clock with
-            // their channels.
+            self.triangle.clock_linear();
+            // The noise envelope clocks with its channel.
         }
         if clocks.half {
             // Sweep first, then the length counters (the wiki's half-frame
@@ -553,6 +621,7 @@ impl Apu {
             0x4006 => self.pulses[1].write_timer_low(val),
             0x4007 => self.pulses[1].write_length(val),
             0x4008 => self.triangle.write_ctrl(val),
+            0x400A => self.triangle.write_timer_low(val),
             0x400B => self.triangle.write_length(val),
             0x400C => self.noise.write_ctrl(val),
             0x400F => self.noise.write_length(val),
@@ -871,5 +940,90 @@ mod tests {
         d.write(0x08);
         d.decay = 7;
         assert_eq!(d.output(), 7, "otherwise the output is the decay level");
+    }
+
+    /// The wiki's looping 32 steps: 15 down to 0, then 0 back up to 15. The
+    /// triangle's timer runs at the CPU clock, so t = 8 is nine cycles a step.
+    #[test]
+    fn the_triangle_sequence_runs_15_down_to_0_then_back() {
+        let mut apu = Apu::new();
+        apu.triangle.len.length = 200;
+        apu.triangle.linear = 200;
+        apu.cpu_write(0x400A, 0x08); // t = 8
+        apu.cpu_write(0x400B, 0x00);
+        apu.triangle.divider = 0;
+        let mut samples = Vec::new();
+        let mut seq = None;
+        for _ in 0..4_000 {
+            if samples.len() >= 40 {
+                break;
+            }
+            apu.tick();
+            let now = apu.triangle.sequence;
+            if seq != Some(now) {
+                seq = Some(now);
+                samples.push(apu.triangle.output());
+            }
+        }
+        let want: Vec<u8> = (0..32u8)
+            .map(|i| if i < 16 { 15 - i } else { i - 16 })
+            .collect();
+        assert_eq!(samples[..32], want[..], "15 down to 0, then 0 up to 15");
+        assert_eq!(samples[32..], want[..8], "and the sequence loops");
+    }
+
+    /// The sequencer is clocked only while both counters are non-zero, and
+    /// its output is *held* when it stops -- the silence pop SMB relies on.
+    #[test]
+    fn the_linear_counter_holds_the_output_at_its_last_value_when_it_runs_out() {
+        let mut apu = Apu::new();
+        apu.triangle.len.length = 200;
+        apu.triangle.linear = 200;
+        apu.cpu_write(0x400A, 0x08);
+        apu.cpu_write(0x400B, 0x00);
+        apu.triangle.divider = 0;
+        for _ in 0..20 {
+            apu.tick();
+        }
+        let sounding = apu.triangle.output();
+        assert_ne!(sounding, 0, "the channel is sounding");
+        let seq = apu.triangle.sequence;
+
+        apu.triangle.linear = 0; // the linear counter ran out
+        for _ in 0..200 {
+            apu.tick();
+        }
+        assert_eq!(
+            apu.triangle.sequence, seq,
+            "the sequencer stops when silenced"
+        );
+        assert_eq!(apu.triangle.output(), sounding, "held, not snapped to zero");
+    }
+
+    /// The control flag is the halt: while set, the reload flag stays set and
+    /// the counter is held; while clear, the flag is cleared every clock and
+    /// the counter walks down after one reload.
+    #[test]
+    fn the_control_flag_becomes_the_linear_reload_when_clear() {
+        let mut t = Triangle::default();
+
+        t.write_ctrl(0x88); // control set, reload value 8
+        t.write_length(0x00); // $400B: sets the reload flag
+        t.clock_linear();
+        assert_eq!(t.linear, 8, "reloaded");
+        t.clock_linear();
+        assert_eq!(t.linear, 8, "held while the control flag is set");
+        t.write_ctrl(0x85); // reload value 5, still held
+        t.clock_linear();
+        assert_eq!(t.linear, 5, "a $4008 write lands at the next clock");
+
+        t.write_ctrl(0x05); // control clear, reload value 5
+        t.write_length(0x00); // one reload...
+        t.clock_linear();
+        assert_eq!(t.linear, 5, "reloaded once");
+        t.clock_linear();
+        assert_eq!(t.linear, 4, "...then it counts down");
+        t.clock_linear();
+        assert_eq!(t.linear, 3);
     }
 }
