@@ -25,6 +25,20 @@ const SCALE: u32 = 3;
 /// the wall-clock half of the period.
 const FRAME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_micros(16_667);
 
+/// Bytes one stereo frame of the mixer's `i16` output occupies.
+const AUDIO_FRAME_BYTES: u32 = 4;
+
+/// How much audio to keep queued in the device, in bytes: two video frames'
+/// worth, about 33 ms. Slack enough to ride out a scheduling hiccup, little
+/// enough that the sound stays with the picture.
+const AUDIO_TARGET: u32 = 1600 * AUDIO_FRAME_BYTES;
+
+/// A queue deeper than this is a stall -- a dragged window, a suspended
+/// process -- being played back. Past it the frame's samples are dropped, so
+/// the sound cannot end up seconds behind the picture with no bound at all.
+/// Ten video frames is about 166 ms.
+const AUDIO_MAX_QUEUED: u32 = 10 * 800 * AUDIO_FRAME_BYTES;
+
 const USAGE: &str = "usage: nes <rom.nes> [--dump N[,N...]] [--play SCRIPT]\n\
     \x20 <rom.nes>          the cartridge to boot, quoted if it has spaces\n\
     \x20 --dump N[,N...]   after each listed frame write frame-N.ppm; the last\n\
@@ -215,6 +229,28 @@ fn frame_sleep(elapsed: ::std::time::Duration) -> ::std::time::Duration {
     FRAME_BUDGET.checked_sub(elapsed).unwrap_or_default()
 }
 
+/// How long to wait before emulating the next frame, given how much audio the
+/// device has not drained yet.
+///
+/// The device consumes 48 kHz exactly, so its queue is the emulator's real
+/// clock and this is that clock's own period: wait for as many of its frames
+/// as are queued above the target. Waiting on `FRAME_BUDGET` instead runs the
+/// emulator at 60.000 fps against NTSC's 60.0988, which starves a 48 kHz queue
+/// by about 79 samples a second -- an audible click every few seconds.
+///
+/// Zero at or below the target: a queue that has drained needs the emulator to
+/// run as fast as it can, not to wait. Capped at `FRAME_BUDGET`: a device that
+/// accepts samples and never plays them must not slow the picture below what
+/// the emulator does with no audio at all (what it holds past `AUDIO_MAX_QUEUED`
+/// is dropped, so that queue cannot grow without bound either).
+fn audio_sleep(queued: u32) -> ::std::time::Duration {
+    let excess = queued.saturating_sub(AUDIO_TARGET) as u64;
+    let drain = ::std::time::Duration::from_micros(
+        excess * 1_000_000 / (48_000 * AUDIO_FRAME_BYTES as u64),
+    );
+    drain.min(FRAME_BUDGET)
+}
+
 /// With no script the dump list is the whole run, so the last frame named ends
 /// it. This is the maximum, not the position: `--dump 5,3` still has to reach
 /// frame 5, or the caller asked for a frame and silently got none of it.
@@ -358,9 +394,14 @@ fn main() -> Result<(), String> {
         if let Some(queue) = &audio {
             let samples = bus.apu.take_samples();
             if !samples.is_empty() {
-                // A device that stops accepting samples must not stop the
-                // emulator: the picture is the primary output.
-                let _ = queue.queue_audio(&samples);
+                // A queue past `AUDIO_MAX_QUEUED` is a stall being played back:
+                // drop this frame and let the device catch up to the picture
+                // rather than fall further behind it. A device that stops
+                // accepting samples must not stop the emulator either -- the
+                // picture is the primary output.
+                if queue.size() < AUDIO_MAX_QUEUED {
+                    let _ = queue.queue_audio(&samples);
+                }
             }
         }
         // `take_frame` is what clears the ready flag, and it is the ONLY thing that
@@ -391,7 +432,12 @@ fn main() -> Result<(), String> {
             .copy(&texture, None, None)
             .map_err(|e| e.to_string())?;
         canvas.present();
-        ::std::thread::sleep(frame_sleep(frame_start.elapsed()));
+        // With a device, its queue sets the pace; without one, the wall-clock
+        // budget does. Either way the emulation is untouched by the wait.
+        match &audio {
+            Some(queue) => ::std::thread::sleep(audio_sleep(queue.size())),
+            None => ::std::thread::sleep(frame_sleep(frame_start.elapsed())),
+        }
     }
     // The run stopped early -- the script ran out, or the user quit -- so any
     // dump frame past here was never written. Name them: a missing file with
@@ -424,8 +470,9 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_event, button_for, dump_list_ends_run, frame_sleep, mask_for_name, missed_dumps,
-        parse_script, Play, FRAME_BUDGET,
+        apply_event, audio_sleep, button_for, dump_list_ends_run, frame_sleep, mask_for_name,
+        missed_dumps, parse_script, Play, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
+        FRAME_BUDGET,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::Keycode;
@@ -629,6 +676,43 @@ mod tests {
             ],
             "Start, Start, nothing, nothing, Right x3"
         );
+    }
+
+    /// The audio clock. Sleeping for the queued excess must drain exactly that
+    /// excess: then a frame's worth of audio queued above the target is a
+    /// frame's worth of waiting, and the queue neither grows nor starves.
+    #[test]
+    fn audio_sleep_waits_as_long_as_the_device_needs_to_drain_the_excess() {
+        assert_eq!(audio_sleep(0), Duration::ZERO, "empty queue: run flat out");
+        assert_eq!(
+            audio_sleep(AUDIO_TARGET),
+            Duration::ZERO,
+            "at the target: run"
+        );
+
+        // One NTSC frame of audio: 48000 / 60.0988 = 798.7 stereo frames.
+        let frame = (48_000.0 / 60.0988 * AUDIO_FRAME_BYTES as f64) as u32;
+        let wait = audio_sleep(AUDIO_TARGET + frame);
+        let drained = wait.as_secs_f64() * 48_000.0 * AUDIO_FRAME_BYTES as f64;
+        assert!(
+            (drained - frame as f64).abs() < 1.0,
+            "{frame} bytes over the target waited out {drained} bytes"
+        );
+        assert!(
+            (0.0163..0.0167).contains(&wait.as_secs_f64()),
+            "a frame of audio is a frame of waiting, not {wait:?}"
+        );
+
+        // Deeper is longer, but a device that takes samples and never plays
+        // them cannot hold the picture below the no-audio rate, and the deepest
+        // queue kept is a bounded pause: past it, frames are dropped.
+        assert!(audio_sleep(AUDIO_TARGET + 2 * frame) > wait);
+        for deep in [AUDIO_MAX_QUEUED, u32::MAX] {
+            assert!(
+                audio_sleep(deep) <= FRAME_BUDGET,
+                "{deep} bytes queued waits longer than a frame"
+            );
+        }
     }
 
     #[test]
