@@ -1,5 +1,8 @@
-//! iNES loader and mapper 66 (UxROM variant with bus conflicts) for
-//! "Super Mario Bros. + Duck Hunt (USA)".
+//! iNES loader for the two boards this emulator knows: mapper 66 (UxROM
+//! variant with bus conflicts) for "Super Mario Bros. + Duck Hunt (USA)",
+//! and mapper 0 (NROM) for blargg's APU test ROMs -- NROM-128 and NROM-256,
+//! both with the `$6000-$7FFF` PRG RAM the tests need, and the 2005 suite
+//! with no CHR at all (the PPU gets RAM instead).
 //!
 //! The iNES header is honest about this cartridge: its `chr=2` really is 16 KiB
 //! of tile data, its `prg=4` really is 64 KiB, and its mirroring bit really is
@@ -52,10 +55,21 @@ const CHR_BANK: usize = 0x2000;
 pub struct Cartridge {
     prg: Vec<u8>,
     chr: Vec<u8>,
-    /// Which 32 KiB bank is mapped at `$8000-$FFFF`.
+    /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
+    board: Board,
+    /// Which 32 KiB bank is mapped at `$8000-$FFFF` (GxRom only).
     bank: usize,
-    /// Which 8 KiB CHR bank is mapped at `$0000-$1FFF`.
+    /// Which 8 KiB CHR bank is mapped at `$0000-$1FFF` (GxRom only).
     chr_bank: usize,
+}
+
+/// The two boards this emulator knows how to read.
+enum Board {
+    /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
+    /// both halves directly. Writes to the window go nowhere.
+    Nrom,
+    /// GxROM, the SMB + Duck Hunt board: bus-conflict banking, see above.
+    GxRom,
 }
 
 impl Cartridge {
@@ -68,15 +82,37 @@ impl Cartridge {
             return Err(format!("truncated PRG: header claims {prg_len} bytes"));
         }
         let mapper = bytes[7] & 0xF0 | bytes[6] >> 4;
-        if mapper != 66 {
-            return Err(format!("mapper {mapper}, only mapper 66 is supported"));
-        }
+        let board = match mapper {
+            0 => Board::Nrom,
+            66 => Board::GxRom,
+            other => return Err(format!("mapper {other}, only 0 and 66 are supported")),
+        };
+        // NROM has no register at all, and `POWER_ON_BANK % (prg_len / BANK)`
+        // would divide by zero for its 16 KiB images.
+        let bank = match board {
+            Board::Nrom => 0,
+            Board::GxRom => POWER_ON_BANK % (prg_len / BANK),
+        };
         Ok(Cartridge {
             prg: bytes[16..16 + prg_len].to_vec(),
             chr: bytes[16 + prg_len..].to_vec(),
-            bank: POWER_ON_BANK % (prg_len / BANK),
+            board,
+            bank,
             chr_bank: 0,
         })
+    }
+
+    /// Whether `$6000-$7FFF` is populated. Both NROM images this emulator
+    /// loads carry the 8 KiB PRG RAM the APU tests use for reporting; the
+    /// SMB board doesn't populate it and the game never reads it.
+    pub fn has_prg_ram(&self) -> bool {
+        matches!(self.board, Board::Nrom)
+    }
+
+    /// Whether pattern memory is RAM. True for images that carry no CHR bytes
+    /// at all -- the 2005 suite -- where the game uploads its own tiles.
+    pub fn chr_is_ram(&self) -> bool {
+        self.chr.is_empty()
     }
 
     /// The CHR ROM image, for the PPU to hold. Borrowed, not copied.
@@ -90,8 +126,13 @@ impl Cartridge {
     }
 
     /// One 32 KiB window: `$8000` is the bank base and `$FFFF` its last byte.
+    /// NROM has no register: 16 KiB images mirror their single block, 32 KiB
+    /// ones map both halves directly, and `& (len - 1)` does both.
     pub fn cpu_read(&self, addr: u16) -> u8 {
-        self.prg[self.bank * BANK + (addr as usize - 0x8000)]
+        match self.board {
+            Board::Nrom => self.prg[addr as usize & (self.prg.len() - 1)],
+            Board::GxRom => self.prg[self.bank * BANK + (addr as usize - 0x8000)],
+        }
     }
 
     /// Bus conflict: the bank register only moves when the byte written is
@@ -101,6 +142,10 @@ impl Cartridge {
     /// board only supports 64KB PRG", hence two banks and one select bit) and
     /// CHR is bits 1-0.
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
+        // NROM has no registers at all: every write to the window is ignored.
+        if matches!(self.board, Board::Nrom) {
+            return;
+        }
         // The register decodes `$8000-$BFFF` only. `$C000-$FFFF` is the upper
         // half of the same window, not a second register, and reset writes
         // `$FFFD` there for the stack scratch byte; that byte happens to be the
@@ -174,6 +219,43 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// A ROM under `test_roms/`, or `None` when it is not on disk. Those
+    /// images are gitignored too, so the tests that need them must be able to
+    /// skip on a clean checkout.
+    fn test_rom(rel: &str) -> Option<Vec<u8>> {
+        let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel);
+        match std::fs::read(&path) {
+            Ok(b) => Some(b),
+            Err(_) => {
+                println!("note: {path} not present, skipping");
+                None
+            }
+        }
+    }
+
+    /// 16-byte iNES header for a plain NROM board: mapper 0, no trainer.
+    fn nrom_header(prg_banks: u8, chr_banks: u8) -> [u8; 16] {
+        let mut h = [0u8; 16];
+        h[..4].copy_from_slice(b"NES\x1a");
+        h[4] = prg_banks;
+        h[5] = chr_banks;
+        h[6] = 0x00; // no mirroring bits that matter to the PPU
+        h[7] = 0x00; // mapper 0
+        h
+    }
+
+    /// A synthesized NROM image: 16 KiB PRG block `i` filled with
+    /// `0x11 * (i + 1)` so the mapped block is observable through `cpu_read`,
+    /// and `chr_banks` 8 KiB CHR banks filled with zero.
+    fn nrom_cart(prg_banks: u8, chr_banks: u8) -> Cartridge {
+        let mut bytes = nrom_header(prg_banks, chr_banks).to_vec();
+        for i in 0..prg_banks {
+            bytes.extend(std::iter::repeat_n(0x11 * (i + 1), PRG_UNIT));
+        }
+        bytes.extend(std::iter::repeat_n(0u8, chr_banks as usize * CHR_BANK));
+        Cartridge::load(&bytes).expect("synthetic NROM image must load")
     }
 
     // The conflict tests read at $8001, not $8000: $8000 holds the patched byte,
@@ -292,5 +374,53 @@ mod tests {
             u16::from_le_bytes([c.cpu_read(0xFFFA), c.cpu_read(0xFFFB)]),
             0x8082
         );
+    }
+
+    /// NROM-128 (16 KiB PRG) mirrors the single block across the whole
+    /// `$8000-$FFFF` window; the byte at an offset must appear at that offset
+    /// in BOTH halves, so a model that stops reading after 16 KiB fails.
+    #[test]
+    fn nrom_mirrors_16k_prg_across_the_whole_window() {
+        let mut bytes = nrom_header(1, 0).to_vec();
+        bytes.extend((0..PRG_UNIT).map(|o| o as u8)); // byte at offset o is o & $FF
+        let c = Cartridge::load(&bytes).expect("16 KiB NROM image must load");
+        assert_eq!(c.cpu_read(0x8000 + 0x1234), 0x34, "lower half");
+        assert_eq!(c.cpu_read(0xC000 + 0x1234), 0x34, "upper half mirrors it");
+        assert_eq!(c.cpu_read(0xFFFF), 0xFF, "last byte of the window");
+        assert!(c.has_prg_ram(), "NROM carries the $6000-$7FFF RAM");
+        assert!(c.chr_is_ram(), "no CHR bytes in the file -> CHR RAM");
+    }
+
+    /// NROM-256 (32 KiB PRG) has two distinct 16 KiB blocks, and no bank
+    /// register: a write that would conflict on GxROM must change nothing.
+    #[test]
+    fn nrom_32k_prg_is_not_mirrored_and_writes_do_not_bank() {
+        let mut c = nrom_cart(2, 1); // 32 KiB PRG, 8 KiB CHR ROM
+        assert_eq!(c.prg.len(), 2 * PRG_UNIT);
+        assert_eq!(c.cpu_read(0x8000), 0x11, "first 16 KiB block");
+        assert_eq!(c.cpu_read(0xC000), 0x22, "second block, not a mirror");
+        c.cpu_write(0x8000, 0x11); // NROM has no bank register
+        assert_eq!(c.cpu_read(0xC000), 0x22, "the write changed nothing");
+        assert!(!c.chr_is_ram(), "8 KiB of CHR ROM in the file");
+        assert!(c.has_prg_ram());
+    }
+
+    /// The real test suites must load: apu_reset is NROM-256 with 8 KiB CHR,
+    /// apu_2005 is NROM-128 with no CHR at all (CHR RAM).
+    #[test]
+    fn the_real_test_roms_load() {
+        if let Some(bytes) = test_rom("test_roms/apu_reset/4015_cleared.nes") {
+            let c = Cartridge::load(&bytes).expect("apu_reset image must load");
+            assert_eq!(c.prg.len(), 2 * PRG_UNIT, "32 KiB NROM-256");
+            assert!(c.has_prg_ram());
+            assert!(!c.chr_is_ram());
+            assert_eq!(c.chr_rom().len(), 8192, "8 KiB of CHR ROM");
+        }
+        if let Some(bytes) = test_rom("test_roms/apu_2005/01.len_ctr.nes") {
+            let c = Cartridge::load(&bytes).expect("apu_2005 image must load");
+            assert_eq!(c.prg.len(), PRG_UNIT, "16 KiB NROM-128");
+            assert!(c.has_prg_ram());
+            assert!(c.chr_is_ram(), "no CHR bytes -> the PPU must get RAM");
+        }
     }
 }
