@@ -111,14 +111,18 @@ fn vram_index(addr: u16) -> usize {
     (addr & 0x0FFF) as usize & 0x07FF
 }
 
-/// Palette RAM is 32 entries: `$3F10`/`$3F14`/`$3F18`/`$3F1C` sit behind
-/// `$3F00`/`$3F04`/`$3F08`/`$3F0C` and `$3F20` upwards mirrors `$3F00`.
+/// Palette RAM is 32 entries. Only four of the `$3F10-$3F1F` addresses are
+/// mirrors: `$3F10`, `$3F14`, `$3F18` and `$3F1C` sit behind
+/// `$3F00`/`$3F04`/`$3F08`/`$3F0C` (NESdev "PPU palettes": "Addresses $3F10/$3F14/
+/// $3F18/$3F1C are mirrors of $3F00/$3F04/$3F08/$3F0C"), and `$3F20` upwards
+/// mirrors `$3F00`. The other twelve are ordinary background entries -- folding
+/// all sixteen down leaves a sprite palette no writer can reach.
 fn palette_index(addr: u16) -> usize {
     let i = (addr & 0x1F) as usize;
-    if i >= 0x20 {
-        i - 0x20
+    if i >= 0x10 && i % 4 == 0 {
+        i - 0x10
     } else {
-        i & 0x0F
+        i
     }
 }
 
@@ -1012,7 +1016,7 @@ impl Ppu {
         }
         self.write_vram_for_test(0x3F00, 0x0F); // backdrop black
         self.write_vram_for_test(0x3F01, 0x30); // background colour 1 = white
-        self.write_vram_for_test(0x3F05, 0x21); // sprite palette 1 colour 1 = blue
+        self.write_vram_for_test(0x3F15, 0x21); // sprite palette 1 colour 1 = blue
                                                 // Y = 20 puts the sprite on scanlines 21..36 ("you must subtract 1
                                                 // from the sprite's Y coordinate before writing it here").
         self.put_sprite_for_test(0, 20, 0x02, 0x01, x);
@@ -1152,6 +1156,52 @@ mod tests {
         }
     }
 
+    /// Every tile on screen carries pattern value 1, and every attribute byte
+    /// reads 0,1,2,3 in quadrant order, so the only thing that can change a
+    /// pixel's colour is WHICH quadrant its tile reads.
+    const QUADRANT_COLOUR: [u8; 4] = [0x30, 0x21, 0x16, 0x2A];
+
+    #[test]
+    fn every_attribute_quadrant_selects_its_own_palette() {
+        let mut p = Ppu::new();
+        // Tile 0: low plane all ones, high plane all zeros => pattern value 1.
+        for row in 0..8u16 {
+            p.chr_write_for_test(row, 0xFF);
+            p.chr_write_for_test(row + 8, 0x00);
+        }
+        for r in 0..30u8 {
+            for c in 0..32u8 {
+                p.upload_tile_for_test(0, c, r, 0);
+            }
+        }
+        // Four unmistakable background palettes.
+        for (quadrant, entry) in QUADRANT_COLOUR.iter().enumerate() {
+            p.write_vram_for_test(0x3F00 + (quadrant as u16) * 4, 0x0F);
+            p.write_vram_for_test(0x3F01 + (quadrant as u16) * 4, *entry);
+        }
+        // Every attribute byte reads 0,1,2,3 in quadrant order. Bit 1 of coarse X
+        // and coarse Y pick the quadrant, and within a 4-tile attribute group
+        // that bit is just the tile's offset >> 1 -- so quadrant 0 lives in bits
+        // 0-1 of every byte, 1 in bits 2-3, 2 in bits 4-5, 3 in bits 6-7. That is
+        // the same byte everywhere: 0b11_10_01_00.
+        for byte in 0x27C0u16..0x2800 {
+            p.write_vram_for_test(byte, 0xE4);
+        }
+        show_ctrl(&mut p, 0x01, 0, 0);
+        p.run_to(&[120]);
+        for ty in 0..16u8 {
+            for tx in 0..16u8 {
+                let quadrant = ((ty >> 1) & 1) * 2 + ((tx >> 1) & 1);
+                let want = PALETTE[QUADRANT_COLOUR[quadrant as usize] as usize];
+                assert_eq!(
+                    p.pixel(tx as u32 * 8, ty as u32 * 8),
+                    want,
+                    "tile ({tx},{ty}) is in quadrant {quadrant} and picked the wrong palette"
+                );
+            }
+        }
+    }
+
     /// `$2001` is `BGRs bMmG`: bit 4 (`s`) is the sprite enable and bit 2 (`M`)
     /// only lets sprites into the leftmost 8 pixels. The game writes `$18` at
     /// boot to show both layers, and a PPU that reads the enable as bit 2 shows
@@ -1203,8 +1253,8 @@ mod tests {
             p.chr_write_for_test(0x0038 + row, 0xFF); // colour 2
         }
         p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
-        p.write_vram_for_test(0x3F01, 0x30); // colour 1 = $FFFFFF
-        p.write_vram_for_test(0x3F02, 0x21); // colour 2 = $004A9FFF
+        p.write_vram_for_test(0x3F11, 0x30); // sprite palette 0 colour 1 = $FFFFFF
+        p.write_vram_for_test(0x3F12, 0x21); // sprite palette 0 colour 2 = $004A9FFF
     }
 
     /// Tile `tile`'s row 0: `lo` in the low plane, `hi` in the high one. The
@@ -1512,6 +1562,47 @@ mod tests {
         p.write_vram_for_test(0x3F20, 0x06);
         assert_eq!(read(&mut p, 0x3F00), 0x06, "$3F20 must mirror $3F00");
         assert_eq!(read(&mut p, 0x3F04), 0x0A, "$3F20 must not touch $3F04");
+    }
+
+    /// Only `$3F10`, `$3F14`, `$3F18` and `$3F1C` fold down. The other twelve
+    /// `$3F1x` addresses are sprite entries in their own right, and a decode that
+    /// folds all sixteen down makes them unreachable: SMB writes its sprite
+    /// colours to `$3F11`-`$3F1F`, and every one of them would land on a
+    /// background entry that the playfield is already using.
+    #[test]
+    fn the_other_twelve_3f1x_entries_are_sprite_palette_not_mirrors() {
+        let mut p = Ppu::new();
+        let read = |p: &mut Ppu, addr: u16| {
+            p.cpu_write(0x2006, (addr >> 8) as u8);
+            p.cpu_write(0x2006, addr as u8);
+            p.cpu_read(0x2007)
+        };
+        for addr in [0x3F10u16, 0x3F14, 0x3F18, 0x3F1C] {
+            p.write_vram_for_test(addr, 0x30);
+            assert_eq!(
+                read(&mut p, addr - 0x10),
+                0x30,
+                "${addr:04X} is one of the four mirrors and must fold onto the background entry"
+            );
+        }
+        for addr in [
+            0x3F11u16, 0x3F12, 0x3F13, 0x3F15, 0x3F16, 0x3F17, 0x3F19, 0x3F1A, 0x3F1B, 0x3F1D,
+            0x3F1E, 0x3F1F,
+        ] {
+            p.write_vram_for_test(addr, 0x16);
+            assert_eq!(
+                read(&mut p, addr),
+                0x16,
+                "${addr:04X} is a sprite entry, not a mirror"
+            );
+        }
+        for addr in [0x3F01u16, 0x3F02, 0x3F03, 0x3F05, 0x3F06, 0x3F07] {
+            assert_eq!(
+                read(&mut p, addr),
+                0x00,
+                "${addr:04X} is a background entry and the sprite writes must not have reached it"
+            );
+        }
     }
 
     #[test]
@@ -2141,7 +2232,7 @@ mod tests {
             p.chr_write_for_test(0x0048 + row, 0xFF); // colour 3
         }
         p.put_sprite_for_test(1, 20, 0x04, 0x02, 100);
-        p.write_vram_for_test(0x3F0B, 0x11); // sprite palette 2 colour 3
+        p.write_vram_for_test(0x3F1B, 0x11); // sprite palette 2 colour 3
         p.cpu_write(0x2001, 0x1E);
         p.run_to(&[21]);
         assert_eq!(
@@ -2173,7 +2264,7 @@ mod tests {
             p.chr_write_for_test(0x0040 + row, 0xFF); // tile $04
             p.chr_write_for_test(0x0048 + row, 0xFF); // colour 3
         }
-        p.write_vram_for_test(0x3F0B, 0x11); // sprite palette 2 colour 3
+        p.write_vram_for_test(0x3F1B, 0x11); // sprite palette 2 colour 3
         p.cpu_write(0x2001, 0x1E);
         p.run_to(&[21]);
         assert_eq!(
