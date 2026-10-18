@@ -313,7 +313,9 @@ fn main() -> Result<(), String> {
     cpu.reset(&mut bus);
 
     if let Some(queue) = &audio {
-        // The device picks a rate it can actually do; the mixer follows it.
+        // The queue is opened with no allowed changes, so a device that cannot
+        // do exactly this spec fails the open instead of renegotiating it; the
+        // mixer follows whatever rate the device did agree to.
         bus.apu.set_sample_rate(queue.spec().freq as u32);
         queue.resume();
     }

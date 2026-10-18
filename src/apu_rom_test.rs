@@ -22,8 +22,10 @@ use crate::cpu::Cpu;
 use crate::rom::Cartridge;
 
 /// The ROM, or `None` when the gitignored file is not in the working tree.
+/// Resolved from the manifest directory, so the suites read this checkout's
+/// `test_roms/` whatever directory the test binary was started in.
 fn rom_bytes(rel: &str) -> Option<Vec<u8>> {
-    ::std::fs::read(rel).ok()
+    ::std::fs::read(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel)).ok()
 }
 
 /// A powered-on NES with the two pieces the tests drive.
@@ -178,6 +180,15 @@ fn the_2005_frame_counter_suite_reports_one_beep() {
         eprintln!("skipped: no ROMs in test_roms/apu_2005");
         return;
     }
+    // Half a suite means a broken environment, not a clean skip: green here has
+    // to mean all eleven ROMs reported.
+    assert_eq!(
+        roms.len(),
+        APU_2005_ROMS.len(),
+        "test_roms/apu_2005 is incomplete: {} of {} ROMs present",
+        roms.len(),
+        APU_2005_ROMS.len()
+    );
 
     let mut failures = Vec::new();
     for (name, bytes) in roms {
@@ -209,6 +220,13 @@ fn the_apu_reset_suite_reports_the_expected_codes() {
         eprintln!("skipped: no ROMs in test_roms/apu_reset");
         return;
     }
+    assert_eq!(
+        roms.len(),
+        APU_RESET_ROMS.len(),
+        "test_roms/apu_reset is incomplete: {} of {} ROMs present",
+        roms.len(),
+        APU_RESET_ROMS.len()
+    );
 
     let mut failures = Vec::new();
     for (name, want, bytes) in roms {

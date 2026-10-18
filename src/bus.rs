@@ -60,8 +60,10 @@ pub struct Bus {
     dma_stall: u16,
     /// CPU cycles of APU advancement the instruction in progress still owes its
     /// own ticks: an APU-register access is placed on the cycle it really
-    /// happens by advancing the APU now and skipping that many ticks. Always 0
-    /// at an instruction boundary; see `apu_advance_ahead`.
+    /// happens by advancing the APU now and skipping that many ticks. `Cpu::step`
+    /// clears `instr_cycles` when it returns, so this is 0 at every instruction
+    /// boundary and an access made from outside an instruction is not placed at
+    /// all; see `apu_advance_ahead`.
     apu_skip: u8,
     /// The cycle count `Cpu::step` announced for the instruction in progress,
     /// or 0 when the bus has not been told (a DMA's reads, a test).
@@ -438,6 +440,58 @@ mod tests {
         fn dma_cycles_remaining(&self) -> u16 {
             self.dma_stall
         }
+    }
+
+    /// `apu_advance_ahead` places an APU-register access on its instruction's
+    /// last cycle by advancing the APU and then skipping the same number of
+    /// ticks, so whatever the instruction is, the APU must end up exactly its
+    /// cycle count further on. Every documented opcode, with and without an
+    /// access to the APU window: the skipped ticks are owed either way.
+    #[test]
+    fn an_instruction_advances_the_apu_by_exactly_its_cycle_count() {
+        // The operand bytes name an address in the APU window, so the absolute
+        // and absolute-indexed forms really do read or write a register (X and
+        // Y are 0, so the address is unchanged). No operand lands on $4014:
+        // the DMA's reads are a separate path with its own tests.
+        for ops in [[0x00u8, 0x00], [0x15, 0x40], [0x17, 0x40], [0x03, 0x40]] {
+            for &op in crate::cpu::DOCUMENTED {
+                let mut bus = Bus::new(cart_running(&[op, ops[0], ops[1]]));
+                let mut cpu = Cpu::new();
+                bus.power_on();
+                cpu.reset(&mut bus);
+                let before = bus.apu.total_cycles();
+                let cycles = cpu.step(&mut bus);
+                let advanced = bus.apu.total_cycles() - before;
+                assert_eq!(
+                    advanced, cycles as u64,
+                    "opcode {op:02X} operands ${:02X}{:02X}: ran {cycles} cycles but \
+                     advanced the APU by {advanced}",
+                    ops[1], ops[0]
+                );
+            }
+        }
+    }
+
+    /// An APU-register access made between instructions must not be placed on
+    /// one: `Cpu::step` clears the announced cycle count when it returns, so a
+    /// read like this one advances nothing and leaves no skipped ticks behind
+    /// for the next instruction's own ticking.
+    #[test]
+    fn an_apu_access_between_instructions_advances_the_apu_by_nothing() {
+        let mut bus = Bus::new(cart_running(&[0xEA, 0xEA, 0xEA]));
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+        let _ = cpu.step(&mut bus);
+        let before = bus.apu.total_cycles();
+        let _ = bus.cpu_read(0x4015);
+        assert_eq!(
+            bus.apu.total_cycles(),
+            before,
+            "a read between instructions moved the APU"
+        );
+        let cycles = cpu.step(&mut bus);
+        assert_eq!(bus.apu.total_cycles() - before, cycles as u64);
     }
 
     #[test]

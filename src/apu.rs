@@ -1,8 +1,6 @@
-//! The 2A03 APU: the frame counter, the length counters, and `$4015`/`$4017`.
-//!
-//! The channels' synthesis (duty timers, envelopes, sweep, LFSR, linear
-//! counter) and the mixer arrive in the next tasks; this module starts with
-//! everything the control plane needs.
+//! The 2A03 APU: the frame counter, the length counters, `$4015`/`$4017`, the
+//! two pulse channels, the triangle, the noise channel, and the mixer that
+//! turns their outputs into samples.
 //!
 //! References: NESdev "APU Frame Counter" (steps in APU cycles, the 3-or-4
 //! CPU cycle write delay, and the flag "set three times in a row"), NESdev
@@ -40,15 +38,16 @@ const NOISE_PERIODS: [u16; 16] = [
 /// The NTSC CPU clock, the mixer's time base.
 const CPU_HZ: u32 = 1_789_773;
 
-/// Half a second of stereo samples at 48 kHz. When the queue is full the
-/// newest pair is dropped, which keeps memory bounded if no player drains it.
+/// One second of stereo samples at 48 kHz: 96,000 `i16`, which is 48,000
+/// stereo pairs. When the queue is full the newest pair is dropped, which
+/// keeps memory bounded if no player drains it.
 const SAMPLE_QUEUE_CAP: usize = 96_000;
 
 /// How far into its frame the frame counter already is when power-on or reset
 /// hands control to the first instruction, in APU clocks. blargg measured the
 /// implied `$4017` write landing "9 to 12" CPU cycles before that instruction
-/// and "usually 9" (`apu_reset`); 5 APU clocks is 10 CPU cycles, which
-/// `4017_timing` reports as 9.
+/// and "usually 9" (`apu_reset`); a `pre` of 3, on top of the write's own
+/// delay, is what `4017_timing` reports as 9.
 const RESET_PRE: u32 = 3;
 
 /// The frame counter's output for one CPU cycle.
@@ -122,8 +121,8 @@ impl Frame {
     /// first instruction, late enough that its mode change has already taken
     /// effect and the counter is `pre` APU clocks into its frame. blargg's
     /// apu_reset suite measures the write 9-12 CPU cycles before that first
-    /// instruction and "usually 9" (readme.txt); `pre` of 5 puts this
-    /// implementation on 9.
+    /// instruction and "usually 9" (readme.txt); `pre` of 3 puts this
+    /// implementation on the 9 that `4017_timing` reports.
     fn start(&mut self, val: u8, pre: u32) {
         self.schedule(val, 0);
         self.mode = self.pending_mode;
@@ -628,6 +627,10 @@ pub struct Apu {
     acc: u32,
     /// Interleaved stereo, `i16`; drained by `take_samples`.
     samples: Vec<i16>,
+    /// Every CPU cycle `tick` has been called for since this `Apu` was made.
+    /// Power-on and reset do not clear it, so it is a monotonic measure of how
+    /// far the APU has been advanced, for tests and debugging.
+    ticks: u64,
 }
 
 impl Apu {
@@ -641,6 +644,7 @@ impl Apu {
             rate: 48_000,
             acc: 0,
             samples: Vec::new(),
+            ticks: 0,
         };
         apu.power_on();
         apu
@@ -663,8 +667,11 @@ impl Apu {
     /// again.
     ///
     /// The preserved registers are measured: `apu_reset`'s `len_ctrs_enabled`
-    /// halts the triangle before pressing RESET and expects its length counter
-    /// to survive, while the unhalted channels' counters expire.
+    /// presses RESET mid-run and then re-enables `$4015` and reloads each
+    /// channel's length itself, so what it reads back from `$4015` is those
+    /// reloads plus the frame clocks that follow (`$04`, only the triangle
+    /// still live). A reset that kept the old enables or length counters would
+    /// report a different code.
     ///
     /// Nothing in the player's run loop presses RESET yet; the `apu_reset`
     /// harness is what drives it.
@@ -686,7 +693,19 @@ impl Apu {
     }
 
     /// One CPU cycle.
+    /// How many CPU cycles this APU has been advanced through `tick`. The
+    /// placement in `Bus::apu_advance_ahead` is a pre-advance plus an equal
+    /// number of skipped ticks, so a test can assert that one instruction
+    /// moved this by exactly its cycle count.
+    ///
+    /// Nothing in the player's run loop reads it; the bus tests do.
+    #[allow(dead_code)]
+    pub fn total_cycles(&self) -> u64 {
+        self.ticks
+    }
+
     pub fn tick(&mut self) {
+        self.ticks += 1;
         // The channels' timers run at half the CPU rate...
         self.apu_phase = !self.apu_phase;
         if self.apu_phase {
@@ -807,8 +826,8 @@ impl Apu {
             0x400F => self.noise.write_length(val),
             0x4015 => self.write_status(val),
             0x4017 => self.frame.write(val),
-            // $4010-$4013 are the DMC, which is cut. The triangle's and the
-            // noise's remaining registers land with their channels.
+            // $4010-$4013 are the DMC, which is cut: nothing is stored and
+            // nothing is read back.
             _ => {}
         }
     }
