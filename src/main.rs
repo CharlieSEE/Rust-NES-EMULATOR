@@ -1,0 +1,752 @@
+use sdl2::event::{Event, WindowEvent};
+use sdl2::keyboard::Keycode;
+
+mod bus;
+mod controller;
+mod cpu;
+mod ppu;
+mod rom;
+
+use bus::Bus;
+use cpu::Cpu;
+use rom::Cartridge;
+
+const W: usize = 256;
+const H: usize = 240;
+const SCALE: u32 = 3;
+
+/// One NTSC frame is 262 scanlines of 341 dots, so 89342 PPU dots at 5.369 MHz
+/// is 60.0988 Hz, 16.639 ms per frame; 16_667 us is the 60 Hz budget to sleep
+/// to. The emulation boundary is the PPU's own `frame_ready`, one 341x262
+/// frame including the odd-frame pre-render dot skip -- this constant is only
+/// the wall-clock half of the period.
+const FRAME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_micros(16_667);
+
+const USAGE: &str = "usage: nes <rom.nes> [--dump N[,N...]] [--play SCRIPT]\n\
+    \x20 <rom.nes>          the cartridge to boot, quoted if it has spaces\n\
+    \x20 --dump N[,N...]   after each listed frame write frame-N.ppm; the last\n\
+    \x20                    one ends the run\n\
+    \x20 --play SCRIPT      hold scripted buttons, e.g. START,WAIT60,RIGHT120\n\
+    \x20                    NAME is A, B, SELECT, START, UP, DOWN, LEFT, RIGHT,\n\
+    \x20                    JUMP, RUN, FIRE or WAIT; trailing digits are the\n\
+    \x20                    frames to hold it (1 if none); several names joined\n\
+    \x20                    with + are held together, e.g. RIGHT+A30";
+
+/// The pad, one row per bit of `Controller::set_buttons` in its report order --
+/// A, B, Select, Start, Up, Down, Left, Right -- as the SDL key that presses
+/// it, the name `--play` accepts for it, and the bit itself.
+const BUTTONS: [(Keycode, &str, u8); 8] = [
+    (Keycode::Z, "A", 0x01),
+    (Keycode::X, "B", 0x02),
+    (Keycode::RShift, "SELECT", 0x04),
+    (Keycode::Return, "START", 0x08),
+    (Keycode::Up, "UP", 0x10),
+    (Keycode::Down, "DOWN", 0x20),
+    (Keycode::Left, "LEFT", 0x40),
+    (Keycode::Right, "RIGHT", 0x80),
+];
+
+/// Words a script may use for a bit it does not spell out. A is jump and B is
+/// run/fire in both SMB and Duck Hunt, so a script can say what it means.
+const ALIASES: [(&str, &str); 3] = [("JUMP", "A"), ("RUN", "B"), ("FIRE", "B")];
+
+/// Which button a held key presses, or `None` for a key that is not on the pad.
+fn button_for(key: Keycode) -> Option<u8> {
+    BUTTONS.iter().find(|row| row.0 == key).map(|row| row.2)
+}
+
+/// Fold one SDL event into the held mask, returning whether the run continues.
+/// `false` quits. Out of `main` so the arms are reachable from a test: `Event`
+/// is a plain enum value, so a headless test can build a `FocusLost` without a
+/// window ever existing.
+fn apply_event(ev: Event, buttons: &mut u8) -> bool {
+    match ev {
+        Event::Quit { .. } => false,
+        Event::KeyDown {
+            keycode: Some(Keycode::Escape),
+            ..
+        } => false,
+        Event::KeyDown {
+            keycode: Some(key), ..
+        } => {
+            if let Some(bit) = button_for(key) {
+                *buttons |= bit;
+            }
+            true
+        }
+        Event::KeyUp {
+            keycode: Some(key), ..
+        } => {
+            if let Some(bit) = button_for(key) {
+                *buttons &= !bit;
+            }
+            true
+        }
+        // No KeyUp ever arrives for a key released while another window has the
+        // focus, so alt-tabbing away holding Right would latch it on for good.
+        // Forget the whole mask instead.
+        Event::Window {
+            win_event: WindowEvent::FocusLost,
+            ..
+        } => {
+            *buttons = 0;
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Which button a `--play` name presses. Aliases resolve to the real name
+/// first, so there is still exactly one bit table in this file.
+fn mask_for_name(name: &str) -> Option<u8> {
+    let real = if BUTTONS.iter().any(|row| row.1 == name) {
+        name
+    } else {
+        ALIASES.iter().find(|(alias, _)| *alias == name)?.1
+    };
+    BUTTONS.iter().find(|row| row.1 == real).map(|row| row.2)
+}
+
+/// A `--play` script: the held mask for each step and how many frames it lasts.
+/// `RIGHT120` is Right held for 120 frames, `WAIT60` is nothing held for 60,
+/// and a bare name is one frame. `RIGHT+A30` is several buttons at once -- the
+/// names are OR-ed -- because a script that can only hold one mask cannot say
+/// "walk right and jump". Unreadable input is an error, never a step that
+/// silently holds nothing.
+fn parse_script(script: &str) -> Result<Vec<(u8, u32)>, String> {
+    let names = "A, B, SELECT, START, UP, DOWN, LEFT, RIGHT, JUMP, RUN, FIRE or WAIT";
+    if script.trim().is_empty() {
+        return Err(format!(
+            "--play needs at least one step, e.g. START,WAIT60,RIGHT120"
+        ));
+    }
+    let mut steps = Vec::new();
+    for token in script.split(',') {
+        let token = token.trim();
+        // Split the names from the trailing frame count: the count is digits,
+        // so the first character that is neither a name character nor the `+`
+        // separator ends the names. `+` belongs to the separator scan and not
+        // to a name -- `WAIT+A5` is "WAIT and A", never a button "WAIT+".
+        let split = token
+            .find(|c: char| !(c.is_ascii_alphabetic() || c == '+'))
+            .unwrap_or(token.len());
+        let (held, count) = (&token[..split], &token[split..]);
+        let frames: u32 = if count.is_empty() {
+            1
+        } else {
+            count
+                .parse()
+                .map_err(|_| format!("--play step {token:?}: {count:?} is not a frame count"))?
+        };
+        if frames == 0 {
+            return Err(format!(
+                "--play step {token:?}: holding for 0 frames does nothing"
+            ));
+        }
+        // One lookup per name, OR-ed together. Splitting on `+` first is what
+        // makes an empty half an error naming that half, rather than a name
+        // that is never found.
+        let mut mask = 0;
+        for name in held.split('+') {
+            mask |= if name.eq_ignore_ascii_case("WAIT") {
+                0
+            } else {
+                mask_for_name(name.to_ascii_uppercase().as_str()).ok_or_else(|| {
+                    format!(
+                        "--play step {token:?}: {name:?} is not a button; \
+                         join several of them with + out of {names}"
+                    )
+                })?
+            };
+        }
+        steps.push((mask, frames));
+    }
+    Ok(steps)
+}
+
+/// A parsed script, played back one frame at a time.
+struct Play {
+    steps: Vec<(u8, u32)>,
+    /// The mask currently held, the step it came from, and how many frames of
+    /// that step are left to run.
+    mask: u8,
+    at: usize,
+    left: u32,
+}
+
+impl Play {
+    fn new(steps: Vec<(u8, u32)>) -> Play {
+        Play {
+            steps,
+            mask: 0,
+            at: 0,
+            left: 0,
+        }
+    }
+
+    /// The mask to hold for the frame about to be emulated, consuming one
+    /// frame of the running step. `None` once the script has run out.
+    fn mask_for_next_frame(&mut self) -> Option<u8> {
+        // Step frames are always at least one (`parse_script` rejects zero), so
+        // `left == 0` means "this step is done" and only then. A step holding
+        // mask 0 (WAIT) is not done -- the mask is not what ends a step.
+        while self.left == 0 {
+            let &(mask, frames) = self.steps.get(self.at)?;
+            self.mask = mask;
+            self.left = frames;
+            self.at += 1;
+        }
+        self.left -= 1;
+        Some(self.mask)
+    }
+}
+
+/// How long to sleep at the end of a frame that took `elapsed`. A frame that
+/// overran gets no sleep at all and the next one starts fresh.
+///
+/// ponytail: no accumulator. A frame that blew its budget has already cost the
+/// time; chasing the debt with a burst of zero-length frames only makes the
+/// next one worse. Add a fixed-timestep accumulator if replay determinism
+/// ever needs to decouple emulation from the clock.
+fn frame_sleep(elapsed: ::std::time::Duration) -> ::std::time::Duration {
+    FRAME_BUDGET.checked_sub(elapsed).unwrap_or_default()
+}
+
+/// With no script the dump list is the whole run, so the last frame named ends
+/// it. This is the maximum, not the position: `--dump 5,3` still has to reach
+/// frame 5, or the caller asked for a frame and silently got none of it.
+fn dump_list_ends_run(dump_at: &[u32], frames: u32) -> bool {
+    dump_at.iter().copied().max() == Some(frames)
+}
+
+/// The requested dump frames a run that reached `frames` never wrote. Reported
+/// on stderr rather than turned into an error: the frames are simply not
+/// there, and saying so is what stops it reading as "the game froze".
+fn missed_dumps(dump_at: &[u32], frames: u32) -> Vec<u32> {
+    let mut missed: Vec<u32> = dump_at.iter().copied().filter(|&n| n > frames).collect();
+    missed.sort_unstable();
+    missed.dedup();
+    missed
+}
+
+fn main() -> Result<(), String> {
+    let mut args = ::std::env::args().skip(1);
+    let rom_path = args.next().ok_or_else(|| USAGE.to_string())?;
+    let mut dump_at: Vec<u32> = Vec::new();
+    let mut script = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--dump" => {
+                let list = args
+                    .next()
+                    .ok_or_else(|| format!("--dump needs a frame count\n{USAGE}"))?;
+                for n in list.split(',') {
+                    let n: u32 = n
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("--dump frame {n:?} is not a frame count\n{USAGE}"))?;
+                    if n == 0 {
+                        // Frames are counted from one, so this would run until
+                        // it was killed and still write nothing.
+                        return Err(format!(
+                            "--dump frame 0: frames are counted from 1\n{USAGE}"
+                        ));
+                    }
+                    dump_at.push(n);
+                }
+            }
+            "--play" => {
+                let text = args
+                    .next()
+                    .ok_or_else(|| format!("--play needs a script\n{USAGE}"))?;
+                script = Some(parse_script(&text)?);
+            }
+            other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
+        }
+    }
+
+    let sdl = sdl2::init().map_err(|e| e.to_string())?;
+    let video = sdl.video().map_err(|e| e.to_string())?;
+    let window = video
+        .window("NES", (W as u32) * SCALE, (H as u32) * SCALE)
+        .position_centered()
+        .allow_highdpi()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
+    canvas
+        .set_logical_size(W as u32, H as u32)
+        .map_err(|e| e.to_string())?;
+
+    let texture_creator = canvas.texture_creator();
+    let mut texture = texture_creator
+        .create_texture(
+            sdl2::pixels::PixelFormatEnum::ARGB8888,
+            sdl2::render::TextureAccess::Streaming,
+            W as u32,
+            H as u32,
+        )
+        .map_err(|e| e.to_string())?;
+
+    let bytes = ::std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let mut bus = Bus::new(Cartridge::load(&bytes)?);
+    // The PPU fetches pattern memory every dot, so the CHR ROM the cartridge
+    // parsed out of the file is loaded once into the PPU's banks.
+    bus.ppu.load_chr_rom(bus.cart.chr_rom());
+    let mut cpu = Cpu::new();
+    bus.reset();
+    cpu.reset(&mut bus);
+
+    let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
+    let mut play = script.map(Play::new);
+    let mut buttons = 0u8;
+    let mut running = true;
+    let mut frames = 0u32;
+    while running {
+        // Started before anything else in the frame so the emulation, the
+        // upload and the sleep are all inside the measured budget.
+        let frame_start = ::std::time::Instant::now();
+        for event in events.poll_iter() {
+            if !apply_event(event, &mut buttons) {
+                running = false;
+            }
+        }
+        // A script is not a second input path: it assigns the same mask a key
+        // press assigns, and it goes through the one `set_buttons` call below.
+        if let Some(script) = play.as_mut() {
+            match script.mask_for_next_frame() {
+                Some(mask) => buttons = mask,
+                // The script is over. Release what its last step held instead of
+                // emulating one more frame with it still down -- the frame that
+                // `running = false` still runs would be played with a key that
+                // the script already let go of.
+                None => {
+                    buttons = 0;
+                    running = false;
+                }
+            }
+        }
+        bus.controllers[0].set_buttons(buttons);
+        // Run the CPU until the PPU has a whole frame, taking the NMI the
+        // vblank flag raises. SMB gates its status bar on a sprite-0 hit and
+        // its NMI handler on `$2002`, so this is where the machine actually
+        // lives. There is no APU yet, so nothing below this is timing- or
+        // audio-driven; the frame's wall-clock budget is handled by
+        // `frame_sleep` and nothing else in the loop touches the clock.
+        while !bus.ppu.frame_ready() {
+            // An OAM DMA halts the CPU for its 513 cycles while the PPU keeps
+            // clocking; `tick` is one dot, so three of them per cycle drain it.
+            if bus.dma_busy() {
+                bus.tick();
+                continue;
+            }
+            cpu.step(&mut bus);
+            if bus.ppu.nmi_pending() {
+                bus.ppu.take_nmi();
+                cpu.nmi(&mut bus);
+            }
+        }
+        // The 2A03's maskable interrupt is the APU's and only the APU's, and
+        // `$4015` bits 7-6 are its two request flags (NESdev "APU", $4015 read:
+        // "IF-D NT21"). They read 0 here because there is no APU, so this never
+        // fires.
+        //
+        // ponytail: polled once a frame, not per instruction. Reading $4015
+        // clears the frame-counter flag, so a per-instruction poll would eat the
+        // IRQ before the APU task can deliver it; swap this for a level-triggered
+        // IRQ line the APU raises when there is one.
+        if bus.cpu_read(0x4015) & 0xC0 != 0 {
+            cpu.irq(&mut bus);
+        }
+        // `take_frame` is what clears the ready flag, and it is the ONLY thing that
+        // does -- without this the loop above exits once and never runs again.
+        // Its returned clone is dropped; the upload reads the PPU's own buffer
+        // by reference instead, so a frame costs one 240 KiB copy rather than
+        // two.
+        let _ = bus.ppu.take_frame();
+        let frame = bus.ppu.framebuffer();
+        frames += 1;
+        if let Some(n) = dump_at.iter().find(|&&n| n == frames) {
+            write_ppm(&format!("frame-{n}.ppm"), frame)?;
+        }
+        if play.is_none() && dump_list_ends_run(&dump_at, frames) {
+            // With no script the dump list is the whole run, so the last frame
+            // named ends it.
+            return Ok(());
+        }
+        // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
+        // all len*4 bytes of the frame are valid to read as u8.
+        let frame_bytes =
+            unsafe { ::std::slice::from_raw_parts(frame.as_ptr() as *const u8, frame.len() * 4) };
+        texture
+            .update(None, frame_bytes, W * 4)
+            .map_err(|e| e.to_string())?;
+        canvas.clear();
+        canvas
+            .copy(&texture, None, None)
+            .map_err(|e| e.to_string())?;
+        canvas.present();
+        ::std::thread::sleep(frame_sleep(frame_start.elapsed()));
+    }
+    // The run stopped early -- the script ran out, or the user quit -- so any
+    // dump frame past here was never written. Name them: a missing file with
+    // exit code 0 is indistinguishable from a frozen game.
+    let missed = missed_dumps(&dump_at, frames);
+    if !missed.is_empty() {
+        eprintln!(
+            "--dump asked for frame{} {missed:?} but the run only reached frame {frames}",
+            if missed.len() == 1 { "" } else { "s" },
+        );
+    }
+    Ok(())
+}
+
+/// One framebuffer pixel is `0x00RRGGBB` (see `Ppu::colour`), and binary PPM
+/// `P6` wants three bytes per pixel in R, G, B order, so the only work is
+/// dropping the byte the mask left clear. Convert to PNG outside the crate --
+/// `sdl2` is the only dependency this project has.
+fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
+    let rgb: Vec<u8> = frame
+        .iter()
+        .flat_map(|&px| [(px >> 16) as u8, (px >> 8) as u8, px as u8])
+        .collect();
+    let mut out = Vec::with_capacity(rgb.len() + 32);
+    out.extend_from_slice(format!("P6\n{W} {H}\n255\n").as_bytes());
+    out.extend_from_slice(&rgb);
+    ::std::fs::write(path, out).map_err(|e| format!("{path}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_event, button_for, dump_list_ends_run, frame_sleep, mask_for_name, missed_dumps,
+        parse_script, Play, FRAME_BUDGET,
+    };
+    use sdl2::event::{Event, WindowEvent};
+    use sdl2::keyboard::Keycode;
+    use std::time::Duration;
+
+    #[test]
+    fn a_script_is_a_list_of_mask_and_frame_pairs() {
+        assert_eq!(
+            parse_script("START,WAIT60,RIGHT120").unwrap(),
+            [(0x08, 1), (0, 60), (0x80, 120)],
+            "Start for a frame, nothing for 60, Right for 120"
+        );
+    }
+
+    /// One step can hold several buttons at once: `RIGHT+A30` is Right AND A
+    /// for 30 frames. A single mask per step cannot express "walk right and
+    /// jump", which is what a 3-tile-high pipe in WORLD 1-1 asks for.
+    #[test]
+    fn a_step_can_hold_two_buttons_at_once() {
+        assert_eq!(
+            parse_script("RIGHT+A30").unwrap(),
+            [(0x80 | 0x01, 30)],
+            "Right and A are OR-ed into one mask and last 30 frames"
+        );
+    }
+
+    #[test]
+    fn a_step_can_hold_three_buttons_at_once() {
+        assert_eq!(
+            parse_script("LEFT+B+START4").unwrap(),
+            [(0x40 | 0x02 | 0x08, 4)],
+            "Left, B and Start in one mask for 4 frames"
+        );
+    }
+
+    /// The names are looked up one at a time, so the error has to say WHICH
+    /// one was wrong -- "not a button" naming the whole step leaves the reader
+    /// hunting for the bad half of it.
+    #[test]
+    fn an_unknown_name_inside_a_multi_button_step_names_that_name() {
+        // Both halves of the assertion matter. Naming "FOO" alone is worthless:
+        // the pre-fix error reads `"+FOO30" is not a frame count`, which also
+        // contains the letters FOO. It has to be rejected AS A NAME.
+        for bad in ["RIGHT+FOO30", "RIGHT+FOO+ALSONOPE30"] {
+            let err = parse_script(bad).expect_err(&format!("{bad:?} should not parse"));
+            assert!(
+                err.contains("is not a button"),
+                "{bad:?} must be rejected as an unknown name, not as a bad count: {err}"
+            );
+            for name in bad.split('+').skip(1).map(|s| {
+                &s[..s
+                    .find(|c: char| !c.is_ascii_alphabetic())
+                    .unwrap_or(s.len())]
+            }) {
+                assert!(err.contains(name), "error must name {name:?}: {err}");
+            }
+        }
+        // The same rejection as a single-name step: joining with + is not a way
+        // to smuggle an unknown name past the check.
+        assert!(parse_script("FOO30").is_err());
+    }
+
+    /// `+` with nothing on one side is a typo, not a step holding fewer
+    /// buttons. Treating it as nothing is the worst outcome: the run looks
+    /// like it works and simply does not press what was asked for.
+    #[test]
+    fn a_separator_with_no_button_on_one_side_is_rejected() {
+        for bad in [
+            "+RIGHT30",   // nothing before the separator
+            "RIGHT+30",   // nothing after it, and then a frame count
+            "RIGHT+",     // nothing after it at all
+            "RIGHT++A30", // an empty hole between two separators
+            "+",          // and a step that is only a separator
+            "+30",        // which also has no name at all
+        ] {
+            let err = parse_script(bad).expect_err(&format!("{bad:?} should not parse"));
+            assert!(!err.is_empty(), "{bad:?} gave an empty error");
+        }
+    }
+
+    /// `+` is a separator and nothing else. If it were part of the name,
+    /// `WAIT+A5` would look up one button called "WAIT+" and be rejected --
+    /// or worse, be accepted by a lookup that merely ignored the separator and
+    /// never pressed A.
+    #[test]
+    fn the_separator_is_never_part_of_a_button_name() {
+        assert_eq!(
+            parse_script("WAIT+A5").unwrap(),
+            [(0x01, 5)],
+            r#"WAIT contributes nothing, A contributes its bit: "WAIT+" is not a name"#
+        );
+        // And a name may not end in the separator, which is the same defect
+        // read from the other side.
+        assert!(parse_script("WAIT+5").is_err());
+    }
+
+    /// Every single-button form keeps meaning exactly what it meant before
+    /// `+` existed -- `--play "WAIT297,START10,..."` is load-bearing for every
+    /// verification in this project, aliases included.
+    #[test]
+    fn single_button_steps_are_unchanged_by_the_separator() {
+        for (script, want) in [
+            ("START", (0x08u8, 1u32)),
+            ("WAIT297", (0, 297)),
+            ("RIGHT200", (0x80, 200)),
+            ("A1", (0x01, 1)),
+            ("B1", (0x02, 1)),
+            ("SELECT1", (0x04, 1)),
+            ("UP1", (0x10, 1)),
+            ("DOWN1", (0x20, 1)),
+            ("LEFT1", (0x40, 1)),
+            ("JUMP60", (0x01, 60)),
+            ("RUN60", (0x02, 60)),
+            ("FIRE60", (0x02, 60)),
+            ("right60", (0x80, 60)), // still case-insensitive
+        ] {
+            assert_eq!(
+                parse_script(script).unwrap(),
+                [want],
+                "{script:?} must mean exactly what it always did"
+            );
+        }
+    }
+
+    #[test]
+    fn every_button_name_presses_its_own_distinct_bit() {
+        let names = ["A", "B", "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT"];
+        for (i, name) in names.iter().enumerate() {
+            let bit = mask_for_name(name).unwrap_or_else(|| panic!("{name} has no bit"));
+            assert_eq!(
+                bit,
+                0x01 << i,
+                "{name} is bit {i} of the controller report order"
+            );
+            // Distinct bits, or a step could not tell two buttons apart.
+            for other in &names[i + 1..] {
+                assert_ne!(
+                    mask_for_name(other),
+                    Some(bit),
+                    "{name} and {other} share bit {bit:#04x}"
+                );
+            }
+        }
+        assert_eq!(mask_for_name("JUMP"), Some(0x01), "JUMP is A");
+        assert_eq!(mask_for_name("RUN"), Some(0x02), "RUN is B");
+        assert_eq!(mask_for_name("FIRE"), Some(0x02), "FIRE is B");
+    }
+
+    #[test]
+    fn a_key_presses_the_bit_its_script_name_promises() {
+        // One bit table, two front ends: if these drift, a script and a key
+        // would press different buttons.
+        for (key, name, bit) in super::BUTTONS {
+            assert_eq!(button_for(key), Some(bit), "{name} key");
+            assert_eq!(mask_for_name(name), Some(bit), "{name} script");
+        }
+        assert_eq!(button_for(Keycode::Escape), None, "Escape quits");
+        assert_eq!(button_for(Keycode::LShift), None, "not on the pad");
+    }
+
+    /// Garbage in must be an error, not a script that quietly does nothing --
+    /// a silent no-op looks exactly like a working run until you look at a
+    /// screenshot.
+    #[test]
+    fn a_script_it_cannot_read_is_an_error_naming_the_offending_step() {
+        for bad in [
+            "",                                // empty
+            "   ",                             // whitespace only
+            "FOO",                             // not a button
+            "RIGHT0",                          // zero frames
+            "12",                              // no button at all
+            "RIGHTx",                          // frame count is not a number
+            "RIGHT-3",                         // negative frames
+            "START,,R",                        // empty step
+            "RIGHT 4",                         // space in the count
+            "START,RIGHT99999999999999999999", // count overflows u32
+        ] {
+            let err = parse_script(bad).expect_err(&format!("{bad:?} should not parse"));
+            assert!(!err.is_empty(), "{bad:?} gave an empty error");
+        }
+        let err = parse_script("FOO12").unwrap_err();
+        assert!(err.contains("FOO"), "error should name the bad step: {err}");
+    }
+
+    #[test]
+    fn a_script_plays_its_steps_in_order_then_runs_out() {
+        let mut play = Play::new(vec![(0x08, 2), (0, 2), (0x80, 3)]);
+        let got: Vec<Option<u8>> = (0..9).map(|_| play.mask_for_next_frame()).collect();
+        assert_eq!(
+            got,
+            [
+                Some(0x08),
+                Some(0x08),
+                Some(0),
+                Some(0),
+                Some(0x80),
+                Some(0x80),
+                Some(0x80),
+                None, // 7 frames of script, then out
+                None, // and it stays out
+            ],
+            "Start, Start, nothing, nothing, Right x3"
+        );
+    }
+
+    #[test]
+    fn a_sleep_fills_out_the_frame_budget_and_never_goes_negative() {
+        assert_eq!(frame_sleep(Duration::ZERO), FRAME_BUDGET, "free frame");
+        assert_eq!(
+            frame_sleep(FRAME_BUDGET / 2),
+            FRAME_BUDGET / 2,
+            "half a frame used, half to sleep"
+        );
+        assert_eq!(
+            frame_sleep(FRAME_BUDGET),
+            Duration::ZERO,
+            "exactly on budget, no sleep"
+        );
+        // Behind: drop the debt instead of chasing it, and certainly do not
+        // wrap around into an enormous sleep.
+        for over in [
+            FRAME_BUDGET * 3,
+            Duration::from_secs(5),
+            Duration::MAX,
+            Duration::from_nanos(u64::MAX),
+        ] {
+            assert_eq!(frame_sleep(over), Duration::ZERO, "{over:?} overran");
+        }
+    }
+
+    /// `--dump 5,3` used to end the run after frame 3: frame 5 was never
+    /// written, nothing was said, and the exit code was still 0. Task 9 reads
+    /// dumps, so a silently dropped frame reads as "the game froze". The end of
+    /// the run is the highest frame named, in whatever order they were named.
+    #[test]
+    fn an_unsorted_dump_list_still_runs_to_its_highest_frame() {
+        for list in [&[5u32, 3][..], &[9, 3, 5][..], &[3, 5][..]] {
+            let highest = list.iter().copied().max().unwrap();
+            for frames in 1..=highest {
+                assert_eq!(
+                    dump_list_ends_run(list, frames),
+                    frames == highest,
+                    "--dump {list:?} must end at {highest}, not at {frames}"
+                );
+            }
+        }
+    }
+
+    /// SDL sends no `KeyUp` for a key released while another window has the
+    /// focus, so the FocusLost arm is the only thing that un-latches a held
+    /// button. `Event` is a plain enum value, so this runs with no window and
+    /// no X server -- it needed the handler extracted from `main` to be
+    /// reachable at all, not a real alt-tab.
+    #[test]
+    fn a_focus_loss_clears_the_held_mask() {
+        let mut buttons = 0xFF;
+        let lost = Event::Window {
+            timestamp: 0,
+            window_id: 0,
+            win_event: WindowEvent::FocusLost,
+        };
+        assert!(
+            apply_event(lost, &mut buttons),
+            "losing focus is not a quit"
+        );
+        assert_eq!(buttons, 0, "every held bit must be forgotten");
+    }
+
+    #[test]
+    fn a_key_up_clears_only_its_own_bit() {
+        let down = |key| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(key),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat: false,
+        };
+        let up = |key| Event::KeyUp {
+            timestamp: 1,
+            window_id: 0,
+            keycode: Some(key),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat: false,
+        };
+        let mut buttons = 0u8;
+        for key in [Keycode::Z, Keycode::Right, Keycode::Return] {
+            assert!(apply_event(down(key), &mut buttons), "{key:?} down");
+        }
+        assert_eq!(buttons, 0x01 | 0x80 | 0x08, "Z, Right and Return held");
+        assert!(apply_event(up(Keycode::Right), &mut buttons), "Right up");
+        assert_eq!(
+            buttons,
+            0x01 | 0x08,
+            "only Right's bit goes; Z and Return are still down"
+        );
+        // Escape quits, a key with no bit does nothing, and both still say the
+        // run continues.
+        assert!(
+            !apply_event(down(Keycode::Escape), &mut buttons),
+            "Escape ends the run"
+        );
+        let before = buttons;
+        assert!(
+            apply_event(down(Keycode::F5), &mut buttons),
+            "F5 is not a quit"
+        );
+        assert_eq!(buttons, before, "F5 is not on the pad");
+    }
+
+    /// A dump frame past the end of the run is written nowhere and reported
+    /// nowhere, which is the same silent under-delivery as stopping early.
+    #[test]
+    fn a_dump_frame_past_the_end_of_the_run_is_named_as_missed() {
+        assert_eq!(
+            missed_dumps(&[600, 1400], 1400),
+            Vec::<u32>::new(),
+            "all reached"
+        );
+        assert_eq!(missed_dumps(&[600, 1400], 7), [600, 1400], "none reached");
+        assert_eq!(
+            missed_dumps(&[600, 1400], 1000),
+            [1400],
+            "the later one only"
+        );
+        assert_eq!(missed_dumps(&[9, 3, 5], 7), [9], "order does not matter");
+    }
+}
