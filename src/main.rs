@@ -326,36 +326,10 @@ fn main() -> Result<(), String> {
         }
         bus.controllers[0].set_buttons(buttons);
         // Run the CPU until the PPU has a whole frame, taking the NMI the
-        // vblank flag raises. SMB gates its status bar on a sprite-0 hit and
-        // its NMI handler on `$2002`, so this is where the machine actually
-        // lives. There is no APU yet, so nothing below this is timing- or
-        // audio-driven; the frame's wall-clock budget is handled by
-        // `frame_sleep` and nothing else in the loop touches the clock.
-        while !bus.ppu.frame_ready() {
-            // An OAM DMA halts the CPU for its 513 cycles while the PPU keeps
-            // clocking; `tick` is one dot, so three of them per cycle drain it.
-            if bus.dma_busy() {
-                bus.tick();
-                continue;
-            }
-            cpu.step(&mut bus);
-            if bus.ppu.nmi_pending() {
-                bus.ppu.take_nmi();
-                cpu.nmi(&mut bus);
-            }
-        }
-        // The 2A03's maskable interrupt is the APU's and only the APU's, and
-        // `$4015` bits 7-6 are its two request flags (NESdev "APU", $4015 read:
-        // "IF-D NT21"). They read 0 here because there is no APU, so this never
-        // fires.
-        //
-        // ponytail: polled once a frame, not per instruction. Reading $4015
-        // clears the frame-counter flag, so a per-instruction poll would eat the
-        // IRQ before the APU task can deliver it; swap this for a level-triggered
-        // IRQ line the APU raises when there is one.
-        if bus.cpu_read(0x4015) & 0xC0 != 0 {
-            cpu.irq(&mut bus);
-        }
+        // vblank flag raises and the APU's frame IRQ off its level line. SMB
+        // gates its status bar on a sprite-0 hit and its NMI handler on
+        // `$2002`, so this is where the machine actually lives.
+        bus.run_frame(&mut cpu);
         // `take_frame` is what clears the ready flag, and it is the ONLY thing that
         // does -- without this the loop above exits once and never runs again.
         // Its returned clone is dropped; the upload reads the PPU's own buffer

@@ -26,8 +26,9 @@
 //! * Unmapped and write-only reads return 0 where hardware returns open bus,
 //!   matching the PPU's own choice for `$2002` bits 4-0.
 
+use crate::apu::Apu;
 use crate::controller::Controller;
-use crate::cpu::BusLike;
+use crate::cpu::{BusLike, Cpu};
 use crate::ppu::Ppu;
 use crate::rom::Cartridge;
 
@@ -44,6 +45,7 @@ pub struct Bus {
     /// images carry it; the SMB board does not.
     prg_ram: [u8; 8192],
     pub ppu: Ppu,
+    pub apu: Apu,
     pub controllers: [Controller; 2],
     /// CPU cycles the bus has been ticked for. Only its parity is load-bearing:
     /// it decides whether the next `$4014` write costs 513 or 514 cycles.
@@ -65,6 +67,7 @@ impl Bus {
             cpu_ram: [0; 2048],
             prg_ram: [0; 8192],
             ppu: Ppu::new(),
+            apu: Apu::new(),
             controllers: [Controller::new(), Controller::new()],
             cycles: 0,
             dot: 0,
@@ -91,6 +94,7 @@ impl Bus {
         self.cycles = 0;
         self.dot = 0;
         self.dma_stall = 0;
+        self.apu.power_on();
     }
 
     /// The RESET button: both RAMs keep their contents -- hardware does not
@@ -101,6 +105,7 @@ impl Bus {
         self.cycles = 0;
         self.dot = 0;
         self.dma_stall = 0;
+        self.apu.reset();
     }
 
     pub fn cpu_read(&mut self, addr: u16) -> u8 {
@@ -111,7 +116,7 @@ impl Bus {
             // "$2000-$2007 ... $2008-$3FFF: mirrors of $2000-$2007 (repeats
             // every 8 bytes)"; the PPU does the `& 7` itself.
             0x2000..=0x3FFF => self.ppu.cpu_read(addr),
-            0x4015 => 0, // APU status: no APU, so no channels and no frame IRQ
+            0x4015 => self.apu.cpu_read(addr),
             0x4016 => self.controllers[0].read(),
             0x4017 => self.controllers[1].read(),
             // The cartridge may populate this window with PRG RAM. Both NROM
@@ -130,6 +135,10 @@ impl Bus {
             0x0000..=0x1FFF => self.cpu_ram[addr as usize & 0x07FF] = val,
             0x2000..=0x3FFF => self.ppu.cpu_write(addr, val),
             0x4014 => self.oam_dma(val),
+            // `$4000-$4013` are the APU's channels -- `$4010-$4013` being the
+            // DMC, which this APU drops -- and `$4015`/`$4017` its status and
+            // frame counter.
+            0x4000..=0x4013 | 0x4015 | 0x4017 => self.apu.cpu_write(addr, val),
             // One `$4016` write latches BOTH ports: "Though both are polled from
             // a write to $4016, controller 1 is read through $4016, and
             // controller 2 is separately read through $4017" (NESdev
@@ -139,8 +148,7 @@ impl Bus {
                     c.write_strobe(val);
                 }
             }
-            // `$4010-$4013`, `$4015` and `$4017` are the APU, and there is no
-            // APU; `$4020-$7FFF` is mapper 66's unmapped window. Both drop.
+            // `$4020-$7FFF` is mapper 66's unmapped window and drops.
             0x6000..=0x7FFF if self.cart.has_prg_ram() => {
                 self.prg_ram[addr as usize - 0x6000] = val;
             }
@@ -160,9 +168,10 @@ impl Bus {
         self.dma_stall > 0
     }
 
-    /// Advance the PPU by **one dot**. `Cpu::step` calls `tick` three times per
-    /// cycle it consumes (see `BusLike`), and SMB's sprite-0 hit depends on
-    /// that ratio, so nothing here may add a factor of three.
+    /// Advance the PPU by **one dot** (and the APU once the dots make a whole
+    /// CPU cycle). `Cpu::step` calls `tick` three times per cycle it consumes
+    /// (see `BusLike`), and SMB's sprite-0 hit depends on that ratio, so
+    /// nothing here may add a factor of three.
     pub fn tick(&mut self) {
         self.ppu.tick();
         self.dot += 1;
@@ -171,8 +180,34 @@ impl Bus {
         }
         self.dot = 0;
         self.cycles += 1;
+        self.apu.tick();
         if self.dma_stall > 0 {
             self.dma_stall -= 1;
+        }
+    }
+
+    /// Run the CPU until the PPU has a whole frame, delivering the PPU's NMI
+    /// and the APU's level-triggered IRQ (checked before every instruction,
+    /// like hardware's instruction-boundary sampling). The frame-ready flag is
+    /// left set for the caller, which is what `take_frame` clears.
+    pub fn run_frame(&mut self, cpu: &mut Cpu) {
+        while !self.ppu.frame_ready() {
+            // An OAM DMA halts the CPU for its 513 cycles while the PPU keeps
+            // clocking; `tick` is one dot, so three of them per cycle drain it.
+            if self.dma_busy() {
+                self.tick();
+                continue;
+            }
+            // `Cpu::irq` itself refuses while `I` is set, and the APU's flag
+            // stays up until `$4015` is read, so this line keeps re-asking.
+            if self.apu.irq_pending() {
+                cpu.irq(self);
+            }
+            cpu.step(self);
+            if self.ppu.nmi_pending() {
+                self.ppu.take_nmi();
+                cpu.nmi(self);
+            }
         }
     }
 
@@ -268,6 +303,25 @@ mod tests {
         Cartridge::load(&bytes).expect("synthetic NROM image must load")
     }
 
+    /// A cartridge with a real interrupt layout: `$8000` runs `CLI; JMP $8000`,
+    /// the IRQ vector points at `$8010` and the NMI vector at an RTI stub, so a
+    /// frame's vblank does not run into uninitialized memory.
+    fn cart_with_irq_handler(handler: &[u8]) -> Cartridge {
+        let mut bytes = ines_header().to_vec();
+        for fill in 0..2u8 {
+            bytes.extend(std::iter::repeat_n(fill, BANK));
+        }
+        let at = 16 + POWER_ON_BANK * BANK;
+        bytes[at..at + 4].copy_from_slice(&[0x58, 0x4C, 0x00, 0x80]); // CLI; JMP $8000
+        bytes[at + 0x10..at + 0x10 + handler.len()].copy_from_slice(handler);
+        bytes[at + 0x20] = 0x40; // NMI lands on an RTI
+        let vectors = at + (0xFFFC - 0x8000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes()); // reset
+        bytes[vectors + 2..vectors + 4].copy_from_slice(&0x8010u16.to_le_bytes()); // IRQ
+        bytes[vectors + 4..vectors + 6].copy_from_slice(&0x8020u16.to_le_bytes()); // NMI
+        Cartridge::load(&bytes).expect("synthetic image must load")
+    }
+
     /// Same image, except the power-on bank's `$8000` byte is patched to `$11`.
     /// Each bank is filled with its own index, so writing `$11` matches the ROM
     /// and bits 5-4 select bank 1 -- a bank that reads 1 at `$8001` instead of 0.
@@ -329,15 +383,98 @@ mod tests {
         }
     }
 
+    /// `$4000-$4013`, `$4015` and `$4017` reach the APU now: the frame IRQ it
+    /// raises is visible through `cpu_read($4015)`.
     #[test]
-    fn the_apu_window_reads_as_open_bus_and_writes_are_dropped() {
+    fn the_apu_window_reaches_the_apu() {
         let mut b = Bus::new(blank_cart());
-        assert_eq!(b.cpu_read(0x4015), 0, "$4015 with no APU");
-        b.cpu_write(0x4015, 0x0F); // would raise a frame IRQ if there were an APU
-        assert_eq!(b.cpu_read(0x4015), 0);
-        b.cpu_write(0x4010, 0x0F); // DMC channel
-        b.cpu_write(0x4017, 0x40); // frame counter
-        assert_eq!(b.cpu_read(0x4015), 0);
+        b.cpu_write(0x4017, 0x40); // inhibit: the flag can never rise
+        for _ in 0..3 * 29_831 {
+            b.tick();
+        }
+        assert_eq!(
+            b.cpu_read(0x4015) & 0x40,
+            0,
+            "$4017 bit 6 holds the flag down"
+        );
+        b.cpu_write(0x4017, 0x00); // now let the counter run
+        let mut ticks = 0;
+        while b.cpu_read(0x4015) & 0x40 == 0 {
+            b.tick();
+            ticks += 1;
+            assert!(ticks < 3 * 40_000, "the frame IRQ never reached the bus");
+        }
+    }
+
+    /// The APU advances one tick per CPU CYCLE, not per dot: through the real
+    /// instruction path the frame counter's first IRQ step lands at 29831
+    /// cycles, and the flag is not up a few cycles before that.
+    #[test]
+    fn the_apu_sees_one_tick_per_cpu_cycle_written_to_its_registers() {
+        let code = [0xEA, 0x4C, 0x00, 0x80]; // NOP; JMP $8000
+        let mut b = Bus::new(cart_running(&code));
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut b);
+        b.cpu_write(0x4017, 0x00); // mode 0, counter restarted
+        let mut cycles = 0u32;
+        while cycles + 5 < 29_831 {
+            cycles += cpu.step(&mut b) as u32;
+        }
+        assert_eq!(
+            b.cpu_read(0x4015) & 0x40,
+            0,
+            "before the step, no flag: a dot-rate tick would be three times too fast"
+        );
+        while cycles < 29_831 {
+            cycles += cpu.step(&mut b) as u32;
+        }
+        assert_eq!(
+            b.cpu_read(0x4015) & 0x40,
+            0x40,
+            "one tick per cycle puts the flag up at 29831 cycles"
+        );
+        assert!(cycles <= 29_840, "and not much later: {cycles}");
+    }
+
+    /// The APU's frame IRQ is maskable: with `I` clear it is taken through
+    /// `$FFFE` before the next instruction. The handler is `INC $00; RTI`.
+    #[test]
+    fn an_apu_irq_is_delivered_before_the_next_instruction_when_i_is_clear() {
+        let mut b = Bus::new(cart_with_irq_handler(&[0xE6, 0x00, 0x40]));
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut b);
+        b.cpu_write(0x4017, 0x00);
+        // The first frame is ~27510 cycles: short of the 29831-cycle step, and
+        // a three-times-too-fast APU would already have fired.
+        b.run_frame(&mut cpu);
+        let _ = b.ppu.take_frame();
+        assert_eq!(b.cpu_read(0x0000), 0, "no IRQ before the frame step");
+        b.run_frame(&mut cpu);
+        let _ = b.ppu.take_frame();
+        assert!(
+            b.cpu_read(0x0000) >= 1,
+            "the frame IRQ must reach the handler at $FFFE"
+        );
+    }
+
+    #[test]
+    fn a_held_frame_flag_does_not_re_fire_while_i_is_set() {
+        // Handler: INC $00; JMP $8012 -- one more entry would count 2. It
+        // never reads $4015 and never RTIs.
+        let mut b = Bus::new(cart_with_irq_handler(&[0xE6, 0x00, 0x4C, 0x12, 0x80]));
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut b);
+        b.cpu_write(0x4017, 0x00);
+        for _ in 0..3 {
+            b.run_frame(&mut cpu);
+            let _ = b.ppu.take_frame();
+        }
+        assert_eq!(
+            b.cpu_read(0x0000),
+            1,
+            "the held flag must not stack a second interrupt while I is set"
+        );
+        assert_eq!(b.cpu_read(0x4015) & 0x40, 0x40, "and it is still pending");
     }
 
     /// `$2000-$3FFF` writes must land on the PPU register the address names,
