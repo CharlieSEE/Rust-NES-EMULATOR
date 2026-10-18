@@ -57,7 +57,7 @@ pub struct Bus {
 
 impl Bus {
     pub fn new(cart: Cartridge) -> Bus {
-        Bus {
+        let mut bus = Bus {
             cart,
             cpu_ram: [0; 2048],
             ppu: Ppu::new(),
@@ -65,7 +65,16 @@ impl Bus {
             cycles: 0,
             dot: 0,
             dma_stall: 0,
+        };
+        // The PPU fetches pattern memory every dot, so the CHR image the
+        // cartridge parsed out of the file is loaded once, here. A cartridge
+        // that carries no CHR bytes at all gets RAM instead, which is what
+        // blargg's 2005 suite uploads its tiles into.
+        bus.ppu.load_chr_rom(bus.cart.chr_rom());
+        if bus.cart.chr_is_ram() {
+            bus.ppu.use_chr_ram();
         }
+        bus
     }
 
     /// Power-on state. The 2A03's RAM comes up undefined and the game's own
@@ -227,6 +236,16 @@ mod tests {
         cart_running(&[])
     }
 
+    /// A 16 KiB NROM image with no CHR bytes at all, like blargg's 2005 suite:
+    /// the PPU gets CHR RAM and the cartridge claims the `$6000-$7FFF` window.
+    fn nrom_cart_no_chr() -> Cartridge {
+        let mut bytes = vec![0u8; 16];
+        bytes[..4].copy_from_slice(b"NES\x1a");
+        bytes[4] = 1; // 16 KiB PRG
+        bytes.resize(16 + 0x4000, 0);
+        Cartridge::load(&bytes).expect("synthetic NROM image must load")
+    }
+
     /// Same image, except the power-on bank's `$8000` byte is patched to `$11`.
     /// Each bank is filled with its own index, so writing `$11` matches the ROM
     /// and bits 5-4 select bank 1 -- a bank that reads 1 at `$8001` instead of 0.
@@ -326,6 +345,42 @@ mod tests {
             0x21,
             "$2006/$2007 writes never reached the PPU"
         );
+    }
+
+    /// CHR RAM: when the cartridge carries no CHR bytes, pattern writes
+    /// through `$2006`/`$2007` land in the PPU's pattern memory. The 2005
+    /// suite uploads its own tiles this way; dropping the write renders
+    /// nothing and every test ROM looks empty.
+    #[test]
+    fn chr_ram_accepts_pattern_writes_through_2007() {
+        let mut b = Bus::new(nrom_cart_no_chr());
+        b.cpu_write(0x2006, 0x00);
+        b.cpu_write(0x2006, 0x00);
+        b.cpu_write(0x2007, 0xAA);
+        b.cpu_write(0x2006, 0x00);
+        b.cpu_write(0x2006, 0x00);
+        let _ = b.cpu_read(0x2007); // prime the one-byte-late read buffer
+        assert_eq!(
+            b.cpu_read(0x2007),
+            0xAA,
+            "the write must land in pattern memory"
+        );
+    }
+
+    /// ...and it must land in pattern memory, not be masked down onto the
+    /// nametables: `vram_index` maps `$0000-$1FFF` onto the first two
+    /// nametable pages, so a write that fell through to the VRAM path would
+    /// put the tile data in tilemap RAM instead.
+    #[test]
+    fn chr_ram_writes_do_not_alias_the_nametables() {
+        let mut b = Bus::new(nrom_cart_no_chr());
+        b.cpu_write(0x2006, 0x00);
+        b.cpu_write(0x2006, 0x00);
+        b.cpu_write(0x2007, 0xAA);
+        b.cpu_write(0x2006, 0x20); // $2000: the first nametable byte
+        b.cpu_write(0x2006, 0x00);
+        let _ = b.cpu_read(0x2007);
+        assert_eq!(b.cpu_read(0x2007), 0x00, "no alias onto the nametables");
     }
 
     /// RAM mirrors on the WRITE side too, or a game that sets up its zero page

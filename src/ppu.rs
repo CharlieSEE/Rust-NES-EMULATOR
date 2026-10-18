@@ -137,6 +137,10 @@ pub struct Ppu {
     /// register puts it in bits 1-0, and the game flips it mid-frame to show
     /// both games' logos at once.
     chr_bank: usize,
+    /// Whether `$0000-$1FFF` is RAM instead of ROM: true for cartridges that
+    /// carry no CHR bytes at all (blargg's 2005 suite), which upload their own
+    /// tiles through `$2007`.
+    chr_ram: bool,
     /// Power-on OAM is dynamic RAM with no defined contents, and Y = $FF is the
     /// documented way to hide a sprite ("Hide a sprite by moving it down
     /// offscreen, by writing any values between #$EF-#$FF here"). Filling it
@@ -247,6 +251,7 @@ impl Ppu {
             palette: [0; 32],
             chr: [0; 16384],
             chr_bank: 0,
+            chr_ram: false,
             oam: [0xFF; 256],
             secondary_oam: [0; 32],
             secondary_sprite0: [false; 8],
@@ -840,15 +845,18 @@ impl Ppu {
                     self.palette[palette_index(addr)] = val & 0x3F;
                 } else if addr >= 0x2000 {
                     self.vram[vram_index(addr)] = val;
+                } else if self.chr_ram {
+                    // The game uploads its tiles here through `$2007`. NROM is
+                    // the only board with CHR RAM and it has no bank register,
+                    // so `chr_bank` stays 0 and the address alone indexes.
+                    self.chr[addr as usize & 0x1FFF] = val;
                 }
-                // `$0000-$1FFF` is pattern memory and on this board it is CHR
-                // ROM, so the write goes NOWHERE. Storing it would be worse
-                // than dropping it: `vram_index` masks that range down to
-                // `$0000 + (addr & $07FF)` and would alias the byte onto a
-                // nametable tile. `v` advances either way -- hardware steps the
-                // address register on every `$2007` access whether or not the
-                // byte lands, and getting that wrong hangs any game that
-                // streams data through a fixed address window.
+                // `$0000-$1FFF` is pattern memory. On a cartridge with CHR ROM
+                // the write goes NOWHERE; on one with none it is the 8 KiB RAM
+                // pattern space written above. `v` advances either way --
+                // hardware steps the address register on every `$2007` access
+                // whether or not the byte lands, and getting that wrong hangs
+                // any game that streams data through a fixed address window.
                 self.increment_v();
             }
             // $2002 is read-only: "Reading from $2002 clears the vblank flag
@@ -886,9 +894,20 @@ impl Ppu {
         self.chr_bank = bank;
     }
 
-    /// The CHR ROM image, which the `Cartridge` parsed out of the file.
+    /// `$0000-$1FFF` is RAM: the cartridge carries no CHR bytes, so every
+    /// `$2007` write into pattern space lands there. NROM has no bank register
+    /// and `chr_bank` stays 0.
+    pub fn use_chr_ram(&mut self) {
+        self.chr_ram = true;
+    }
+
+    /// The CHR image, which the `Cartridge` parsed out of the file: 16 KiB for
+    /// the SMB board, 8 KiB for apu_reset, nothing at all for a CHR RAM cart.
+    /// The array zero-fills, so a short -- or absent -- image is fine.
     pub fn load_chr_rom(&mut self, data: &[u8]) {
-        self.chr.copy_from_slice(data);
+        self.chr = [0; 16384];
+        let n = data.len().min(self.chr.len());
+        self.chr[..n].copy_from_slice(&data[..n]);
     }
 }
 
@@ -1126,6 +1145,32 @@ mod tests {
         for x in 8..16 {
             assert_eq!(p.pixel(x, 0), BACKDROP, "tile bled past its 8 pixels");
         }
+    }
+
+    /// apu_reset's images carry 8 KiB of CHR, not 16: the load must zero-fill
+    /// the rest instead of panicking, and CHR RAM carts (no CHR bytes at all)
+    /// must end up with a zeroed pattern space.
+    #[test]
+    fn an_8k_chr_image_loads_without_panicking() {
+        let mut p = Ppu::new();
+        p.load_chr_rom(&[0xAA; 8192]); // apu_reset carries 8 KiB, not 16
+        assert_eq!(p.chr[0], 0xAA, "the 8 KiB that exist");
+        assert_eq!(p.chr[8192], 0x00, "the upper bank zero-fills");
+        p.load_chr_rom(&[]); // the 2005 suite: no CHR bytes at all
+        assert_eq!(p.chr[0], 0x00, "an empty image leaves a zeroed pattern space");
+    }
+
+    /// With CHR ROM in the file, a `$2007` write into pattern space must still
+    /// go nowhere -- in particular not onto nametable RAM, which is where
+    /// `vram_index` would put it.
+    #[test]
+    fn a_pattern_write_goes_nowhere_when_the_cartridge_has_chr_rom() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2006, 0x00);
+        p.cpu_write(0x2006, 0x00);
+        p.cpu_write(0x2007, 0xAA);
+        assert_eq!(p.vram[0], 0x00, "not masked onto the nametables");
+        assert_eq!(p.chr[0], 0x00, "and not into CHR ROM either");
     }
 
     /// Mapper 66's register bits 1-0 pick which 8 KiB CHR bank is mapped at
