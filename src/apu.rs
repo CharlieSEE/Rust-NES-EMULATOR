@@ -32,6 +32,11 @@ const TRIANGLE_SEQUENCE: [u8; 32] = [
     13, 14, 15,
 ];
 
+/// The noise period table in CPU cycles (NESdev "APU Noise", NTSC column).
+const NOISE_PERIODS: [u16; 16] = [
+    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
+];
+
 /// CPU cycles after power-on or reset before the implied `$4017 = $00` write
 /// takes effect: blargg measured "as if $00 were written to $4017, then a 9-12
 /// clock delay, then execution" (`apu_reset`). Provisional; `09.reset_timing`
@@ -474,19 +479,74 @@ impl Triangle {
     }
 }
 
-/// The noise channel.
+/// The noise channel: the linear-feedback shift register, envelope, and
+/// length counter. Its timer runs at the CPU clock.
 #[derive(Clone, Copy, Default)]
 struct Noise {
     len: LengthCounter,
+    /// `$400E` bit 7: the periodic-noise tap.
+    mode: bool,
+    period: u16,
+    divider: u16,
+    /// 15 bits of shift register, "loaded with the value 1" at power-up.
+    lfsr: u16,
+    envelope: Envelope,
 }
 
 impl Noise {
+    fn new() -> Noise {
+        Noise {
+            period: NOISE_PERIODS[0],
+            divider: NOISE_PERIODS[0],
+            lfsr: 1,
+            ..Noise::default()
+        }
+    }
+
     fn write_ctrl(&mut self, val: u8) {
         self.len.halt = val & 0x20 != 0;
+        self.envelope.write(val & 0x1F);
+    }
+
+    fn write_period(&mut self, val: u8) {
+        self.mode = val & 0x80 != 0;
+        self.period = NOISE_PERIODS[(val & 0x0F) as usize];
     }
 
     fn write_length(&mut self, val: u8) {
         self.len.write_length(val);
+        // "Writing to this register also restarts the envelope."
+        self.envelope.start = true;
+    }
+
+    /// One shift-register clock: "feedback is the XOR of bit 0 and bit 6 if
+    /// periodic noise mode is set, otherwise bit 1; shift right by one bit;
+    /// bit 14 is set to the feedback."
+    fn step_lfsr(&mut self) {
+        let tap = if self.mode { 6 } else { 1 };
+        let feedback = (self.lfsr & 1) ^ ((self.lfsr >> tap) & 1);
+        self.lfsr = (self.lfsr >> 1) | (feedback << 14);
+    }
+
+    /// One CPU clock: the divider counts the table period down, then clocks
+    /// the shift register.
+    fn tick(&mut self) {
+        if self.divider > 0 {
+            self.divider -= 1;
+        }
+        if self.divider == 0 {
+            self.divider = self.period;
+            self.step_lfsr();
+        }
+    }
+
+    /// The value this channel contributes to the mixer, 0-15.
+    fn output(&self) -> u8 {
+        if self.lfsr & 1 != 0 || self.len.length == 0 {
+            0
+        } else {
+            self.envelope.output()
+        }
     }
 }
 
@@ -504,7 +564,7 @@ impl Apu {
         let mut apu = Apu {
             pulses: [Pulse::new(true), Pulse::new(false)],
             triangle: Triangle::default(),
-            noise: Noise::default(),
+            noise: Noise::new(),
             frame: Frame::new(),
             apu_phase: false,
         };
@@ -533,14 +593,10 @@ impl Apu {
         for p in &mut self.pulses {
             p.len.enabled = true;
         }
-        self.triangle.len = LengthCounter {
-            enabled: true,
-            ..LengthCounter::default()
-        };
-        self.noise.len = LengthCounter {
-            enabled: true,
-            ..LengthCounter::default()
-        };
+        self.triangle = Triangle::default();
+        self.triangle.len.enabled = true;
+        self.noise = Noise::new();
+        self.noise.len.enabled = true;
     }
 
     /// Sample rate for the mixer; the mixer itself arrives with the channels.
@@ -555,8 +611,9 @@ impl Apu {
                 p.tick();
             }
         }
-        // ...except the triangle's, which runs at the CPU rate.
+        // ...except the triangle's and the noise's, which run at the CPU rate.
         self.triangle.tick();
+        self.noise.tick();
 
         let clocks = self.frame.tick();
         if clocks.quarter {
@@ -564,7 +621,7 @@ impl Apu {
                 p.envelope.clock();
             }
             self.triangle.clock_linear();
-            // The noise envelope clocks with its channel.
+            self.noise.envelope.clock();
         }
         if clocks.half {
             // Sweep first, then the length counters (the wiki's half-frame
@@ -624,6 +681,7 @@ impl Apu {
             0x400A => self.triangle.write_timer_low(val),
             0x400B => self.triangle.write_length(val),
             0x400C => self.noise.write_ctrl(val),
+            0x400E => self.noise.write_period(val),
             0x400F => self.noise.write_length(val),
             0x4015 => self.write_status(val),
             0x4017 => self.frame.write(val),
@@ -1025,5 +1083,105 @@ mod tests {
         assert_eq!(t.linear, 4, "...then it counts down");
         t.clock_linear();
         assert_eq!(t.linear, 3);
+    }
+
+    /// The 15-bit LFSR: feedback is bit 0 XOR bit 1, shifted right with the
+    /// feedback landing in bit 14; the sequence is 32767 steps and never
+    /// reaches zero (NESdev "APU Noise", "Operation").
+    #[test]
+    fn the_lfsr_sequence_follows_the_15_bit_taps() {
+        let mut n = Noise::new();
+        n.lfsr = 0x7FFF; // all ones: 1 XOR 1 = 0
+        n.step_lfsr();
+        assert_eq!(n.lfsr, 0x3FFF, "bits 0 and 1 both set: feedback zero");
+
+        n.lfsr = 1; // the power-up seed
+        for _ in 0..32_767 {
+            n.step_lfsr();
+            assert_ne!(n.lfsr, 0, "the all-zero state is unreachable");
+        }
+        assert_eq!(
+            n.lfsr, 1,
+            "the generator returns to its seed after 32767 steps"
+        );
+    }
+
+    /// The periodic mode swaps bit 6 for bit 1 in the feedback: the same seed
+    /// diverges, and the sequence collapses to the wiki's 93 steps.
+    #[test]
+    fn mode_flag_swaps_bit_6_for_bit_1_in_the_feedback() {
+        let seed = 0x41; // bit 0 and bit 6 set, bit 1 clear: the two taps differ
+        let mut m0 = Noise::new();
+        m0.lfsr = seed;
+        m0.step_lfsr();
+        let mut m1 = Noise::new();
+        m1.lfsr = seed;
+        m1.mode = true;
+        m1.step_lfsr();
+        assert_eq!(m0.lfsr, 0x4020, "bit 0 XOR bit 1 = 1");
+        assert_eq!(m1.lfsr, 0x0020, "bit 0 XOR bit 6 = 0");
+
+        m1.lfsr = 1;
+        let mut steps = 0;
+        loop {
+            m1.step_lfsr();
+            steps += 1;
+            assert!(steps <= 93, "periodic noise runs at most 93 steps");
+            if m1.lfsr == 1 {
+                break;
+            }
+        }
+        assert_eq!(steps, 93, "the measured periodic-mode sequence length");
+    }
+
+    /// The NTSC period table, and "the period determines how many CPU cycles
+    /// happen between shift register clocks".
+    #[test]
+    fn the_period_table_matches_the_ntsc_values() {
+        assert_eq!(
+            NOISE_PERIODS,
+            [4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068]
+        );
+
+        let mut apu = Apu::new();
+        apu.cpu_write(0x400E, 0x00); // P = 0: four CPU cycles per step
+        let mut changes = Vec::new();
+        let mut lfsr = apu.noise.lfsr;
+        for tick in 0..400 {
+            apu.tick();
+            if apu.noise.lfsr != lfsr {
+                changes.push(tick);
+                lfsr = apu.noise.lfsr;
+            }
+        }
+        let gaps: Vec<i64> = changes.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.len() > 50, "the register must keep stepping");
+        assert!(
+            gaps.iter().all(|&g| g == 4),
+            "P = 0 is 4 CPU cycles: {gaps:?}"
+        );
+    }
+
+    /// "The mixer receives the current envelope volume except when bit 0 of
+    /// the shift register is set, or the length counter is zero."
+    #[test]
+    fn the_envelope_is_gated_by_bit_0_and_the_length_counter() {
+        let mut apu = Apu::new();
+        apu.cpu_write(0x400C, 0x1F); // constant volume 15
+        apu.noise.len.length = 200;
+        apu.noise.lfsr = 1;
+        assert_eq!(apu.noise.output(), 0, "bit 0 set silences the channel");
+        apu.noise.lfsr = 2;
+        assert_eq!(
+            apu.noise.output(),
+            15,
+            "bit 0 clear lets the envelope through"
+        );
+        apu.noise.len.length = 0;
+        assert_eq!(
+            apu.noise.output(),
+            0,
+            "a zero length counter silences it too"
+        );
     }
 }
