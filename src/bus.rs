@@ -16,17 +16,13 @@
 //!
 //! Two deliberate ceilings:
 //!
-//! * OAM DMA's stall is COUNTED but NOT ENFORCED. `dma_stall` is only ever
-//!   decremented by `tick`; it never becomes extra `ppu.tick()` calls and it
-//!   never stops the CPU. So a DMA makes neither clock skip ahead: the CPU
-//!   and the PPU are both short by the same 513 (or 514) cycles. The 3:1
-//!   dot:cycle ratio and every PPU-versus-CPU-instruction relationship
-//!   therefore survive intact, and the cost is a bounded timing skew of
-//!   513 of 29 780 cycles per frame -- 89342 dots / 3, so ~1.7% -- not a
-//!   desync. SMB's vblank `BIT $2002` poll loop is self-correcting and lands
-//!   within one poll iteration of the dot hardware would stop on. Enforce it
-//!   when a timing-sensitive case shows: Task 7 gates the CPU on
-//!   `dma_stall > 0`.
+//! * OAM DMA's stall is COUNTED here and ENFORCED by the caller: the 256 bytes
+//!   are already in OAM by the time `dma_stall` is set, and the stall never
+//!   becomes extra `ppu.tick()` calls, so the CPU is the only clock held back.
+//!   `main` gates on `dma_busy()` and ticks without stepping until the stall
+//!   drains, which is what puts OAM 513 (or 514) cycles later than the CPU.
+//!   `tick` here only decrements the counter, once every third dot, because
+//!   `BusLike::tick` is one DOT and not one CPU cycle.
 //! * Unmapped and write-only reads return 0 where hardware returns open bus,
 //!   matching the PPU's own choice for `$2002` bits 4-0.
 
