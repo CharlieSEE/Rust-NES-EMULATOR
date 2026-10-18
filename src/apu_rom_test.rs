@@ -60,6 +60,37 @@ impl Machine {
     }
 }
 
+/// SMB leaves `$4017` alone for its first five seconds, so the APU stays in
+/// the mode 0 it powered up in: the frame IRQ flag comes up half a frame in
+/// and *stays* up. That is hardware's power-on state (`$4017 = $00`, interrupt
+/// enabled) and it is harmless while the CPU keeps `I` set, which is what SMB
+/// does -- an interrupt the CPU actually took would move the picture, which is
+/// what the pre-plan baseline comparison in the APU plan's Task 13 checks.
+///
+/// So what this measures is that the flag rises once, from the frame counter
+/// alone, and that nothing in the game's first 60 frames clears or inhibits it.
+#[test]
+fn smb_runs_sixty_frames_with_the_frame_irq_flag_up() {
+    let Some(bytes) = rom_bytes("Super Mario Bros. + Duck Hunt (USA).nes") else {
+        return;
+    };
+    let mut m = Machine::boot(&bytes);
+    let mut up_at = None;
+    for frame in 0..60 {
+        m.frame();
+        if m.bus.apu.irq_pending() {
+            up_at.get_or_insert(frame);
+        } else if let Some(first) = up_at {
+            panic!(
+                "the frame IRQ flag went down again at frame {frame} (up since {first}): \
+                 this cart does not write $4017 this early"
+            );
+        }
+    }
+    let first = up_at.expect("the mode 0 flag never came up");
+    assert!(first <= 1, "the mode 0 flag came up only at frame {first}");
+}
+
 /// blargg's audible result code: he beeps the code, so a passing 2005 ROM
 /// (code 1) beeps exactly once.
 fn beep_count(samples: &[i16]) -> usize {
