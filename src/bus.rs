@@ -40,6 +40,9 @@ const DMA_STALL_ODD: u16 = DMA_STALL + 1;
 pub struct Bus {
     pub cart: Cartridge,
     pub cpu_ram: [u8; 2048],
+    /// The 8 KiB the cartridge may populate at `$6000-$7FFF`. Both NROM test
+    /// images carry it; the SMB board does not.
+    prg_ram: [u8; 8192],
     pub ppu: Ppu,
     pub controllers: [Controller; 2],
     /// CPU cycles the bus has been ticked for. Only its parity is load-bearing:
@@ -60,6 +63,7 @@ impl Bus {
         let mut bus = Bus {
             cart,
             cpu_ram: [0; 2048],
+            prg_ram: [0; 8192],
             ppu: Ppu::new(),
             controllers: [Controller::new(), Controller::new()],
             cycles: 0,
@@ -81,8 +85,19 @@ impl Bus {
     /// init code fills everything it reads, so zeroing it is enough; the cycle
     /// count restarts at an even cycle, which is the alignment `$4014` counts
     /// from.
-    pub fn reset(&mut self) {
+    pub fn power_on(&mut self) {
         self.cpu_ram = [0; 2048];
+        self.prg_ram = [0; 8192];
+        self.cycles = 0;
+        self.dot = 0;
+        self.dma_stall = 0;
+    }
+
+    /// The RESET button: both RAMs keep their contents -- hardware does not
+    /// clear RAM on reset, and apu_reset's `4015_cleared` ROM measures exactly
+    /// that a `$4015` write survives one -- while the cycle count restarts at
+    /// an even cycle like power-on's.
+    pub fn reset(&mut self) {
         self.cycles = 0;
         self.dot = 0;
         self.dma_stall = 0;
@@ -99,6 +114,10 @@ impl Bus {
             0x4015 => 0, // APU status: no APU, so no channels and no frame IRQ
             0x4016 => self.controllers[0].read(),
             0x4017 => self.controllers[1].read(),
+            // The cartridge may populate this window with PRG RAM. Both NROM
+            // test images do -- blargg's ROMs report their results here -- and
+            // mapper 66 maps nothing below `$8000`, so for SMB it is open bus.
+            0x6000..=0x7FFF if self.cart.has_prg_ram() => self.prg_ram[addr as usize - 0x6000],
             // Mapper 66 maps nothing below $8000: no PRG RAM, no registers, so
             // `$4020-$7FFF` is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
@@ -122,6 +141,9 @@ impl Bus {
             }
             // `$4010-$4013`, `$4015` and `$4017` are the APU, and there is no
             // APU; `$4020-$7FFF` is mapper 66's unmapped window. Both drop.
+            0x6000..=0x7FFF if self.cart.has_prg_ram() => {
+                self.prg_ram[addr as usize - 0x6000] = val;
+            }
             0x8000..=0xFFFF => {
                 self.cart.cpu_write(addr, val);
                 // The CHR bank is bits 1-0 of the same register the PRG bank is,
@@ -396,6 +418,37 @@ mod tests {
         assert_eq!(b.cpu_read(0x0000), 0x3C, "written at $1800, read at $0000");
     }
 
+    /// NROM carries 8 KiB of PRG RAM at `$6000-$7FFF` -- the window blargg's
+    /// ROMs report their results through. The SMB board does not populate it
+    /// and the game never reads it, so there the window stays open bus.
+    #[test]
+    fn prg_ram_at_6000_round_trips_on_mapper_0_and_stays_open_bus_on_mapper_66() {
+        let mut b = Bus::new(nrom_cart_no_chr());
+        b.cpu_write(0x6000, 0x5A);
+        assert_eq!(b.cpu_read(0x7FFF), 0, "unwritten bytes stay 0");
+        assert_eq!(b.cpu_read(0x6000), 0x5A);
+        let mut smb = Bus::new(blank_cart()); // mapper 66, synthesized
+        smb.cpu_write(0x6000, 0x5A);
+        assert_eq!(smb.cpu_read(0x6000), 0, "mapper 66 has no PRG RAM here");
+    }
+
+    /// A warm reset (the RESET button) keeps RAM; a power cycle clears it.
+    /// The apu_reset suite's `4015_cleared` ROM measures exactly this: it
+    /// clears `$4015`, presses reset, and requires the clearing to have
+    /// survived.
+    #[test]
+    fn a_warm_reset_keeps_ram_and_a_power_on_clears_it() {
+        let mut b = Bus::new(nrom_cart_no_chr());
+        b.cpu_write(0x6000, 0x42);
+        b.cpu_write(0x0000, 0x42);
+        b.reset();
+        assert_eq!(b.cpu_read(0x6000), 0x42, "reset keeps PRG RAM");
+        assert_eq!(b.cpu_read(0x0000), 0x42, "reset keeps CPU RAM");
+        b.power_on();
+        assert_eq!(b.cpu_read(0x6000), 0, "power-on clears PRG RAM");
+        assert_eq!(b.cpu_read(0x0000), 0, "power-on clears CPU RAM");
+    }
+
     /// Mapper 66 banks by bus conflict, so a matching write to `$8000-$BFFF`
     /// must reach the cartridge from the bus. The synthetic image fills each
     /// 32 KiB bank with its own index and patches bank 0's `$8000` to `$11`, so
@@ -633,11 +686,11 @@ mod tests {
     }
 
     #[test]
-    fn reset_clears_ram_and_any_dma_stall() {
+    fn power_on_clears_ram_and_any_dma_stall() {
         let mut b = Bus::new(blank_cart());
         b.cpu_write(0x0000, 0x42);
         b.write_dma_from(0x0200);
-        b.reset();
+        b.power_on();
         assert_eq!(b.cpu_read(0x0000), 0);
         assert_eq!(b.dma_cycles_remaining(), 0);
     }

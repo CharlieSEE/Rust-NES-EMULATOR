@@ -291,7 +291,7 @@ fn main() -> Result<(), String> {
     let bytes = ::std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut bus = Bus::new(Cartridge::load(&bytes)?);
     let mut cpu = Cpu::new();
-    bus.reset();
+    bus.power_on();
     cpu.reset(&mut bus);
 
     let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
