@@ -37,6 +37,13 @@ const NOISE_PERIODS: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
 ];
 
+/// The NTSC CPU clock, the mixer's time base.
+const CPU_HZ: u32 = 1_789_773;
+
+/// Half a second of stereo samples at 48 kHz. When the queue is full the
+/// newest pair is dropped, which keeps memory bounded if no player drains it.
+const SAMPLE_QUEUE_CAP: usize = 96_000;
+
 /// CPU cycles after power-on or reset before the implied `$4017 = $00` write
 /// takes effect: blargg measured "as if $00 were written to $4017, then a 9-12
 /// clock delay, then execution" (`apu_reset`). Provisional; `09.reset_timing`
@@ -557,6 +564,12 @@ pub struct Apu {
     frame: Frame,
     /// The APU clock: channels' timers advance on every other CPU cycle.
     apu_phase: bool,
+    /// The configured output rate in Hz.
+    rate: u32,
+    /// CPU cycles carried over since the last emitted sample.
+    acc: u32,
+    /// Interleaved stereo, `i16`; drained by `take_samples`.
+    samples: Vec<i16>,
 }
 
 impl Apu {
@@ -567,6 +580,9 @@ impl Apu {
             noise: Noise::new(),
             frame: Frame::new(),
             apu_phase: false,
+            rate: 48_000,
+            acc: 0,
+            samples: Vec::new(),
         };
         apu.power_on();
         apu
@@ -599,8 +615,10 @@ impl Apu {
         self.noise.len.enabled = true;
     }
 
-    /// Sample rate for the mixer; the mixer itself arrives with the channels.
-    pub fn set_sample_rate(&mut self, _hz: u32) {}
+    /// Sample rate for the mixer.
+    pub fn set_sample_rate(&mut self, hz: u32) {
+        self.rate = hz;
+    }
 
     /// One CPU cycle.
     pub fn tick(&mut self) {
@@ -640,6 +658,42 @@ impl Apu {
         }
         self.triangle.len.tick();
         self.noise.len.tick();
+
+        self.acc += self.rate;
+        while self.acc >= CPU_HZ {
+            self.acc -= CPU_HZ;
+            self.emit();
+        }
+    }
+
+    /// The nonlinear mixer, straight from NESdev "APU Mixer" with the DMC
+    /// term removed. Both terms are non-negative, so the result is too.
+    fn mix(&self) -> i16 {
+        let p = self.pulses[0].output() as u16 + self.pulses[1].output() as u16;
+        let pulse_out = if p == 0 {
+            0.0
+        } else {
+            95.88 / (8128.0 / p as f64 + 100.0)
+        };
+        let t = self.triangle.output();
+        let n = self.noise.output();
+        let tnd_out = if t == 0 && n == 0 {
+            0.0
+        } else {
+            159.79 / (1.0 / (t as f64 / 8227.0 + n as f64 / 12_241.0) + 100.0)
+        };
+        ((pulse_out + tnd_out) * 32_767.0).clamp(0.0, 32_767.0) as i16
+    }
+
+    fn emit(&mut self) {
+        // ponytail: fixed cap, drop newest; per-device backpressure if a
+        // player ever re-introduces latency.
+        if self.samples.len() >= SAMPLE_QUEUE_CAP {
+            return;
+        }
+        let s = self.mix();
+        self.samples.push(s); // left
+        self.samples.push(s); // mono fanned out to stereo
     }
 
     pub fn cpu_read(&mut self, addr: u16) -> u8 {
@@ -713,7 +767,7 @@ impl Apu {
     }
 
     pub fn take_samples(&mut self) -> Vec<i16> {
-        Vec::new()
+        std::mem::take(&mut self.samples)
     }
 }
 
@@ -1183,5 +1237,106 @@ mod tests {
             0,
             "a zero length counter silences it too"
         );
+    }
+
+    /// No channels enabled: the queue still fills at the configured rate, and
+    /// every value is exactly zero.
+    #[test]
+    fn silence_in_is_silence_out() {
+        let mut apu = Apu::new();
+        for _ in 0..179_000 {
+            apu.tick();
+        }
+        let s = apu.take_samples();
+        assert!(!s.is_empty(), "48000 Hz must still emit samples when idle");
+        assert!(
+            s.iter().all(|&v| v == 0),
+            "no channels enabled -> exactly 0"
+        );
+    }
+
+    /// One emulated second of CPU ticks is exactly 48000 stereo frames.
+    #[test]
+    fn the_sample_rate_accumulator_emits_the_requested_rate() {
+        let mut apu = Apu::new();
+        for _ in 0..1_789_773 {
+            apu.tick();
+        }
+        assert_eq!(
+            apu.take_samples().len(),
+            96_000,
+            "48000 frames, two i16 each"
+        );
+
+        let mut apu = Apu::new();
+        apu.set_sample_rate(1_000);
+        for _ in 0..1_789_773 {
+            apu.tick();
+        }
+        assert_eq!(apu.take_samples().len(), 2_000, "the configured rate wins");
+    }
+
+    /// The mixer's output matches the wiki's formula at full scale, never
+    /// escapes i16, and the queue never grows past its cap.
+    #[test]
+    fn the_output_never_clips_past_i16_range_and_never_overflows_capacity() {
+        // Arrange every channel at full scale *without ticking*: the exact
+        // value is only observable before the sequencers start moving.
+        let mut apu = Apu::new();
+        for (ctrl, timer) in [(0x4000u16, 0x4002u16), (0x4004, 0x4006)] {
+            apu.cpu_write(ctrl, 0x1F); // duty 0, constant volume 15
+            apu.cpu_write(timer, 0x08); // t = 8: audible
+        }
+        apu.pulses[0].len.length = 200;
+        apu.pulses[1].len.length = 200;
+        apu.pulses[0].duty_bit = true;
+        apu.pulses[1].duty_bit = true;
+        apu.cpu_write(0x400C, 0x1F); // noise: constant volume 15
+        apu.noise.len.length = 200;
+        apu.noise.lfsr = 2; // bit 0 clear: the envelope passes
+        apu.triangle.len.length = 200;
+        apu.triangle.linear = 200;
+        apu.triangle.value = 15;
+
+        let pulse_out = 95.88 / (8128.0 / 30.0 + 100.0); // both pulses at 15
+        let tnd_out = 159.79 / (1.0 / (15.0 / 8227.0 + 15.0 / 12_241.0) + 100.0);
+        let expected = ((pulse_out + tnd_out) * 32_767.0) as i16;
+        assert_eq!(
+            apu.mix(),
+            expected,
+            "pulses at 30, triangle and noise at 15"
+        );
+        assert!(apu.mix() > 15_000, "fully open channels must be loud");
+
+        // Over a moving mix the values stay in range and stay loud.
+        let mut apu = Apu::new();
+        for (ctrl, timer) in [(0x4000u16, 0x4002u16), (0x4004, 0x4006)] {
+            apu.cpu_write(ctrl, 0xFF); // duty 3, held, constant volume 15
+            apu.cpu_write(timer, 0x08);
+        }
+        apu.cpu_write(0x400C, 0x3F); // noise: held, constant volume 15
+        apu.pulses[0].len.length = 200;
+        apu.pulses[1].len.length = 200;
+        apu.noise.len.length = 200;
+        apu.triangle.len.length = 200;
+        apu.triangle.linear = 200;
+        let mut max = 0i16;
+        for _ in 0..200_000 {
+            apu.tick();
+            for v in apu.take_samples() {
+                assert!(v >= 0, "every mixer term is non-negative");
+                max = max.max(v);
+            }
+        }
+        assert!(max > 15_000, "full-volume channels must be loud");
+
+        // The queue is capped: at one pair per CPU tick it overruns, and the
+        // newest samples are dropped instead of growing without bound.
+        let mut apu = Apu::new();
+        apu.set_sample_rate(1_789_773);
+        for _ in 0..100_000 {
+            apu.tick();
+        }
+        assert_eq!(apu.take_samples().len(), SAMPLE_QUEUE_CAP);
     }
 }
