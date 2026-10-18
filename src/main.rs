@@ -1,6 +1,7 @@
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
 
+mod apu;
 mod bus;
 mod controller;
 mod cpu;
