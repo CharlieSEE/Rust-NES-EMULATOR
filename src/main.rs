@@ -325,6 +325,11 @@ fn main() -> Result<(), String> {
         .window("NES", (W as u32) * SCALE, (H as u32) * SCALE)
         .position_centered()
         .allow_highdpi()
+        // Resizable is what gives the window manager a maximize button to grey
+        // out otherwise. The canvas keeps the 256x240 logical size, so SDL
+        // scales the frame into whatever window the WM makes and letterboxes
+        // the rest.
+        .resizable()
         .build()
         .map_err(|e| e.to_string())?;
     let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
