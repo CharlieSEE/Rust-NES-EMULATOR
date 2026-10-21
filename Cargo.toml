@@ -5,6 +5,13 @@ edition = "2021"
 
 [dependencies]
 sdl2 = "0.38.0"
+# A folder picker is the one thing SDL2 does not offer. The gtk3 feature keeps
+# rfd on the sync API and off the async portal stack; GTK3 is already what the
+# desktop itself links.
+rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
+# The launcher draws its own text. An 8x8 bitmap font keeps that to one tiny
+# dependency instead of SDL2_ttf plus a font file to find at runtime.
+font8x8 = "0.3"
 
 [profile.release]
 opt-level = 3

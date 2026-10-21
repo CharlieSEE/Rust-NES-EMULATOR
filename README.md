@@ -3,16 +3,18 @@
 A from-scratch NES emulator. It boots a real cartridge image and plays
 **Super Mario Bros.** with picture, sound, and keyboard controls.
 
-One binary, no configuration file, no frontend.
+One binary, no configuration file. Run it with no arguments for a small ROM
+launcher, or point it straight at a `.nes` file.
 
 ## Requirements
 
 - Rust (stable, via [rustup](https://rustup.rs))
 - SDL2 development libraries
+- GTK3 development libraries (for the launcher's folder picker)
 
 ```sh
 # Debian / Ubuntu
-sudo apt install libsdl2-dev
+sudo apt install libsdl2-dev libgtk-3-dev
 ```
 
 Build with:
@@ -38,6 +40,21 @@ Or run the built binary directly:
 Quote paths that contain spaces. The window is resizable; the frame scales to
 fit it. Audio goes to the default output device, and a machine with no audio
 device runs silently instead of failing to start.
+
+### Launcher
+
+Run the binary with no arguments:
+
+```sh
+./target/release/nes
+```
+
+The launcher lists the `.nes` files in the folder holding the binary. Arrow
+keys move, `Enter` or a click starts the selected game, `O` opens a folder
+picker, and `Esc` quits. Quitting a game returns to the list.
+
+Starting the binary from a desktop icon works the same way. Naming a ROM on the
+command line still skips the launcher.
 
 Bring your own legally dumped ROM. ROM files are not included in this
 repository.
