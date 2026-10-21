@@ -3,8 +3,9 @@
 A from-scratch NES emulator. It boots a real cartridge image and plays
 **Super Mario Bros.** with picture, sound, and keyboard controls.
 
-One binary, no configuration file. Run it with no arguments for a small ROM
-launcher, or point it straight at a `.nes` file.
+One binary. Run it with no arguments for a small ROM launcher, or point it
+straight at a `.nes` file. The launcher's only setting, its last folder, lives
+in `nes-launcher.conf` beside the binary.
 
 ## Requirements
 

@@ -335,7 +335,7 @@ fn present(canvas: &mut Canvas<Window>, texture: &mut Texture, fb: &[u32]) -> Re
 /// around the scaled frame.
 fn to_logical(canvas: &Canvas<Window>, x: i32, y: i32) -> Option<(usize, usize)> {
     let viewport = canvas.viewport();
-    if !viewport.contains_point((x, y)) {
+    if viewport.width() <= 0 || viewport.height() <= 0 || !viewport.contains_point((x, y)) {
         return None;
     }
     let lx = (x - viewport.x()) as i64 * W as i64 / viewport.width() as i64;
@@ -490,7 +490,7 @@ pub fn run() -> Result<(), String> {
                         list.selected = index;
                         let rom = list.roms[index].clone();
                         launch(&mut canvas, &rom);
-                        list.reset(scan(&dir)?);
+                        refresh(&dir, &mut list);
                         dirty = true;
                     }
                 }
