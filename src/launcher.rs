@@ -102,19 +102,6 @@ fn remember(dir: &Path) {
     }
 }
 
-/// The folder to open with, and its ROMs. A saved folder that cannot be read
-/// falls back to the executable's own folder rather than refusing to start.
-fn start() -> Result<(PathBuf, Vec<PathBuf>), String> {
-    if let Some(saved) = saved_dir() {
-        if let Ok(roms) = scan(&saved) {
-            return Ok((saved, roms));
-        }
-    }
-    let dir = exe_dir()?;
-    let roms = scan(&dir)?;
-    Ok((dir, roms))
-}
-
 /// Keep the selected row inside the visible window with as little movement as
 /// possible: only scroll when the selection leaves it.
 fn keep_visible(selected: usize, scroll: usize, visible: usize, len: usize) -> usize {
@@ -145,28 +132,25 @@ fn row_at(y: usize, top: usize, visible: usize, len: usize, scroll: usize) -> Op
     (index < len).then_some(index)
 }
 
-/// Keep the end of a long name; file names are told apart by their tail more
-/// often than their head.
-fn elide_right(text: &str, max: usize) -> String {
+/// Cut `text` to `max` characters with an ellipsis. `keep_tail` keeps the end,
+/// which is the part of a folder path that says where you are; otherwise the
+/// start is kept, which is how file names are told apart.
+fn elide(text: &str, max: usize, keep_tail: bool) -> String {
     let count = text.chars().count();
     if count <= max {
         return text.to_string();
     }
     let keep = max.saturating_sub(3);
-    let head: String = text.chars().take(keep).collect();
-    format!("{head}...")
-}
-
-/// Keep the end of a long folder path, which is the part that says where you
-/// are.
-fn elide_left(text: &str, max: usize) -> String {
-    let count = text.chars().count();
-    if count <= max {
-        return text.to_string();
+    let kept: String = if keep_tail {
+        text.chars().skip(count - keep).collect()
+    } else {
+        text.chars().take(keep).collect()
+    };
+    if keep_tail {
+        format!("...{kept}")
+    } else {
+        format!("{kept}...")
     }
-    let keep = max.saturating_sub(3);
-    let tail: String = text.chars().skip(count - keep).collect();
-    format!("...{tail}")
 }
 
 /// The list and where it is looking. All movement goes through here so the
@@ -213,10 +197,6 @@ impl List {
     fn end(&mut self, visible: usize) {
         self.selected = self.roms.len().saturating_sub(1);
         self.scroll = keep_visible(self.selected, self.scroll, visible, self.roms.len());
-    }
-
-    fn selected_rom(&self) -> Option<&PathBuf> {
-        self.roms.get(self.selected)
     }
 }
 
@@ -265,7 +245,7 @@ fn render(fb: &mut [u32], dir: &Path, list: &List) {
         fb,
         MARGIN,
         18,
-        &elide_left(&dir.display().to_string(), (W - 2 * MARGIN) / CELL),
+        &elide(&dir.display().to_string(), (W - 2 * MARGIN) / CELL, true),
         DIM,
     );
     let count = match list.roms.len() {
@@ -290,7 +270,7 @@ fn render(fb: &mut [u32], dir: &Path, list: &List) {
             fb,
             MARGIN,
             y,
-            &elide_right(&name, (W - 2 * MARGIN) / CELL),
+            &elide(&name, (W - 2 * MARGIN) / CELL, false),
             FG,
         );
     }
@@ -331,19 +311,15 @@ fn present(canvas: &mut Canvas<Window>, texture: &mut Texture, fb: &[u32]) -> Re
     Ok(())
 }
 
-/// Window pixels to logical pixels, or `None` for the letterbox SDL leaves
-/// around the scaled frame.
-fn to_logical(canvas: &Canvas<Window>, x: i32, y: i32) -> Option<(usize, usize)> {
+/// A click's logical row pixel, or `None` for the letterbox SDL leaves around
+/// the scaled frame.
+fn to_logical_y(canvas: &Canvas<Window>, x: i32, y: i32) -> Option<usize> {
     let viewport = canvas.viewport();
-    if viewport.width() <= 0 || viewport.height() <= 0 || !viewport.contains_point((x, y)) {
+    if !viewport.contains_point((x, y)) {
         return None;
     }
-    let lx = (x - viewport.x()) as i64 * W as i64 / viewport.width() as i64;
     let ly = (y - viewport.y()) as i64 * H as i64 / viewport.height() as i64;
-    Some((
-        lx.clamp(0, W as i64 - 1) as usize,
-        ly.clamp(0, H as i64 - 1) as usize,
-    ))
+    Some(ly.clamp(0, H as i64 - 1) as usize)
 }
 
 /// Re-read a folder, keeping the current list when the read fails. A folder
@@ -380,7 +356,16 @@ fn launch(canvas: &mut Canvas<Window>, rom: &Path) {
 /// Run the launcher until the window is closed. Returns an error only for a
 /// failure that leaves nothing to interact with.
 pub fn run() -> Result<(), String> {
-    let (mut dir, roms) = start()?;
+    let mut dir = exe_dir()?;
+    let mut roms = scan(&dir)?;
+    // A saved folder that cannot be read falls back to the executable's own
+    // folder rather than refusing to start.
+    if let Some(saved) = saved_dir() {
+        if let Ok(found) = scan(&saved) {
+            dir = saved;
+            roms = found;
+        }
+    }
     let mut list = List::new(roms);
 
     let sdl = sdl2::init().map_err(|e| e.to_string())?;
@@ -451,7 +436,7 @@ pub fn run() -> Result<(), String> {
                     dirty = true;
                 }
                 Keycode::Return | Keycode::KpEnter => {
-                    if let Some(rom) = list.selected_rom().cloned() {
+                    if let Some(rom) = list.roms.get(list.selected).cloned() {
                         launch(&mut canvas, &rom);
                         refresh(&dir, &mut list);
                         dirty = true;
@@ -484,7 +469,7 @@ pub fn run() -> Result<(), String> {
                 y,
                 ..
             } => {
-                if let Some((_, ly)) = to_logical(&canvas, x, y) {
+                if let Some(ly) = to_logical_y(&canvas, x, y) {
                     if let Some(index) = row_at(ly, LIST_TOP, visible, list.roms.len(), list.scroll)
                     {
                         list.selected = index;
@@ -518,8 +503,7 @@ pub fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        elide_left, elide_right, is_rom, keep_visible, read_saved, row_at, visible_rows, List,
-        CELL, LIST_TOP,
+        elide, is_rom, keep_visible, read_saved, row_at, visible_rows, List, CELL, LIST_TOP,
     };
     use std::path::{Path, PathBuf};
 
@@ -550,12 +534,12 @@ mod tests {
 
     #[test]
     fn long_names_keep_the_end_that_tells_them_apart() {
-        assert_eq!(elide_right("short.nes", 20), "short.nes");
-        let cut = elide_right("Super Mario Bros. + Duck Hunt (USA).nes", 20);
+        assert_eq!(elide("short.nes", 20, false), "short.nes");
+        let cut = elide("Super Mario Bros. + Duck Hunt (USA).nes", 20, false);
         assert_eq!(cut, "Super Mario Bros....");
         assert_eq!(cut.chars().count(), 20);
         // Paths keep their tail, because the last folder says where you are.
-        let cut = elide_left("/home/charlie/DataSSD/projects/roms/nes", 20);
+        let cut = elide("/home/charlie/DataSSD/projects/roms/nes", 20, true);
         assert_eq!(cut, "...projects/roms/nes");
         assert_eq!(cut.chars().count(), 20);
     }
@@ -632,7 +616,7 @@ mod tests {
         list.home(20);
         list.end(20);
         assert_eq!(list.selected, 0);
-        assert!(list.selected_rom().is_none());
+        assert!(list.roms.get(list.selected).is_none());
         // And scrolling an empty list is the top, not an underflow.
         assert_eq!(keep_visible(0, 5, 20, 0), 0);
     }
