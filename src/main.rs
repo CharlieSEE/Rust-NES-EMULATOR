@@ -7,6 +7,7 @@ mod apu_rom_test;
 mod bus;
 mod controller;
 mod cpu;
+mod launcher;
 mod ppu;
 mod rom;
 
@@ -270,7 +271,12 @@ fn missed_dumps(dump_at: &[u32], frames: u32) -> Vec<u32> {
 
 fn main() -> Result<(), String> {
     let mut args = ::std::env::args().skip(1);
-    let rom_path = args.next().ok_or_else(|| USAGE.to_string())?;
+    // No ROM named is the launcher: a desktop icon and a bare `nes` both land
+    // here, and the launcher starts this same executable with a ROM when one
+    // is picked.
+    let Some(rom_path) = args.next() else {
+        return launcher::run();
+    };
     let mut dump_at: Vec<u32> = Vec::new();
     let mut script = None;
     while let Some(arg) = args.next() {
