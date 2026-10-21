@@ -49,9 +49,11 @@ Run the binary with no arguments:
 ./target/release/nes
 ```
 
-The launcher lists the `.nes` files in the folder holding the binary. Arrow
-keys move, `Enter` or a click starts the selected game, `O` opens a folder
-picker, and `Esc` quits. Quitting a game returns to the list.
+The launcher lists the `.nes` files in the last folder you picked, or in the
+folder holding the binary on first run. That folder is remembered in
+`nes-launcher.conf` next to the binary. Arrow keys move, `Enter` or a click
+starts the selected game, `O` opens a folder picker, and `Esc` quits. Quitting
+a game returns to the list.
 
 Starting the binary from a desktop icon works the same way. Naming a ROM on the
 command line still skips the launcher.

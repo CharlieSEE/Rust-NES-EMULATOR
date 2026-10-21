@@ -62,13 +62,57 @@ fn scan(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// The folder holding this executable. Both a terminal run and a desktop icon
-/// land here, so no config file is needed to say where the ROMs live.
+/// land here.
 fn exe_dir() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
     Ok(exe
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(".")))
+}
+
+/// The launcher's one setting lives beside the executable, the same place the
+/// ROM list defaults to.
+const CONFIG_NAME: &str = "nes-launcher.conf";
+
+fn config_path() -> Result<PathBuf, String> {
+    Ok(exe_dir()?.join(CONFIG_NAME))
+}
+
+/// The folder named by the config file. Whitespace and an empty file mean
+/// nothing was saved. The path is not checked here.
+fn read_saved(text: &str) -> Option<PathBuf> {
+    let path = text.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// A remembered folder that is still there. A folder that was moved or
+/// unmounted is ignored, so the next start falls back instead of failing.
+fn saved_dir() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(config_path().ok()?).ok()?;
+    let saved = read_saved(&text)?;
+    saved.is_dir().then_some(saved)
+}
+
+/// Remember `dir` for the next start. A read-only install directory just means
+/// the setting is not kept; it must not stop the launcher.
+fn remember(dir: &Path) {
+    if let Ok(path) = config_path() {
+        let _ = std::fs::write(path, format!("{}\n", dir.display()));
+    }
+}
+
+/// The folder to open with, and its ROMs. A saved folder that cannot be read
+/// falls back to the executable's own folder rather than refusing to start.
+fn start() -> Result<(PathBuf, Vec<PathBuf>), String> {
+    if let Some(saved) = saved_dir() {
+        if let Ok(roms) = scan(&saved) {
+            return Ok((saved, roms));
+        }
+    }
+    let dir = exe_dir()?;
+    let roms = scan(&dir)?;
+    Ok((dir, roms))
 }
 
 /// Keep the selected row inside the visible window with as little movement as
@@ -336,8 +380,8 @@ fn launch(canvas: &mut Canvas<Window>, rom: &Path) {
 /// Run the launcher until the window is closed. Returns an error only for a
 /// failure that leaves nothing to interact with.
 pub fn run() -> Result<(), String> {
-    let mut dir = exe_dir()?;
-    let mut list = List::new(scan(&dir)?);
+    let (mut dir, roms) = start()?;
+    let mut list = List::new(roms);
 
     let sdl = sdl2::init().map_err(|e| e.to_string())?;
     let video = sdl.video().map_err(|e| e.to_string())?;
@@ -423,6 +467,7 @@ pub fn run() -> Result<(), String> {
                         // rather than replacing them with nothing.
                         match scan(&picked) {
                             Ok(roms) => {
+                                remember(&picked);
                                 dir = picked;
                                 list.reset(roms);
                                 dirty = true;
@@ -473,7 +518,8 @@ pub fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        elide_left, elide_right, is_rom, keep_visible, row_at, visible_rows, List, CELL, LIST_TOP,
+        elide_left, elide_right, is_rom, keep_visible, read_saved, row_at, visible_rows, List,
+        CELL, LIST_TOP,
     };
     use std::path::{Path, PathBuf};
 
@@ -485,6 +531,21 @@ mod tests {
         for name in ["game.smc", "game.nes.bak", "nes", "game.zip", ".nes"] {
             assert!(!is_rom(Path::new(name)), "{name} should not boot");
         }
+    }
+
+    /// The config file is one path and a newline. A file left empty, or with
+    /// only whitespace, must read as "nothing saved" -- otherwise the launcher
+    /// would start in the current directory or fail.
+    #[test]
+    fn the_saved_folder_is_one_trimmed_path_or_nothing() {
+        assert_eq!(read_saved("/roms/nes\n"), Some(PathBuf::from("/roms/nes")));
+        assert_eq!(
+            read_saved("  /roms/nes  \n"),
+            Some(PathBuf::from("/roms/nes")),
+            "spaces around the path are not part of it"
+        );
+        assert_eq!(read_saved(""), None, "empty file: nothing saved");
+        assert_eq!(read_saved("\n\t \n"), None, "whitespace only: nothing");
     }
 
     #[test]
