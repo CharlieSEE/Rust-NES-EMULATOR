@@ -1,5 +1,5 @@
-//! PPU: registers, VRAM, palette RAM, the two banked 8 KiB pages of CHR ROM
-//! this cartridge carries, and the dot-by-dot background and sprite pipelines.
+//! PPU: registers, VRAM, palette RAM, the CHR ROM or CHR RAM pattern space,
+//! and the dot-by-dot background and sprite pipelines.
 //!
 //! References, all fetched 2026-10-16:
 //! - NESdev "PPU registers" -- register bits, the v/t/x/w internal registers,
@@ -129,13 +129,14 @@ fn palette_index(addr: u16) -> usize {
 pub struct Ppu {
     vram: [u8; 2048],
     palette: [u8; 32],
-    /// The cartridge carries 16 KiB of CHR ROM (two 8 KiB banks), and pattern
-    /// memory is PPU-bus memory the PPU fetches from every dot, so the PPU holds
-    /// the banks and `Cartridge` keeps the bytes and the register that swaps them.
+    /// Pattern memory. The cartridge carries up to 16 KiB of CHR ROM (two
+    /// 8 KiB banks), or none at all, in which case this array is CHR RAM.
+    /// Pattern memory is PPU-bus memory the PPU fetches from every dot, so the
+    /// PPU holds it and `Cartridge` keeps the bytes and any bank register.
     chr: [u8; 16384],
     /// Which 8 KiB bank is mapped at `$0000-$1FFF`. Mapper 66's `xxPPxxCC`
     /// register puts it in bits 1-0, and the game flips it mid-frame to show
-    /// both games' logos at once.
+    /// both games' logos at once. Boards with no CHR bank register leave it 0.
     chr_bank: usize,
     /// Whether `$0000-$1FFF` is RAM instead of ROM: true for cartridges that
     /// carry no CHR bytes at all (blargg's 2005 suite), which upload their own
@@ -847,9 +848,9 @@ impl Ppu {
                 } else if addr >= 0x2000 {
                     self.vram[vram_index(addr)] = val;
                 } else if self.chr_ram {
-                    // The game uploads its tiles here through `$2007`. NROM is
-                    // the only board with CHR RAM and it has no bank register,
-                    // so `chr_bank` stays 0 and the address alone indexes.
+                    // The game uploads its tiles here through `$2007`. NROM
+                    // and UxROM have CHR RAM and no CHR bank register, so
+                    // `chr_bank` stays 0 and the address alone indexes.
                     self.chr[addr as usize & 0x1FFF] = val;
                 }
                 // `$0000-$1FFF` is pattern memory. On a cartridge with CHR ROM
@@ -896,8 +897,8 @@ impl Ppu {
     }
 
     /// `$0000-$1FFF` is RAM: the cartridge carries no CHR bytes, so every
-    /// `$2007` write into pattern space lands there. NROM has no bank register
-    /// and `chr_bank` stays 0.
+    /// `$2007` write into pattern space lands there. NROM and UxROM have no
+    /// CHR bank register and `chr_bank` stays 0.
     pub fn use_chr_ram(&mut self) {
         self.chr_ram = true;
     }
