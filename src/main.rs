@@ -8,6 +8,8 @@ mod bus;
 mod controller;
 mod cpu;
 mod launcher;
+#[cfg(test)]
+mod nestest_test;
 mod ppu;
 mod report;
 mod rom;

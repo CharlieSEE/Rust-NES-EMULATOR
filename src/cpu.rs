@@ -184,6 +184,20 @@ impl Cpu {
         self.pc = self.fetch16(bus, 0xFFFC);
     }
 
+    /// The six registers, for the nestest golden-log comparison.
+    #[cfg(test)]
+    pub fn registers(&self) -> (u16, u8, u8, u8, u8, u8) {
+        (self.pc, self.a, self.x, self.y, self.p, self.sp)
+    }
+
+    /// Jump straight into a test ROM's automation entry point.
+    #[cfg(test)]
+    pub fn set_registers_for_test(&mut self, pc: u16, sp: u8, p: u8) {
+        self.pc = pc;
+        self.sp = sp;
+        self.p = p;
+    }
+
     /// Runs one instruction and returns every cycle it consumed, penalties
     /// included, ticking the bus three times per cycle.
     pub fn step<B: BusLike>(&mut self, bus: &mut B) -> u8 {
@@ -487,7 +501,11 @@ impl Cpu {
             Mode::IndX => {
                 let zp = bus.read(self.pc).wrapping_add(self.x);
                 self.pc = self.pc.wrapping_add(1);
-                (self.fetch16(bus, zp as u16), false)
+                // `(zp,X)`: the pointer's high byte wraps inside the zero page.
+                // `$FF` takes it from `$00`, never from `$0100`.
+                let lo = bus.read(zp as u16) as u16;
+                let hi = bus.read(zp.wrapping_add(1) as u16) as u16;
+                ((hi << 8) | lo, false)
             }
             // `(zp),Y`: ONE operand byte. The 16-bit pointer is the word at
             // `$Z` and `$Z+1`, wrapping INSIDE the zero page -- `$FF` takes its
@@ -501,7 +519,15 @@ impl Cpu {
                     bus.read(zp as u16) as u16 | (bus.read(zp.wrapping_add(1) as u16) as u16) << 8;
                 index(ptr, self.y)
             }
-            Mode::Ind => (self.next16(bus), false),
+            // `JMP ($xxFF)` takes its high byte from `$xx00`: the pointer wraps
+            // inside its page, unlike an ordinary 16-bit read.
+            Mode::Ind => {
+                let ptr = self.next16(bus);
+                let lo = bus.read(ptr) as u16;
+                let hi_at = (ptr & 0xFF00) | (ptr as u8).wrapping_add(1) as u16;
+                let hi = bus.read(hi_at) as u16;
+                ((hi << 8) | lo, false)
+            }
         }
     }
 
@@ -634,7 +660,6 @@ impl Cpu {
         self.nz(r);
         r
     }
-
 }
 
 #[cfg(test)]
@@ -778,6 +803,24 @@ mod tests {
         assert_eq!(c.step(&mut bus), 6, "$20FF + $01 crosses a page");
         assert_eq!(c.a, 0x77, "the pointer's high byte came from $0000");
         assert_eq!(c.pc, 0x2002, "two bytes consumed, not three");
+    }
+
+    /// `(zp,X)` also wraps its pointer inside the zero page. The operand is
+    /// `$FE`, X is 1, so the pointer lives at `$FF`/`$00`; `$0100` is bait.
+    #[test]
+    fn indirect_x_pointer_wraps_inside_the_zero_page() {
+        let mut bus = TestBus::new();
+        load(&mut bus, 0x2000, &[0xA1, 0xFE]); // LDA ($FE,X)
+        bus.write(0x00FF, 0x00); // pointer low
+        bus.write(0x0000, 0x30); // pointer high: ($FF)+1 wraps to $00
+        bus.write(0x0100, 0x40); // what a non-wrapping read would use
+        bus.write(0x3000, 0x5D);
+        bus.write(0x4000, 0xEE);
+        let mut c = Cpu::new();
+        c.pc = 0x2000;
+        c.x = 0x01;
+        assert_eq!(c.step(&mut bus), 6);
+        assert_eq!(c.a, 0x5D, "the pointer's high byte came from $0000");
     }
 
     /// The index is the Y register, never a second operand byte: `$2001` here
