@@ -6,8 +6,9 @@
 //! (the PPU gets RAM instead).
 //!
 //! Mapper 1 is MMC1: a five-write serial register controlling PRG mode, CHR
-//! banking, nametable mirroring and PRG RAM enable. Zelda carries CHR RAM and
-//! an 8 KiB battery-backed save, both of which this loader exposes.
+//! banking and nametable mirroring. Zelda carries CHR RAM and an 8 KiB
+//! battery-backed save. Its board is an MMC1A, whose PRG RAM is always
+//! enabled; the enable bit in the PRG register is an MMC1B addition.
 //!
 //! Mapper 2's window is 16 KiB switchable at `$8000-$BFFF` plus the LAST
 //! 16 KiB fixed at `$C000-$FFFF`. The bank register decodes any write in
@@ -86,8 +87,6 @@ pub struct Cartridge {
     /// MMC1 control register. Power-on/reset value is PRG mode 3 (switch at
     /// `$8000`, last bank fixed), 8 KiB CHR mode, vertical mirroring.
     control: u8,
-    /// MMC1 PRG register: low four bits are the bank, bit 4 enables PRG RAM.
-    prg_ram_reg: u8,
     /// MMC1's five-write serial port: bits received so far and how many.
     shift: u8,
     shift_count: u8,
@@ -159,7 +158,6 @@ impl Cartridge {
             bank,
             chr_banks: [0, 1],
             control: 0x0C,
-            prg_ram_reg: 0,
             shift: 0,
             shift_count: 0,
             mirroring,
@@ -173,17 +171,12 @@ impl Cartridge {
         matches!(self.board, Board::Nrom | Board::Mmc1)
     }
 
-    /// Whether a mapper register currently allows the CPU to reach PRG RAM.
-    /// NROM has no register; MMC1 can disable its 8 KiB window.
+    /// Whether the CPU can reach PRG RAM right now. NROM has no register.
+    /// MMC1A -- Zelda's board -- has no working enable bit: its RAM is always
+    /// there. (MMC1B's bit 4 is not modelled, because this loader does not read
+    /// NES 2.0 submappers yet; the compatibility cost is one register bit.)
     pub fn prg_ram_enabled(&self) -> bool {
-        if !self.has_prg_ram() {
-            return false;
-        }
-        match self.board {
-            Board::Nrom => true,
-            Board::Mmc1 => self.prg_ram_reg & 0x10 != 0,
-            Board::GxRom | Board::UxRom => false,
-        }
+        self.has_prg_ram()
     }
 
     /// Whether the cartridge has battery-backed PRG RAM to persist.
@@ -362,7 +355,6 @@ impl Cartridge {
             1 => self.chr_banks[0] = (value & 0x1F) as usize,
             2 => self.chr_banks[1] = (value & 0x1F) as usize,
             _ => {
-                self.prg_ram_reg = value & 0x1F;
                 self.bank = (value & 0x0F) as usize;
             }
         }
@@ -783,12 +775,17 @@ mod tests {
     }
 
     #[test]
-    fn mmc1_prg_ram_is_disabled_until_bit_4_of_the_prg_register() {
+    fn mmc1_prg_ram_is_always_visible_like_the_mmc1a_zelda_carries() {
         let mut c = mmc1_cart(2, 0);
         assert!(c.has_prg_ram(), "MMC1 has the $6000-$7FFF window");
-        assert!(!c.prg_ram_enabled(), "power-on PRG register disables it");
+        assert!(
+            c.prg_ram_enabled(),
+            "MMC1A ignores the PRG register's enable bit"
+        );
+        // The register's low four bits still bank PRG; only bit 4 is inert.
         mmc1_write(&mut c, 0xE000, 0x10);
-        assert!(c.prg_ram_enabled(), "bit 4 enables PRG RAM");
+        assert!(c.prg_ram_enabled(), "bank 0 with bit 4 set");
+        assert_eq!(c.cpu_read(0x8000), 0, "PRG bank 0 at $8000");
     }
 
     #[test]
