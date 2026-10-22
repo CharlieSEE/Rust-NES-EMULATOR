@@ -42,7 +42,7 @@ pub struct Bus {
     pub cart: Cartridge,
     pub cpu_ram: [u8; 2048],
     /// The 8 KiB the cartridge may populate at `$6000-$7FFF`. Both NROM test
-    /// images carry it; the SMB board does not.
+    /// images carry it; the SMB and Contra boards do not.
     prg_ram: [u8; 8192],
     pub ppu: Ppu,
     pub apu: Apu,
@@ -182,10 +182,10 @@ impl Bus {
             0x4017 => self.controllers[1].read(),
             // The cartridge may populate this window with PRG RAM. Both NROM
             // test images do -- blargg's ROMs report their results here -- and
-            // mapper 66 maps nothing below `$8000`, so for SMB it is open bus.
+            // mappers 2 and 66 map nothing below `$8000`, so it is open bus.
             0x6000..=0x7FFF if self.cart.has_prg_ram() => self.prg_ram[addr as usize - 0x6000],
-            // Mapper 66 maps nothing below $8000: no PRG RAM, no registers, so
-            // `$4020-$7FFF` is open bus.
+            // Mappers 2 and 66 map nothing below $8000: no PRG RAM, no
+            // registers, so `$4020-$7FFF` is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
             _ => 0,
         }
@@ -212,14 +212,15 @@ impl Bus {
                     c.write_strobe(val);
                 }
             }
-            // `$4020-$7FFF` is mapper 66's unmapped window and drops.
+            // `$4020-$7FFF` is the mappers' unmapped window and drops.
             0x6000..=0x7FFF if self.cart.has_prg_ram() => {
                 self.prg_ram[addr as usize - 0x6000] = val;
             }
             0x8000..=0xFFFF => {
                 self.cart.cpu_write(addr, val);
-                // The CHR bank is bits 1-0 of the same register the PRG bank is,
-                // so it moves on writes that the PPU cares about too.
+                // On GxROM the CHR bank is bits 1-0 of the same register the
+                // PRG bank is, so it moves on writes the PPU cares about too.
+                // UxROM has no CHR bank register and reports 0.
                 self.ppu.set_chr_bank(self.cart.chr_bank());
             }
             _ => {}
