@@ -341,13 +341,52 @@ struct Game {
     stderr: Option<std::thread::JoinHandle<String>>,
 }
 
-/// Killing on drop ties the game's life to the launcher's: closing the
+/// Ask a running game to quit. SDL installs a SIGTERM handler that turns the
+/// signal into a quit event, so the game leaves its frame loop normally and
+/// flushes the battery save. SIGKILL, which `Child::kill` sends, skips all of
+/// that.
+#[cfg(unix)]
+fn request_stop(child: &Child) {
+    // SAFETY: `kill` only reads the pid and signal number; an already-reaped
+    // pid just returns ESRCH, which the caller's fallback handles.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn request_stop(_: &Child) {}
+
+/// Wait up to `timeout` for the child to exit. Returns whether it did; a child
+/// that already exited is reaped here and still counts.
+fn wait_for_exit(child: &mut Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Stopping on drop ties the game's life to the launcher's: closing the
 /// launcher stops the emulator instead of leaving it running with no window
-/// to return to.
+/// to return to. Give it a grace period to save first, then kill it.
 impl Drop for Game {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // `run` may already have reaped this child. Do not signal a pid that
+        // has exited: the OS could have handed it to an unrelated process.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        request_stop(&self.child);
+        if !wait_for_exit(&mut self.child, std::time::Duration::from_secs(2)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -603,6 +642,27 @@ mod tests {
         elide, is_rom, keep_visible, read_saved, row_at, visible_rows, List, CELL, LIST_TOP,
     };
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_child_exits_within_the_grace_period() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a long-running child");
+        super::request_stop(&child);
+        let stopped = super::wait_for_exit(&mut child, Duration::from_secs(2));
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            stopped,
+            "SIGTERM must end the child, not leave it for SIGKILL"
+        );
+    }
 
     #[test]
     fn only_nes_files_are_roms_whatever_their_case() {

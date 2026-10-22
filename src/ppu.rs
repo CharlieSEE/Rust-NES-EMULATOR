@@ -147,11 +147,11 @@ fn palette_index(addr: u16) -> usize {
 pub struct Ppu {
     vram: [u8; 2048],
     palette: [u8; 32],
-    /// Pattern memory. The cartridge carries up to 16 KiB of CHR ROM (two
-    /// 8 KiB banks), or none at all, in which case this array is CHR RAM.
-    /// Pattern memory is PPU-bus memory the PPU fetches from every dot, so the
-    /// PPU holds it and `Cartridge` keeps the bytes and any bank register.
-    chr: [u8; 16384],
+    /// Pattern memory. The cartridge may carry CHR ROM larger than the PPU's
+    /// 8 KiB address window; the bank map selects which part is visible, so
+    /// this holds the whole image. A cartridge with no CHR bytes gets 8 KiB of
+    /// CHR RAM here.
+    chr: Vec<u8>,
     /// Which 1 KiB CHR bank backs each of the eight 1 KiB slots at
     /// `$0000-$1FFF`. Eight slots rather than one 8 KiB bank lets a mapper
     /// switch 4 KiB (MMC1) or 1 KiB (MMC3) windows without the PPU knowing
@@ -271,7 +271,7 @@ impl Ppu {
         Ppu {
             vram: [0; 2048],
             palette: [0; 32],
-            chr: [0; 16384],
+            chr: vec![0; 16384],
             chr_map: [0, 1, 2, 3, 4, 5, 6, 7],
             mirroring: Mirroring::Vertical,
             chr_ram: false,
@@ -876,7 +876,8 @@ impl Ppu {
                     // The game uploads its tiles here through `$2007`. CHR RAM
                     // goes through the same bank map as CHR ROM, because MMC1
                     // can bank its 8 KiB of pattern RAM too.
-                    self.chr[self.crbank(addr)] = val;
+                    let at = self.crbank(addr);
+                    self.chr[at] = val;
                 }
                 // `$0000-$1FFF` is pattern memory. On a cartridge with CHR ROM
                 // the write goes NOWHERE; on one with none it is the 8 KiB RAM
@@ -909,9 +910,11 @@ impl Ppu {
     }
 
     /// Index into the whole CHR array for a `$0000-$1FFF` pattern address, via
-    /// the 1 KiB slot the mapper currently maps there.
+    /// the 1 KiB slot the mapper currently maps there. The modulo keeps a
+    /// mapper register from reading past the image when it selects a bank the
+    /// cartridge does not carry (or a 16 KiB CHR array from a larger board).
     fn crbank(&self, addr: u16) -> usize {
-        self.chr_map[(addr as usize >> 10) & 7] * 1024 + (addr as usize & 0x03FF)
+        (self.chr_map[(addr as usize >> 10) & 7] * 1024 + (addr as usize & 0x03FF)) % self.chr.len()
     }
 
     /// Map each 1 KiB slot at `$0000-$1FFF` individually. MMC1 maps 4 KiB
@@ -933,13 +936,12 @@ impl Ppu {
         self.chr_ram = true;
     }
 
-    /// The CHR image, which the `Cartridge` parsed out of the file: 16 KiB for
-    /// the SMB board, 8 KiB for apu_reset, nothing at all for a CHR RAM cart.
-    /// The array zero-fills, so a short -- or absent -- image is fine.
+    /// The whole CHR image the `Cartridge` parsed out of the file, banked by
+    /// the mapper. A short -- or absent -- image is zero-filled to at least the
+    /// PPU's 8 KiB pattern window.
     pub fn load_chr_rom(&mut self, data: &[u8]) {
-        self.chr = [0; 16384];
-        let n = data.len().min(self.chr.len());
-        self.chr[..n].copy_from_slice(&data[..n]);
+        self.chr = vec![0; data.len().max(8192)];
+        self.chr[..data.len()].copy_from_slice(data);
     }
 }
 
@@ -970,7 +972,8 @@ impl Ppu {
     /// board, so nothing can reach it through the `$2007` write path and the
     /// tests go through this door instead. No game code ever writes it.
     fn chr_write_for_test(&mut self, addr: u16, val: u8) {
-        self.chr[self.crbank(addr)] = val;
+        let at = self.crbank(addr);
+        self.chr[at] = val;
     }
 
     /// Point nametable tile `(x, y)` at `tile` and give it `palette` through the
@@ -1214,16 +1217,31 @@ mod tests {
         }
     }
 
-    /// apu_reset's images carry 8 KiB of CHR, not 16: the load must zero-fill
-    /// the rest instead of panicking, and CHR RAM carts (no CHR bytes at all)
-    /// must end up with a zeroed pattern space.
+    /// A CHR image larger than the PPU's 8 KiB window is real on MMC1 boards.
+    /// It must be kept in full; selecting a high bank must read that bank, not
+    /// truncate or index past the end of the array.
+    #[test]
+    fn a_large_chr_image_keeps_its_upper_banks_in_bounds() {
+        let mut chr = vec![0u8; 32 * 1024];
+        chr[24 * 1024] = 0x5A;
+        let mut p = Ppu::new();
+        p.load_chr_rom(&chr);
+        p.set_chr_map([24, 25, 26, 27, 28, 29, 30, 31]);
+        assert_eq!(p.crbank(0x0000), 24 * 1024);
+        assert_eq!(p.ppu_bus_read(0x0000), 0x5A);
+        assert_eq!(p.crbank(0x1FFF), 31 * 1024 + 0x03FF);
+    }
+
+    /// apu_reset's images carry 8 KiB of CHR, which is the PPU's whole pattern
+    /// window; a CHR RAM cart (no CHR bytes at all) gets the same 8 KiB zeroed.
     #[test]
     fn an_8k_chr_image_loads_without_panicking() {
         let mut p = Ppu::new();
         p.load_chr_rom(&[0xAA; 8192]); // apu_reset carries 8 KiB, not 16
-        assert_eq!(p.chr[0], 0xAA, "the 8 KiB that exist");
-        assert_eq!(p.chr[8192], 0x00, "the upper bank zero-fills");
+        assert_eq!(p.chr.len(), 8192, "the whole 8 KiB pattern window");
+        assert_eq!(p.chr[0], 0xAA);
         p.load_chr_rom(&[]); // the 2005 suite: no CHR bytes at all
+        assert_eq!(p.chr.len(), 8192, "CHR RAM is 8 KiB");
         assert_eq!(
             p.chr[0], 0x00,
             "an empty image leaves a zeroed pattern space"

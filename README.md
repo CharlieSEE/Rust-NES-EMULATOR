@@ -90,7 +90,7 @@ the cartridge runs but cannot be aimed.
 - **Super Mario Bros.** — playable, with music and sound effects.
 - **Contra** — playable on mapper 2 (UxROM).
 - **The Legend of Zelda** — playable on mapper 1 (MMC1); progress is saved to
-  a `.sav` file beside the ROM.
+  a `.sav` file beside the ROM periodically while playing and on exit.
 - iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)** and
   **mapper 66** (the SMB/Duck Hunt board) are supported. Most other games will
   not boot and will exit with a mapper error.

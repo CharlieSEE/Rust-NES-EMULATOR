@@ -259,6 +259,7 @@ name = "nes"
 version = "0.1.0"
 dependencies = [
  "font8x8",
+ "libc",
  "rfd",
  "sdl2",
 ]

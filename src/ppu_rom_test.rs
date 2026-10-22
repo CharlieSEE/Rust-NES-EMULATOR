@@ -19,9 +19,8 @@ const ROMS: [&str; 3] = ["palette_ram.nes", "sprite_ram.nes", "vram_access.nes"]
 #[test]
 fn blargg_ppu_suites_report_one_beep() {
     for name in ROMS {
-        let Some(bytes) = test_rom(&format!("test_roms/blargg_ppu_tests/{name}")) else {
-            return;
-        };
+        let bytes = test_rom(&format!("test_roms/blargg_ppu_tests/{name}"))
+            .unwrap_or_else(|| panic!("{name} ships with the test suite"));
         let mut bus = Bus::new(Cartridge::load(&bytes).expect("PPU test ROM must load"));
         let mut cpu = Cpu::new();
         bus.power_on();

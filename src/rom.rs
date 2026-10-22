@@ -7,8 +7,9 @@
 //!
 //! Mapper 1 is MMC1: a five-write serial register controlling PRG mode, CHR
 //! banking and nametable mirroring. Zelda carries CHR RAM and an 8 KiB
-//! battery-backed save. Its board is an MMC1A, whose PRG RAM is always
-//! enabled; the enable bit in the PRG register is an MMC1B addition.
+//! battery-backed save. The PRG register's bit 4 disables that RAM on MMC1B;
+//! iNES cannot distinguish the revisions, so mapper 1 honours the bit and
+//! mapper 155's always-enabled MMC1A is left out of scope.
 //!
 //! Mapper 2's window is 16 KiB switchable at `$8000-$BFFF` plus the LAST
 //! 16 KiB fixed at `$C000-$FFFF`. The bank register decodes any write in
@@ -85,11 +86,15 @@ pub struct Cartridge {
     /// separately in 4 KiB mode.
     chr_banks: [usize; 2],
     /// MMC1 control register. Power-on/reset value is PRG mode 3 (switch at
-    /// `$8000`, last bank fixed), 8 KiB CHR mode, vertical mirroring.
+    /// `$8000`, last bank fixed), 8 KiB CHR mode, and one-screen lower
+    /// nametable mirroring (control bits 0-1 are 0).
     control: u8,
     /// MMC1's five-write serial port: bits received so far and how many.
     shift: u8,
     shift_count: u8,
+    /// MMC1B PRG register bit 4: false disables `$6000-$7FFF` until the game
+    /// writes a value with the bit clear. Power-on is enabled.
+    prg_ram_enabled: bool,
     /// How the board wires the four logical nametables onto 2 KiB of VRAM.
     mirroring: Mirroring,
     /// Whether the header marks PRG RAM as battery-backed, so it should be
@@ -144,10 +149,12 @@ impl Cartridge {
             Board::Nrom | Board::Mmc1 | Board::UxRom => 0,
             Board::GxRom => POWER_ON_BANK % (prg_len / BANK).max(1),
         };
-        // MMC1's control register owns mirroring and powers up vertical;
-        // GxROM is hardwired vertical. NROM and UxROM follow the header bit.
+        // MMC1's control register powers up at $0C: PRG mode 3, 8 KiB CHR
+        // mode, and one-screen lower nametable arrangement. GxROM is hardwired
+        // vertical. NROM and UxROM follow the header bit.
         let mirroring = match board {
-            Board::Mmc1 | Board::GxRom => Mirroring::Vertical,
+            Board::Mmc1 => Mirroring::SingleLower,
+            Board::GxRom => Mirroring::Vertical,
             Board::Nrom | Board::UxRom if flags6 & 0x01 != 0 => Mirroring::Vertical,
             Board::Nrom | Board::UxRom => Mirroring::Horizontal,
         };
@@ -160,6 +167,7 @@ impl Cartridge {
             control: 0x0C,
             shift: 0,
             shift_count: 0,
+            prg_ram_enabled: true,
             mirroring,
             battery: flags6 & 0x02 != 0,
         })
@@ -172,11 +180,10 @@ impl Cartridge {
     }
 
     /// Whether the CPU can reach PRG RAM right now. NROM has no register.
-    /// MMC1A -- Zelda's board -- has no working enable bit: its RAM is always
-    /// there. (MMC1B's bit 4 is not modelled, because this loader does not read
-    /// NES 2.0 submappers yet; the compatibility cost is one register bit.)
+    /// MMC1's PRG register bit 4 is MMC1B's disable bit: writes with it set make
+    /// `$6000-$7FFF` open bus until the game clears it again.
     pub fn prg_ram_enabled(&self) -> bool {
-        self.has_prg_ram()
+        self.has_prg_ram() && self.prg_ram_enabled
     }
 
     /// Whether the cartridge has battery-backed PRG RAM to persist.
@@ -293,13 +300,10 @@ impl Cartridge {
             Board::Nrom => {}
             Board::Mmc1 => self.mmc1_write(addr, val),
             Board::GxRom => {
-                // The register decodes `$8000-$BFFF` only. `$C000-$FFFF` is
-                // the upper half of the same window, not a second register,
-                // and reset writes `$FFFD` there for the stack scratch byte;
-                // that byte happens to be the very value written, so a conflict
-                // check spanning the whole `$8000-$FFFF` range would take bits
-                // 5-4 of `$80` mid-reset.
-                if !(0x8000..0xC000).contains(&addr) || val != self.cpu_read(addr) {
+                // The register decodes the whole `$8000-$FFFF` window. Bus
+                // conflicts still decide whether the write lands: the value
+                // must equal the byte the ROM currently drives.
+                if addr < 0x8000 || val != self.cpu_read(addr) {
                     return;
                 }
                 // `saturating_sub`, not `-`: the iNES header can claim more PRG
@@ -356,6 +360,7 @@ impl Cartridge {
             2 => self.chr_banks[1] = (value & 0x1F) as usize,
             _ => {
                 self.bank = (value & 0x0F) as usize;
+                self.prg_ram_enabled = value & 0x10 == 0;
             }
         }
     }
@@ -411,16 +416,6 @@ mod tests {
         }
         bytes.extend(std::iter::repeat_n(0, CHR_BANK * 2));
         bytes[16 + POWER_ON_BANK * BANK + addr - 0x8000] = patch;
-        Cartridge::load(&bytes).expect("synthetic image must load")
-    }
-
-    /// Two 32 KiB PRG banks, filled with `a` and `b`, and two 8 KiB CHR banks.
-    fn two_banks_filled(a: u8, b: u8) -> Cartridge {
-        let mut bytes = ines_header(4, 2, 66).to_vec();
-        for fill in [a, b] {
-            bytes.extend(std::iter::repeat_n(fill, BANK));
-        }
-        bytes.extend(std::iter::repeat_n(0, CHR_BANK * 2));
         Cartridge::load(&bytes).expect("synthetic image must load")
     }
 
@@ -490,16 +485,16 @@ mod tests {
         assert_eq!(c.cpu_read(0xC001), 1, "...and it took $C000 with it");
     }
 
-    /// The conflict check must stop at `$BFFF`. Bank 1's own reset stub writes
-    /// `$FFFD` with `$80`, which is the byte the ROM holds there, so a check
-    /// spanning `$8000-$FFFF` would bank-switch mid-reset on the second bank.
+    /// GxROM's register decodes the whole `$8000-$FFFF` window, not just the
+    /// lower half. A matching write in the upper half therefore moves the same
+    /// 32 KiB bank the lower half is reading.
     #[test]
-    fn a_matching_write_to_the_upper_half_never_moves_the_bank() {
-        let mut c = two_banks_filled(0xAA, 0xBB);
-        c.cpu_write(0x8000, 0xAA); // matches -> bank 0
-        let before = c.cpu_read(0xC000);
-        c.cpu_write(0xFFFD, c.cpu_read(0xFFFD));
-        assert_eq!(c.cpu_read(0xC000), before);
+    fn a_matching_write_to_the_upper_half_moves_the_bank() {
+        let mut c = banks_filled_with_their_own_index(0xFFFD, 0x11);
+        assert_eq!(c.cpu_read(0xC001), 0, "power-on bank 0 covers $C000");
+        c.cpu_write(0xFFFD, 0x11); // matches -> bits 5-4 = 0b01 -> bank 1
+        assert_eq!(c.cpu_read(0x8001), 1, "the whole window moved");
+        assert_eq!(c.cpu_read(0xC001), 1);
     }
 
     #[test]
@@ -775,17 +770,24 @@ mod tests {
     }
 
     #[test]
-    fn mmc1_prg_ram_is_always_visible_like_the_mmc1a_zelda_carries() {
-        let mut c = mmc1_cart(2, 0);
-        assert!(c.has_prg_ram(), "MMC1 has the $6000-$7FFF window");
-        assert!(
-            c.prg_ram_enabled(),
-            "MMC1A ignores the PRG register's enable bit"
+    fn mmc1_powers_up_in_one_screen_lower_mirroring() {
+        let c = mmc1_cart(2, 0);
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::SingleLower,
+            "control $0C has nametable bits 0-1 clear"
         );
-        // The register's low four bits still bank PRG; only bit 4 is inert.
+    }
+
+    #[test]
+    fn mmc1_prg_ram_bit_four_disables_the_six_thousand_window() {
+        let mut c = mmc1_cart(2, 0);
+        assert!(c.prg_ram_enabled(), "power-on PRG RAM is enabled");
         mmc1_write(&mut c, 0xE000, 0x10);
-        assert!(c.prg_ram_enabled(), "bank 0 with bit 4 set");
-        assert_eq!(c.cpu_read(0x8000), 0, "PRG bank 0 at $8000");
+        assert!(!c.prg_ram_enabled(), "MMC1B bit 4 disables PRG RAM");
+        assert_eq!(c.cpu_read(0x8000), 0, "and the PRG bank is still bank 0");
+        mmc1_write(&mut c, 0xE000, 0x01);
+        assert!(c.prg_ram_enabled(), "clearing bit 4 enables it again");
     }
 
     #[test]
@@ -797,6 +799,10 @@ mod tests {
         assert!(matches!(c.board, Board::Mmc1), "mapper 1 is MMC1");
         assert!(c.has_battery(), "Zelda saves to battery-backed PRG RAM");
         assert!(c.chr_is_ram(), "Zelda uploads its own tiles");
-        assert_eq!(c.mirroring(), Mirroring::Vertical, "MMC1 power-on wiring");
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::SingleLower,
+            "MMC1 powers up with control $0C"
+        );
     }
 }

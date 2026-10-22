@@ -67,7 +67,6 @@ enum Mode {
     Abs,
     AbsX,
     AbsY,
-    Ind,
     IndX,
     IndY,
     Rel,
@@ -113,7 +112,7 @@ const MODE: [Mode; 256] = [
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 30
     M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 40
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 50
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Ind,  M::Abs,  M::Abs,  M::Imp, // 60
+    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Imp, // 60
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 70
     M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 80
     M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp, // 90
@@ -518,15 +517,6 @@ impl Cpu {
                 let ptr =
                     bus.read(zp as u16) as u16 | (bus.read(zp.wrapping_add(1) as u16) as u16) << 8;
                 index(ptr, self.y)
-            }
-            // `JMP ($xxFF)` takes its high byte from `$xx00`: the pointer wraps
-            // inside its page, unlike an ordinary 16-bit read.
-            Mode::Ind => {
-                let ptr = self.next16(bus);
-                let lo = bus.read(ptr) as u16;
-                let hi_at = (ptr & 0xFF00) | (ptr as u8).wrapping_add(1) as u16;
-                let hi = bus.read(hi_at) as u16;
-                ((hi << 8) | lo, false)
             }
         }
     }

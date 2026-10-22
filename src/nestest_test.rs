@@ -100,7 +100,9 @@ fn nestest_matches_the_golden_log_from_c000_to_the_end() {
     // The first log line is the state before `$C000` runs, with reset's seven
     // cycles already on the hardware clock.
     let mut cycles = 7u64;
+    let mut checked = 0usize;
     for (number, line) in log.lines().enumerate() {
+        checked += 1;
         let want =
             parse(line).unwrap_or_else(|| panic!("line {}: cannot parse {line:?}", number + 1));
         let (pc, a, x, y, p, sp) = cpu.registers();
@@ -122,4 +124,11 @@ fn nestest_matches_the_golden_log_from_c000_to_the_end() {
         }
         cycles += cpu.step(&mut bus) as u64;
     }
+    // The shipped log has 5003 documented lines before the first illegal one.
+    // An empty or truncated file must fail instead of finishing the loop with
+    // nothing checked, which is exactly what a vacuous pass looked like.
+    assert!(
+        checked >= 5_000,
+        "only {checked} lines were checked; nestest.log is incomplete"
+    );
 }

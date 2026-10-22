@@ -134,9 +134,8 @@ impl Bus {
     /// The RESET button: both RAMs keep their contents -- hardware does not
     /// clear RAM on reset, and apu_reset's `4015_cleared` ROM measures exactly
     /// that a `$4015` write survives one -- while the cycle count restarts at
-    /// an even cycle like power-on's. The player does not expose a reset key
-    /// yet; the `apu_reset` harness is what drives it.
-    #[allow(dead_code)]
+    /// an even cycle like power-on's. The player's `R` key and the `apu_reset`
+    /// harness both drive it.
     pub fn reset(&mut self) {
         self.clear_clock();
         self.apu.reset();

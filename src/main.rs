@@ -32,6 +32,12 @@ const SCALE: u32 = 3;
 /// the wall-clock half of the period.
 const FRAME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_micros(16_667);
 
+/// How often a battery-backed cartridge's 8 KiB of PRG RAM is flushed to disk
+/// while the game runs. The process can be killed (the launcher's old drop path
+/// did exactly that), so waiting for a clean exit loses every save made since
+/// boot. Five seconds bounds that loss without making the disk the bottleneck.
+const SAVE_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_secs(5);
+
 /// Bytes one stereo frame of the mixer's `i16` output occupies.
 const AUDIO_FRAME_BYTES: u32 = 4;
 
@@ -409,17 +415,30 @@ fn run() -> Result<(), String> {
     cpu.reset(&mut bus);
 
     // Battery-backed PRG RAM (MMC1's Zelda save) lives next to the ROM. A
-    // missing or short file leaves the RAM zeroed; it is written back on a
-    // clean exit.
+    // missing file starts zeroed; any other read failure is reported rather
+    // than silently treated as a blank save and overwritten later.
     let save_path = bus
         .cart
         .has_battery()
         .then(|| ::std::path::Path::new(&rom_path).with_extension("sav"));
     if let Some(path) = &save_path {
-        if let Ok(saved) = ::std::fs::read(path) {
-            bus.load_prg_ram(&saved);
+        match ::std::fs::read(path) {
+            Ok(saved) => {
+                if saved.len() != bus.prg_ram().len() {
+                    report::log_error(&format!(
+                        "{}: save is {} bytes, expected {}; loading what is there",
+                        path.display(),
+                        saved.len(),
+                        bus.prg_ram().len()
+                    ));
+                }
+                bus.load_prg_ram(&saved);
+            }
+            Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => {}
+            Err(e) => report::log_error(&format!("cannot read {}: {e}", path.display())),
         }
     }
+    let mut last_save = ::std::time::Instant::now();
 
     if let Some(queue) = &audio {
         // The queue is opened with no allowed changes, so a device that cannot
@@ -577,6 +596,14 @@ fn run() -> Result<(), String> {
             // is never copied.
             bus.ppu.take_frame();
             frames += 1;
+            if let Some(path) = &save_path {
+                if last_save.elapsed() >= SAVE_INTERVAL {
+                    if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+                        report::log_error(&e);
+                    }
+                    last_save = ::std::time::Instant::now();
+                }
+            }
             if let Some(n) = dump_at.iter().find(|&&n| n == frames) {
                 write_ppm(&format!("frame-{n}.ppm"), bus.ppu.framebuffer())?;
             }
@@ -615,8 +642,8 @@ fn run() -> Result<(), String> {
     // A battery save is only useful if the process gets to exit normally, so
     // write it before the dump report can return an error.
     if let Some(path) = &save_path {
-        if let Err(e) = ::std::fs::write(path, bus.prg_ram()) {
-            report::log_error(&format!("cannot write {}: {e}", path.display()));
+        if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+            report::log_error(&e);
         }
     }
     // The run stopped early -- the script ran out, or the user quit -- so any
@@ -630,6 +657,21 @@ fn run() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Flush battery-backed PRG RAM without ever leaving a half-written `.sav` in
+/// place. The bytes go to a sibling temp file, are synced, and only then replace
+/// the save by rename; a crash or a kill during the write leaves the previous
+/// save intact.
+fn write_battery_save(path: &::std::path::Path, ram: &[u8]) -> Result<(), String> {
+    let temp = path.with_extension("sav.tmp");
+    let write = (|| {
+        let mut file = ::std::fs::File::create(&temp)?;
+        ::std::io::Write::write_all(&mut file, ram)?;
+        file.sync_all()?;
+        ::std::fs::rename(&temp, path)
+    })();
+    write.map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// One framebuffer pixel is `0x00RRGGBB` (see `Ppu::colour`), and binary PPM
@@ -651,12 +693,30 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         apply_event, audio_sleep, button_for, dump_list_ends_run, frame_sleep, mask_for_name,
-        missed_dumps, parse_script, Play, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
-        FRAME_BUDGET,
+        missed_dumps, parse_script, write_battery_save, Play, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        AUDIO_TARGET, FRAME_BUDGET,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::Keycode;
     use std::time::Duration;
+
+    #[test]
+    fn a_battery_save_replaces_the_old_file_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("nes-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("game.sav");
+        std::fs::write(&path, b"old save").expect("seed save");
+
+        let ram = [0x5Au8; 8192];
+        write_battery_save(&path, &ram).expect("save must be written");
+
+        assert_eq!(std::fs::read(&path).unwrap(), ram, "the new save landed");
+        assert!(
+            !path.with_extension("sav.tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn a_script_is_a_list_of_mask_and_frame_pairs() {
