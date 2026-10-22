@@ -18,10 +18,11 @@
 //!   pattern fetch & render" for the 8x16 address rule, the in-range comparator,
 //!   and the down-counter that serialises a sprite's eight pixels.
 
+use crate::region::Region;
+
 const DOTS_PER_LINE: u32 = 341;
 const VISIBLE_LINES: u32 = 240;
 const VBLANK_FIRST: u32 = 241;
-const PRE_RENDER: u32 = 261;
 
 /// The 2C02 master palette, verbatim from the NESdev wiki page "PPU palettes",
 /// file `2C02G_U_wiki.pal` (generated with pally v0.23.0, `--cld -phd 4 -e`),
@@ -97,6 +98,78 @@ const PALETTE: [u32; 64] = [
     0x00_00_00_00,
 ];
 
+/// The 2C07 (PAL) palette, verbatim from the NESdev wiki page "PPU palettes",
+/// file `2C07_wiki.pal` (pally v0.24.1, `--cld -ppu 2C07 -phd 4
+/// --delay-line-filter -e`). The file holds 512 entries, eight emphasis
+/// variants of the 64 colours; the first 64 are the no-emphasis values this
+/// emulator uses.
+const PAL_PALETTE: [u32; 64] = [
+    0x00_62_62_62,
+    0x00_00_23_65,
+    0x00_0D_10_7F,
+    0x00_2B_01_7F,
+    0x00_45_00_65,
+    0x00_54_00_37,
+    0x00_54_05_01,
+    0x00_45_15_00,
+    0x00_2B_28_00,
+    0x00_0D_37_00,
+    0x00_00_3F_00,
+    0x00_00_3E_01,
+    0x00_00_33_37,
+    0x00_00_00_00,
+    0x00_00_00_00,
+    0x00_00_00_00,
+    0x00_AB_AB_AB,
+    0x00_11_51_AA,
+    0x00_34_38_CE,
+    0x00_5C_23_CE,
+    0x00_7F_19_AA,
+    0x00_93_1A_6C,
+    0x00_93_28_24,
+    0x00_7F_3F_00,
+    0x00_5C_58_00,
+    0x00_34_6C_00,
+    0x00_11_77_00,
+    0x00_00_75_24,
+    0x00_00_67_6C,
+    0x00_00_00_00,
+    0x00_00_00_00,
+    0x00_00_00_00,
+    0x00_FF_FF_FF,
+    0x00_61_A1_FB,
+    0x00_84_89_FF,
+    0x00_AD_74_FF,
+    0x00_D0_69_FB,
+    0x00_E4_6B_BC,
+    0x00_E4_79_74,
+    0x00_D0_8F_36,
+    0x00_AD_A8_12,
+    0x00_84_BD_12,
+    0x00_61_C8_36,
+    0x00_4D_C6_74,
+    0x00_4D_B8_BC,
+    0x00_4E_4E_4E,
+    0x00_00_00_00,
+    0x00_00_00_00,
+    0x00_FF_FF_FF,
+    0x00_C4_DD_FF,
+    0x00_D1_D3_FF,
+    0x00_E1_CB_FF,
+    0x00_EF_C7_FF,
+    0x00_F7_C8_E7,
+    0x00_F7_CD_CB,
+    0x00_EF_D6_B3,
+    0x00_E1_DF_A5,
+    0x00_D1_E7_A5,
+    0x00_C4_EC_B3,
+    0x00_BC_EB_CB,
+    0x00_BC_E5_E7,
+    0x00_B8_B8_B8,
+    0x00_00_00_00,
+    0x00_00_00_00,
+];
+
 /// The colour the PPU emits where both the background and the sprites are
 /// transparent. On a stock NES the EXT pins are grounded, so this is whatever
 /// palette RAM entry `$3F00` holds; the shift register model only ever asks for
@@ -159,6 +232,8 @@ pub struct Ppu {
     chr_map: [usize; 8],
     /// How the board wires the four logical nametables onto the 2 KiB of RAM.
     mirroring: Mirroring,
+    /// Which console timing this PPU is: the scanline count and the palette.
+    region: Region,
     /// Whether `$0000-$1FFF` is RAM instead of ROM: true for cartridges that
     /// carry no CHR bytes at all (blargg's 2005 suite), which upload their own
     /// tiles through `$2007`.
@@ -267,13 +342,21 @@ impl Ppu {
     /// first 16 pixels of the first scanline unwritten. Starting on the
     /// pre-render line instead costs one blanked scanline at boot and makes
     /// every frame this PPU renders complete.
+    #[cfg(test)]
     pub fn new() -> Ppu {
+        Ppu::for_region(Region::Ntsc)
+    }
+
+    /// A PPU for `region`: NTSC's 262-scanline 2C02 or PAL's 312-scanline
+    /// 2C07.
+    pub fn for_region(region: Region) -> Ppu {
         Ppu {
             vram: [0; 2048],
             palette: [0; 32],
             chr: vec![0; 16384],
             chr_map: [0, 1, 2, 3, 4, 5, 6, 7],
             mirroring: Mirroring::Vertical,
+            region,
             chr_ram: false,
             oam: [0xFF; 256],
             secondary_oam: [0; 32],
@@ -287,7 +370,7 @@ impl Ppu {
             fine_x: 0,
             write_latch: false,
             read_buffer: 0,
-            scanline: PRE_RENDER,
+            scanline: region.scanlines() - 1,
             dot: 0,
             odd_frame: false,
             frame_done: false,
@@ -304,8 +387,15 @@ impl Ppu {
         }
     }
 
+    /// The pre-render line: the last line of the frame, 261 on NTSC and 311
+    /// on PAL.
+    fn pre_render(&self) -> u32 {
+        self.region.scanlines() - 1
+    }
+
     /// Advance the PPU by one dot. Three of these are one CPU cycle.
     pub fn tick(&mut self) {
+        let pre_render = self.pre_render();
         // "The VBlank flag of the PPU is set at tick 1 (the second tick) of
         // scanline 241" and cleared 6820 dots later, at 261.1.
         if self.scanline == VBLANK_FIRST && self.dot == 1 {
@@ -315,7 +405,7 @@ impl Ppu {
                 self.nmi = true;
             }
         }
-        if self.scanline == PRE_RENDER && self.dot == 1 {
+        if self.scanline == pre_render && self.dot == 1 {
             // "The three flags in this register are automatically cleared on
             // dot 1 of the prerender scanline" (NESdev "PPU registers"), which
             // is the ONLY place the sprite-0 hit and the overflow flag fall:
@@ -333,7 +423,7 @@ impl Ppu {
         // a disabled component is transparent, not absent, so the other one's
         // fetches and scroll updates are unaffected (NESdev "PPUMASK").
         if self.rendering_enabled()
-            && (self.scanline < VISIBLE_LINES || self.scanline == PRE_RENDER)
+            && (self.scanline < VISIBLE_LINES || self.scanline == pre_render)
         {
             self.background_dot();
             // "At dot 256 of each scanline ... the PPU increments the vertical
@@ -352,7 +442,7 @@ impl Ppu {
             }
             // "During pixels 280 through 304 of the pre-render scanline, the
             // vertical scroll bits are reloaded."
-            if self.scanline == PRE_RENDER && (280..=304).contains(&self.dot) {
+            if self.scanline == pre_render && (280..=304).contains(&self.dot) {
                 self.v = (self.v & !0x7BE0) | (self.t & 0x7BE0);
             }
             // Sprite evaluation (dots 65-256) and the sprite pattern fetches
@@ -371,14 +461,14 @@ impl Ppu {
             // skipped ... by jumping directly from (339,261) to (0,0)". Only
             // with rendering enabled; with it disabled every frame is 89342
             // dots long.
-            if self.scanline == PRE_RENDER && self.odd_frame && self.rendering_enabled() {
+            if self.scanline == pre_render && self.odd_frame && self.rendering_enabled() {
                 self.dot = 0;
                 self.scanline = 0;
                 self.odd_frame = !self.odd_frame;
             } else {
                 self.dot = 0;
                 self.scanline += 1;
-                if self.scanline > PRE_RENDER {
+                if self.scanline > pre_render {
                     self.scanline = 0;
                     self.odd_frame = !self.odd_frame;
                 }
@@ -736,7 +826,10 @@ impl Ppu {
         } else {
             value & 0x3F
         };
-        PALETTE[value as usize]
+        match self.region {
+            Region::Ntsc => PALETTE[value as usize],
+            Region::Pal => PAL_PALETTE[value as usize],
+        }
     }
 
     /// "Bits 0-4 are incremented, with overflow toggling bit 10."
@@ -1598,6 +1691,32 @@ mod tests {
         p.take_frame();
         assert_eq!(p.framebuffer().len(), 256 * 240);
         assert!(!p.frame_ready(), "taking the frame must clear frame_ready");
+    }
+
+    /// The PAL PPU is a 312-scanline part, so a frame is 106,392 dots against
+    /// NTSC's 89,342, and it maps the same six-bit palette index through the
+    /// 2C07 table instead of the 2C02 one.
+    #[test]
+    fn pal_frames_are_312_scanlines_and_use_the_2c07_palette() {
+        let mut p = Ppu::for_region(Region::Pal);
+        p.cpu_write(0x2001, 0x00); // rendering off: no odd-frame skip
+        while !p.frame_ready() {
+            p.tick();
+        }
+        p.take_frame();
+        let mut dots = 0;
+        while !p.frame_ready() {
+            p.tick();
+            dots += 1;
+        }
+        assert_eq!(dots, 312 * 341, "a PAL frame is 312 lines of 341 dots");
+
+        p.write_vram_for_test(0x3F00, 0x11);
+        assert_eq!(
+            p.backdrop(),
+            0x00_11_51_AA,
+            "index $11 is the 2C07 colour, not the 2C02 one"
+        );
     }
 
     /// `$2000`'s nametable select lives in `t` at bits 10-11 and nowhere else.

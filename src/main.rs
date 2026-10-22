@@ -14,11 +14,13 @@ mod nestest_test;
 mod ppu;
 #[cfg(test)]
 mod ppu_rom_test;
+mod region;
 mod report;
 mod rom;
 
 use bus::Bus;
 use cpu::Cpu;
+use region::Region;
 use rom::Cartridge;
 
 const W: usize = 256;
@@ -29,8 +31,20 @@ const SCALE: u32 = 3;
 /// is 60.0988 Hz, 16.639 ms per frame; 16_667 us is the 60 Hz budget to sleep
 /// to. The emulation boundary is the PPU's own `frame_ready`, one 341x262
 /// frame including the odd-frame pre-render dot skip -- this constant is only
-/// the wall-clock half of the period.
+/// the wall-clock half of the period. PAL gets its own budget below.
 const FRAME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_micros(16_667);
+
+/// One PAL frame is 312 scanlines of 341 dots = 106,392 dots at 5.320342 MHz,
+/// 19,997.6 us. 20 ms is the 50 Hz budget.
+const FRAME_BUDGET_PAL: ::std::time::Duration = ::std::time::Duration::from_micros(20_000);
+
+/// The wall-clock budget for one frame of `region`.
+fn frame_budget(region: Region) -> ::std::time::Duration {
+    match region {
+        Region::Ntsc => FRAME_BUDGET,
+        Region::Pal => FRAME_BUDGET_PAL,
+    }
+}
 
 /// How often a battery-backed cartridge's 8 KiB of PRG RAM is flushed to disk
 /// while the game runs. The process can be killed (the launcher's old drop path
@@ -269,8 +283,11 @@ impl Play {
 /// time; chasing the debt with a burst of zero-length frames only makes the
 /// next one worse. Add a fixed-timestep accumulator if replay determinism
 /// ever needs to decouple emulation from the clock.
-fn frame_sleep(elapsed: ::std::time::Duration) -> ::std::time::Duration {
-    FRAME_BUDGET.checked_sub(elapsed).unwrap_or_default()
+fn frame_sleep(
+    elapsed: ::std::time::Duration,
+    budget: ::std::time::Duration,
+) -> ::std::time::Duration {
+    budget.checked_sub(elapsed).unwrap_or_default()
 }
 
 /// How long to wait before emulating the next frame, given how much audio the
@@ -278,21 +295,21 @@ fn frame_sleep(elapsed: ::std::time::Duration) -> ::std::time::Duration {
 ///
 /// The device consumes 48 kHz exactly, so its queue is the emulator's real
 /// clock and this is that clock's own period: wait for as many of its frames
-/// as are queued above the target. Waiting on `FRAME_BUDGET` instead runs the
-/// emulator at 60.000 fps against NTSC's 60.0988, which starves a 48 kHz queue
-/// by about 79 samples a second -- an audible click every few seconds.
+/// as are queued above the target. Waiting on the frame budget instead runs the
+/// emulator at a round 60 fps against NTSC's 60.0988, which starves a 48 kHz
+/// queue by about 79 samples a second -- an audible click every few seconds.
 ///
 /// Zero at or below the target: a queue that has drained needs the emulator to
-/// run as fast as it can, not to wait. Capped at `FRAME_BUDGET`: a device that
+/// run as fast as it can, not to wait. Capped at `budget`: a device that
 /// accepts samples and never plays them must not slow the picture below what
 /// the emulator does with no audio at all (what it holds past `AUDIO_MAX_QUEUED`
 /// is dropped, so that queue cannot grow without bound either).
-fn audio_sleep(queued: u32) -> ::std::time::Duration {
+fn audio_sleep(queued: u32, budget: ::std::time::Duration) -> ::std::time::Duration {
     let excess = queued.saturating_sub(AUDIO_TARGET) as u64;
     let drain = ::std::time::Duration::from_micros(
         excess * 1_000_000 / (48_000 * AUDIO_FRAME_BYTES as u64),
     );
-    drain.min(FRAME_BUDGET)
+    drain.min(budget)
 }
 
 /// With no script the dump list is the whole run, so the last frame named ends
@@ -410,6 +427,7 @@ fn run() -> Result<(), String> {
 
     let bytes = ::std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut bus = Bus::new(Cartridge::load(&bytes)?);
+    let budget = frame_budget(bus.cart.region());
     let mut cpu = Cpu::new();
     bus.power_on();
     cpu.reset(&mut bus);
@@ -631,11 +649,11 @@ fn run() -> Result<(), String> {
         // paused or muted run has no queue to follow, so it falls back to the
         // wall clock and keeps the window responsive.
         if paused {
-            ::std::thread::sleep(FRAME_BUDGET);
+            ::std::thread::sleep(budget);
         } else {
             match &audio {
-                Some(queue) if !muted => ::std::thread::sleep(audio_sleep(queue.size())),
-                _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed())),
+                Some(queue) if !muted => ::std::thread::sleep(audio_sleep(queue.size(), budget)),
+                _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed(), budget)),
             }
         }
     }
@@ -692,9 +710,9 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_event, audio_sleep, button_for, dump_list_ends_run, frame_sleep, mask_for_name,
-        missed_dumps, parse_script, write_battery_save, Play, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
-        AUDIO_TARGET, FRAME_BUDGET,
+        apply_event, audio_sleep, button_for, dump_list_ends_run, frame_budget, frame_sleep,
+        mask_for_name, missed_dumps, parse_script, write_battery_save, Play, Region,
+        AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::Keycode;
@@ -923,16 +941,21 @@ mod tests {
     /// frame's worth of waiting, and the queue neither grows nor starves.
     #[test]
     fn audio_sleep_waits_as_long_as_the_device_needs_to_drain_the_excess() {
-        assert_eq!(audio_sleep(0), Duration::ZERO, "empty queue: run flat out");
+        let budget = frame_budget(Region::Ntsc);
         assert_eq!(
-            audio_sleep(AUDIO_TARGET),
+            audio_sleep(0, budget),
+            Duration::ZERO,
+            "empty queue: run flat out"
+        );
+        assert_eq!(
+            audio_sleep(AUDIO_TARGET, budget),
             Duration::ZERO,
             "at the target: run"
         );
 
         // One NTSC frame of audio: 48000 / 60.0988 = 798.7 stereo frames.
         let frame = (48_000.0 / 60.0988 * AUDIO_FRAME_BYTES as f64) as u32;
-        let wait = audio_sleep(AUDIO_TARGET + frame);
+        let wait = audio_sleep(AUDIO_TARGET + frame, budget);
         let drained = wait.as_secs_f64() * 48_000.0 * AUDIO_FRAME_BYTES as f64;
         assert!(
             (drained - frame as f64).abs() < 1.0,
@@ -946,37 +969,54 @@ mod tests {
         // Deeper is longer, but a device that takes samples and never plays
         // them cannot hold the picture below the no-audio rate, and the deepest
         // queue kept is a bounded pause: past it, frames are dropped.
-        assert!(audio_sleep(AUDIO_TARGET + 2 * frame) > wait);
+        assert!(audio_sleep(AUDIO_TARGET + 2 * frame, budget) > wait);
         for deep in [AUDIO_MAX_QUEUED, u32::MAX] {
             assert!(
-                audio_sleep(deep) <= FRAME_BUDGET,
+                audio_sleep(deep, budget) <= budget,
                 "{deep} bytes queued waits longer than a frame"
             );
         }
     }
 
+    /// PAL is a 50 Hz console: one 312-line frame is 19,997.6 us, and the
+    /// wall clock gets 20 ms so a run without audio is paced at 50 fps.
+    #[test]
+    fn a_pal_frame_gets_a_twenty_millisecond_budget() {
+        assert_eq!(frame_budget(Region::Ntsc), FRAME_BUDGET);
+        assert_eq!(frame_budget(Region::Pal), Duration::from_micros(20_000));
+    }
+
     #[test]
     fn a_sleep_fills_out_the_frame_budget_and_never_goes_negative() {
-        assert_eq!(frame_sleep(Duration::ZERO), FRAME_BUDGET, "free frame");
+        let budget = frame_budget(Region::Ntsc);
         assert_eq!(
-            frame_sleep(FRAME_BUDGET / 2),
-            FRAME_BUDGET / 2,
+            frame_sleep(Duration::ZERO, budget),
+            FRAME_BUDGET,
+            "free frame"
+        );
+        assert_eq!(
+            frame_sleep(budget / 2, budget),
+            budget / 2,
             "half a frame used, half to sleep"
         );
         assert_eq!(
-            frame_sleep(FRAME_BUDGET),
+            frame_sleep(budget, budget),
             Duration::ZERO,
             "exactly on budget, no sleep"
         );
         // Behind: drop the debt instead of chasing it, and certainly do not
         // wrap around into an enormous sleep.
         for over in [
-            FRAME_BUDGET * 3,
+            budget * 3,
             Duration::from_secs(5),
             Duration::MAX,
             Duration::from_nanos(u64::MAX),
         ] {
-            assert_eq!(frame_sleep(over), Duration::ZERO, "{over:?} overran");
+            assert_eq!(
+                frame_sleep(over, budget),
+                Duration::ZERO,
+                "{over:?} overran"
+            );
         }
     }
 

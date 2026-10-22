@@ -1,8 +1,8 @@
 # Feature backlog
 
 Current state: mappers 0/1/2/66, cycle-based PPU with scanline IRQ support in the
-cartridge, APU without DMC, battery saves, launcher, scripted input and frame
-dumps. Everything below is not implemented.
+cartridge, APU without DMC, NTSC and PAL timing, battery saves, launcher,
+scripted input and frame dumps. Everything below is not implemented.
 
 Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
@@ -25,7 +25,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
 - [ ] **Unofficial CPU opcodes** — `cpu.rs` currently panics on undocumented opcodes. Implement the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants). *Effort: M.*
 - [ ] **DMC channel** — `$4010–$4013` are currently dropped. Sample fetching through the bus, output level, IRQ, `$4015` status bits, CPU stall conflicts. *Effort: M.*
-- [ ] **PAL support** — 50 Hz timing, PAL APU period tables, PAL palette, header region detection. The bundled European Zelda ROM is a test candidate. *Effort: M.*
+- [x] **PAL support** — 50 Hz timing (312 scanlines, 5:16 CPU:PPU dots), 2A07 APU clock, noise and frame-counter tables, 2C07 palette, and region detection from NES 2.0 byte 12 or iNES flags 9/10. Dendy and dual-region headers fall back to NTSC. *Done.*
 - [ ] **NES 2.0 header support** — parse console type, mapper/submapper, PRG/CHR size exponents, RAM sizes. *Effort: S.*
 - [ ] **FDS support** — BIOS, disk I/O, disk IRQs, writable media, per-side saves. *Effort: XL.*
 - [ ] **MMC5 support** — expansion audio, ExRAM, split-screen mode, large PRG banking. Only if a specific MMC5 game is wanted. *Effort: XL.*
