@@ -1,9 +1,13 @@
-//! iNES loader for the three boards this emulator knows: mapper 2 (UxROM)
-//! for "Contra (USA)", mapper 66 (UxROM variant with bus conflicts) for
-//! "Super Mario Bros. + Duck Hunt (USA)", and mapper 0 (NROM) for blargg's
-//! APU test ROMs -- NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM
-//! the tests need, and the 2005 suite with no CHR at all (the PPU gets RAM
-//! instead).
+//! iNES loader for the boards this emulator knows: mapper 1 (MMC1) for
+//! "Legend of Zelda", mapper 2 (UxROM) for "Contra", mapper 66 (UxROM variant
+//! with bus conflicts) for "Super Mario Bros. + Duck Hunt", and mapper 0 (NROM)
+//! for blargg's APU test ROMs -- NROM-128 and NROM-256, both with the
+//! `$6000-$7FFF` PRG RAM the tests need, and the 2005 suite with no CHR at all
+//! (the PPU gets RAM instead).
+//!
+//! Mapper 1 is MMC1: a five-write serial register controlling PRG mode, CHR
+//! banking, nametable mirroring and PRG RAM enable. Zelda carries CHR RAM and
+//! an 8 KiB battery-backed save, both of which this loader exposes.
 //!
 //! Mapper 2's window is 16 KiB switchable at `$8000-$BFFF` plus the LAST
 //! 16 KiB fixed at `$C000-$FFFF`. The bank register decodes any write in
@@ -37,6 +41,8 @@
 //!    a 16 KiB window with a fixed upper half is what put an illegal opcode at
 //!    the game's own `JSR $E5C1`.
 
+use crate::ppu::Mirroring;
+
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
 /// PRG ROM bank" -- ONE 32 KiB block over the whole window. There is no
 /// separately selectable `$C000-$FFFF` half; `$8000` and `$C000` are both
@@ -45,6 +51,10 @@ const BANK: usize = 0x8000;
 
 /// iNES counts PRG in 16 KiB units, whatever the window size is.
 const PRG_UNIT: usize = 0x4000;
+
+/// Every banking unit this cartridge model needs below 8 KiB: MMC1 switches
+/// CHR in 4 KiB windows (and GxROM's 8 KiB value splits into two).
+const CHR_UNIT: usize = 0x1000;
 
 /// The bank the register holds until something writes it. Measured on this
 /// cartridge: the power-on bytes at `$8000` are
@@ -57,26 +67,45 @@ const POWER_ON_BANK: usize = 0;
 /// One 8 KiB CHR bank: the window at `$0000-$1FFF`, selected by bits 1-0.
 const CHR_BANK: usize = 0x2000;
 
-/// PRG ROM, CHR ROM, and the mapper bank register. The CHR bytes stay here
+/// PRG ROM, CHR ROM, and the mapper registers. The CHR bytes stay here
 /// because the file owns them; the PPU holds the banks because it fetches
-/// pattern memory every dot, and the register writes swap one in for the other.
+/// pattern memory every dot, and the registers swap one in for the other.
 pub struct Cartridge {
     prg: Vec<u8>,
     chr: Vec<u8>,
     /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
     board: Board,
     /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
-    /// `$8000-$FFFF` on GxROM, a 16 KiB bank at `$8000-$BFFF` on UxROM.
+    /// `$8000-$FFFF` on GxROM, a 16 KiB bank at `$8000-$BFFF` on UxROM, and
+    /// MMC1's PRG register in 16 KiB units whose meaning follows `control`.
     bank: usize,
-    /// Which 8 KiB CHR bank is mapped at `$0000-$1FFF` (GxRom only).
-    chr_bank: usize,
+    /// The two 4 KiB CHR banks the board maps at `$0000-$0FFF` and
+    /// `$1000-$1FFF`. GxROM's 8 KiB value fills both; MMC1 selects them
+    /// separately in 4 KiB mode.
+    chr_banks: [usize; 2],
+    /// MMC1 control register. Power-on/reset value is PRG mode 3 (switch at
+    /// `$8000`, last bank fixed), 8 KiB CHR mode, vertical mirroring.
+    control: u8,
+    /// MMC1 PRG register: low four bits are the bank, bit 4 enables PRG RAM.
+    prg_ram_reg: u8,
+    /// MMC1's five-write serial port: bits received so far and how many.
+    shift: u8,
+    shift_count: u8,
+    /// How the board wires the four logical nametables onto 2 KiB of VRAM.
+    mirroring: Mirroring,
+    /// Whether the header marks PRG RAM as battery-backed, so it should be
+    /// written to a `.sav` file next to the ROM.
+    battery: bool,
 }
 
-/// The three boards this emulator knows how to read.
+/// The four boards this emulator knows how to read.
 enum Board {
     /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
     /// both halves directly. Writes to the window go nowhere.
     Nrom,
+    /// MMC1, the Zelda board: serial PRG/CHR banking, mirroring control, and
+    /// battery-backed PRG RAM.
+    Mmc1,
     /// GxROM, the SMB + Duck Hunt board: bus-conflict banking, see above.
     GxRom,
     /// UxROM, the Contra board: 16 KiB switchable low window, last 16 KiB
@@ -89,42 +118,82 @@ impl Cartridge {
         if bytes.len() < 16 || &bytes[..4] != b"NES\x1a" {
             return Err("not an iNES image: bad magic".to_string());
         }
+        let flags6 = bytes[6];
+        // A trainer is 512 bytes between the header and PRG. Rare, but reading
+        // it as PRG puts every bank off by 32 KiB, which looks like a bad ROM.
+        let start = 16 + if flags6 & 0x04 != 0 { 512 } else { 0 };
         let prg_len = bytes[4] as usize * PRG_UNIT;
-        if prg_len == 0 || bytes.len() < 16 + prg_len {
+        if prg_len == 0 || bytes.len() < start + prg_len {
             return Err(format!("truncated PRG: header claims {prg_len} bytes"));
+        }
+        let chr_len = bytes[5] as usize * CHR_BANK;
+        if bytes.len() < start + prg_len + chr_len {
+            return Err(format!("truncated CHR: header claims {chr_len} bytes"));
         }
         let mapper = bytes[7] & 0xF0 | bytes[6] >> 4;
         let board = match mapper {
             0 => Board::Nrom,
+            1 => Board::Mmc1,
             2 => Board::UxRom,
             66 => Board::GxRom,
-            other => return Err(format!("mapper {other}, only 0, 2 and 66 are supported")),
+            other => return Err(format!("mapper {other}, only 0, 1, 2 and 66 are supported")),
         };
-        // NROM and UxROM start with bank 0. GxROM's power-on bank is measured,
-        // and `POWER_ON_BANK % (prg_len / BANK)` would divide by zero for a
-        // 16 KiB image.
+        // NROM, MMC1 and UxROM start with bank 0. GxROM's power-on bank is
+        // measured, and `POWER_ON_BANK % (prg_len / BANK)` would divide by
+        // zero for a 16 KiB image.
         let bank = match board {
-            Board::Nrom | Board::UxRom => 0,
-            Board::GxRom => POWER_ON_BANK % (prg_len / BANK),
+            Board::Nrom | Board::Mmc1 | Board::UxRom => 0,
+            Board::GxRom => POWER_ON_BANK % (prg_len / BANK).max(1),
+        };
+        // MMC1's control register owns mirroring and powers up vertical;
+        // GxROM is hardwired vertical. NROM and UxROM follow the header bit.
+        let mirroring = match board {
+            Board::Mmc1 | Board::GxRom => Mirroring::Vertical,
+            Board::Nrom | Board::UxRom if flags6 & 0x01 != 0 => Mirroring::Vertical,
+            Board::Nrom | Board::UxRom => Mirroring::Horizontal,
         };
         Ok(Cartridge {
-            prg: bytes[16..16 + prg_len].to_vec(),
-            chr: bytes[16 + prg_len..].to_vec(),
+            prg: bytes[start..start + prg_len].to_vec(),
+            chr: bytes[start + prg_len..start + prg_len + chr_len].to_vec(),
             board,
             bank,
-            chr_bank: 0,
+            chr_banks: [0, 1],
+            control: 0x0C,
+            prg_ram_reg: 0,
+            shift: 0,
+            shift_count: 0,
+            mirroring,
+            battery: flags6 & 0x02 != 0,
         })
     }
 
-    /// Whether `$6000-$7FFF` is populated. Both NROM images this emulator
-    /// loads carry the 8 KiB PRG RAM the APU tests use for reporting; neither
-    /// the SMB board nor UxROM populates it.
+    /// Whether `$6000-$7FFF` is populated. NROM's test images and MMC1's
+    /// battery save both use it; the SMB and Contra boards do not.
     pub fn has_prg_ram(&self) -> bool {
-        matches!(self.board, Board::Nrom)
+        matches!(self.board, Board::Nrom | Board::Mmc1)
+    }
+
+    /// Whether a mapper register currently allows the CPU to reach PRG RAM.
+    /// NROM has no register; MMC1 can disable its 8 KiB window.
+    pub fn prg_ram_enabled(&self) -> bool {
+        if !self.has_prg_ram() {
+            return false;
+        }
+        match self.board {
+            Board::Nrom => true,
+            Board::Mmc1 => self.prg_ram_reg & 0x10 != 0,
+            Board::GxRom | Board::UxRom => false,
+        }
+    }
+
+    /// Whether the cartridge has battery-backed PRG RAM to persist.
+    pub fn has_battery(&self) -> bool {
+        self.battery
     }
 
     /// Whether pattern memory is RAM. True for images that carry no CHR bytes
-    /// at all -- the 2005 suite -- where the game uploads its own tiles.
+    /// at all -- the 2005 suite, Contra, Zelda -- where the game uploads its
+    /// own tiles.
     pub fn chr_is_ram(&self) -> bool {
         self.chr.is_empty()
     }
@@ -134,16 +203,50 @@ impl Cartridge {
         &self.chr
     }
 
-    /// Which 8 KiB CHR bank is mapped at `$0000-$1FFF`.
-    pub fn chr_bank(&self) -> usize {
-        self.chr_bank
+    /// The eight 1 KiB CHR slots at `$0000-$1FFF`. Slots 0-3 are the first
+    /// 4 KiB bank and slots 4-7 the second; MMC1's 8 KiB mode points both
+    /// halves at one aligned pair.
+    pub fn chr_map(&self) -> [usize; 8] {
+        let banks = self.chr_bank_count();
+        let (first, second) = match self.board {
+            Board::Mmc1 if self.control & 0x10 == 0 => {
+                let base = self.chr_banks[0] & !1;
+                (base % banks, (base + 1) % banks)
+            }
+            _ => (self.chr_banks[0] % banks, self.chr_banks[1] % banks),
+        };
+        [
+            first * 4,
+            first * 4 + 1,
+            first * 4 + 2,
+            first * 4 + 3,
+            second * 4,
+            second * 4 + 1,
+            second * 4 + 2,
+            second * 4 + 3,
+        ]
+    }
+
+    /// How many 4 KiB CHR banks exist. A CHR RAM cartridge has the 8 KiB the
+    /// PPU provides; a short or absent CHR image must not divide by zero.
+    fn chr_bank_count(&self) -> usize {
+        if self.chr.is_empty() {
+            2
+        } else {
+            (self.chr.len() / CHR_UNIT).max(1)
+        }
+    }
+
+    /// How the board currently wires the nametables.
+    pub fn mirroring(&self) -> Mirroring {
+        self.mirroring
     }
 
     /// The CPU's `$8000-$FFFF` window. NROM has no register: 16 KiB images
     /// mirror their single block, 32 KiB ones map both halves directly, and
     /// `& (len - 1)` does both. GxROM maps one 32 KiB bank across the whole
     /// window. UxROM maps a 16 KiB bank at `$8000-$BFFF` and pins the last
-    /// 16 KiB of the file at `$C000-$FFFF`.
+    /// 16 KiB of the file at `$C000-$FFFF`. MMC1 follows its PRG mode.
     pub fn cpu_read(&self, addr: u16) -> u8 {
         match self.board {
             Board::Nrom => self.prg[addr as usize & (self.prg.len() - 1)],
@@ -152,6 +255,27 @@ impl Cartridge {
                 self.prg[self.bank * PRG_UNIT + (addr as usize - 0x8000)]
             }
             Board::UxRom => self.prg[self.prg.len() - PRG_UNIT + (addr as usize - 0xC000)],
+            Board::Mmc1 => {
+                let (low, high) = self.mmc1_prg_banks();
+                let bank = if addr < 0xC000 { low } else { high };
+                self.prg[bank * PRG_UNIT + (addr as usize & 0x3FFF)]
+            }
+        }
+    }
+
+    /// The two 16 KiB PRG banks MMC1 maps at `$8000` and `$C000`. Control bits
+    /// 2-3 select the mode: 0/1 use one 32 KiB bank, 2 fixes the first bank
+    /// and switches the top, 3 switches the bottom and fixes the last.
+    fn mmc1_prg_banks(&self) -> (usize, usize) {
+        let count = (self.prg.len() / PRG_UNIT).max(1);
+        let bank = self.bank % count;
+        match self.control & 0x0C {
+            0x08 => (0, bank),
+            0x0C => (bank, count - 1),
+            _ => {
+                let base = bank & !1;
+                (base % count, (base + 1) % count)
+            }
         }
     }
 
@@ -166,11 +290,15 @@ impl Cartridge {
     /// UxROM selects a 16 KiB bank on any write in `$8000-$FFFF`. iNES mapper
     /// 2 is conventionally emulated without bus conflicts, and Contra's bank
     /// table writes the byte already in ROM anyway.
+    ///
+    /// MMC1 receives five serial bits per register write, least significant
+    /// first; bit 7 of a write resets the shift register instead.
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
         match self.board {
             // NROM has no registers at all: every write to the window is
             // ignored.
             Board::Nrom => {}
+            Board::Mmc1 => self.mmc1_write(addr, val),
             Board::GxRom => {
                 // The register decodes `$8000-$BFFF` only. `$C000-$FFFF` is
                 // the upper half of the same window, not a second register,
@@ -185,7 +313,9 @@ impl Cartridge {
                 // or CHR than the file carries, and a bank count of 0 must not
                 // underflow.
                 self.bank = ((val >> 4) as usize) & (self.prg.len() / BANK).saturating_sub(1);
-                self.chr_bank = (val & 3) as usize & (self.chr.len() / CHR_BANK).saturating_sub(1);
+                let banks = (self.chr.len() / CHR_BANK).max(1);
+                let bank = (val & 3) as usize % banks;
+                self.chr_banks = [bank * 2, bank * 2 + 1];
             }
             Board::UxRom => {
                 if addr >= 0x8000 {
@@ -197,20 +327,65 @@ impl Cartridge {
             }
         }
     }
+
+    fn mmc1_write(&mut self, addr: u16, val: u8) {
+        if addr < 0x8000 {
+            return;
+        }
+        // Bit 7 clears the shift register and forces PRG mode 3; the other
+        // control bits (mirroring, CHR mode) keep their values.
+        if val & 0x80 != 0 {
+            self.shift = 0;
+            self.shift_count = 0;
+            self.control |= 0x0C;
+            return;
+        }
+        self.shift |= (val & 1) << self.shift_count;
+        self.shift_count += 1;
+        if self.shift_count < 5 {
+            return;
+        }
+        let register = ((addr >> 13) & 3) as usize;
+        let value = self.shift;
+        self.shift = 0;
+        self.shift_count = 0;
+        match register {
+            0 => {
+                self.control = value & 0x1F;
+                self.mirroring = match value & 0x03 {
+                    0 => Mirroring::SingleLower,
+                    1 => Mirroring::SingleUpper,
+                    2 => Mirroring::Vertical,
+                    _ => Mirroring::Horizontal,
+                };
+            }
+            1 => self.chr_banks[0] = (value & 0x1F) as usize,
+            2 => self.chr_banks[1] = (value & 0x1F) as usize,
+            _ => {
+                self.prg_ram_reg = value & 0x1F;
+                self.bank = (value & 0x0F) as usize;
+            }
+        }
+    }
 }
 
 /// 16-byte iNES header for a synthetic image, shared by every image builder in
 /// the crate. `mapper` is split the way iNES has it: low nibble in byte 6, high
-/// nibble in byte 7. 66 is the SMB + Duck Hunt GxROM board, which this repo also
-/// declares vertical mirroring and battery for; 2 is UxROM and 0 is plain NROM.
+/// nibble in byte 7. 66 is the SMB + Duck Hunt GxROM board (vertical mirroring),
+/// 1 is MMC1 (battery, horizontal header bits), 2 is UxROM, 0 is plain NROM.
 #[cfg(test)]
 pub(crate) fn ines_header(prg_banks: u8, chr_banks: u8, mapper: u8) -> [u8; 16] {
     let mut h = [0u8; 16];
     h[..4].copy_from_slice(b"NES\x1a");
     h[4] = prg_banks;
     h[5] = chr_banks;
-    h[6] = (mapper & 0x0F) << 4 | if mapper == 66 { 0x01 } else { 0x00 };
-    h[7] = mapper & 0xF0 | if mapper == 66 { 0x08 } else { 0x00 };
+    h[6] = (mapper & 0x0F) << 4
+        | match mapper {
+            66 => 0x01,
+            1 => 0x02,
+            _ => 0x00,
+        };
+    h[7] = mapper & 0xF0;
     h
 }
 
@@ -339,9 +514,16 @@ mod tests {
     fn a_bad_image_is_rejected() {
         assert!(Cartridge::load(b"nope").is_err(), "bad magic");
         assert!(Cartridge::load(b"NES\x1a").is_err(), "truncated");
-        let mut other_mapper = ines_header(4, 2, 66);
-        other_mapper[7] = 0x43; // mapper 4, MMC3
-        assert!(Cartridge::load(&other_mapper).is_err(), "wrong mapper");
+        let mut other_mapper = ines_header(4, 2, 4).to_vec();
+        other_mapper.resize(16 + 4 * PRG_UNIT + 2 * CHR_BANK, 0);
+        let err = match Cartridge::load(&other_mapper) {
+            Ok(_) => panic!("mapper 4 is not supported"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("mapper 4"),
+            "error must name the mapper: {err}"
+        );
     }
 
     /// The game's own boot handshake, executed against the real cartridge
@@ -503,5 +685,121 @@ mod tests {
             assert!(c.has_prg_ram());
             assert!(c.chr_is_ram(), "no CHR bytes -> the PPU must get RAM");
         }
+    }
+
+    /// Four 16 KiB PRG banks, each filled with its own index, plus `chr_banks`
+    /// 8 KiB CHR banks whose 4 KiB halves are filled with 0x80+index.
+    fn mmc1_cart(prg_banks: u8, chr_banks: u8) -> Cartridge {
+        let mut bytes = ines_header(prg_banks, chr_banks, 1).to_vec();
+        for bank in 0..prg_banks {
+            bytes.extend(std::iter::repeat_n(bank, PRG_UNIT));
+        }
+        for bank in 0..chr_banks * 2 {
+            bytes.extend(std::iter::repeat_n(0x80 + bank, CHR_UNIT));
+        }
+        Cartridge::load(&bytes).expect("synthetic MMC1 image must load")
+    }
+
+    /// MMC1 takes five bits per register, least significant first.
+    fn mmc1_write(c: &mut Cartridge, addr: u16, value: u8) {
+        for bit in 0..5 {
+            c.cpu_write(addr, (value >> bit) & 1);
+        }
+    }
+
+    #[test]
+    fn mmc1_powers_up_in_prg_mode_3_with_the_last_bank_fixed() {
+        let mut c = mmc1_cart(4, 0);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000)),
+            (0, 3),
+            "reset: switchable $8000, last bank fixed at $C000"
+        );
+        mmc1_write(&mut c, 0xE000, 1);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000)),
+            (1, 3),
+            "PRG register 1 moves the low window only"
+        );
+    }
+
+    #[test]
+    fn mmc1_mode_2_fixes_the_first_bank_and_switches_the_top() {
+        let mut c = mmc1_cart(4, 0);
+        mmc1_write(&mut c, 0x8000, 0x08); // PRG mode 2
+        mmc1_write(&mut c, 0xE000, 2);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000)),
+            (0, 2),
+            "mode 2 pins bank 0 at $8000 and maps bank 2 at $C000"
+        );
+    }
+
+    #[test]
+    fn mmc1_mode_0_uses_one_32k_bank_and_ignores_the_low_prg_bit() {
+        let mut c = mmc1_cart(4, 0);
+        mmc1_write(&mut c, 0x8000, 0x00); // PRG mode 0
+        mmc1_write(&mut c, 0xE000, 2);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000)),
+            (2, 3),
+            "one 32 KiB bank: the register's low bit is ignored"
+        );
+    }
+
+    #[test]
+    fn mmc1_control_bits_0_and_1_choose_mirroring() {
+        for (bits, want) in [
+            (0x00, Mirroring::SingleLower),
+            (0x01, Mirroring::SingleUpper),
+            (0x02, Mirroring::Vertical),
+            (0x03, Mirroring::Horizontal),
+        ] {
+            let mut c = mmc1_cart(2, 0);
+            mmc1_write(&mut c, 0x8000, bits);
+            assert_eq!(c.mirroring(), want, "control bits {bits:02b}");
+        }
+    }
+
+    #[test]
+    fn mmc1_chr_registers_map_four_kib_windows() {
+        let mut c = mmc1_cart(2, 1); // 8 KiB CHR ROM = two 4 KiB banks
+        mmc1_write(&mut c, 0x8000, 0x10); // CHR mode: 4 KiB windows
+        mmc1_write(&mut c, 0xA000, 1); // first window -> bank 1
+        mmc1_write(&mut c, 0xC000, 0); // second window -> bank 0
+        assert_eq!(
+            c.chr_map(),
+            [4, 5, 6, 7, 0, 1, 2, 3],
+            "slots 0-3 are CHR bank 1, slots 4-7 are bank 0"
+        );
+    }
+
+    #[test]
+    fn mmc1_eight_kib_chr_mode_ignores_the_low_chr_bit() {
+        let mut c = mmc1_cart(2, 1);
+        mmc1_write(&mut c, 0x8000, 0x00); // CHR mode: 8 KiB, both halves
+        mmc1_write(&mut c, 0xA000, 1); // low bit ignored -> aligned pair 0/1
+        assert_eq!(c.chr_map(), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn mmc1_prg_ram_is_disabled_until_bit_4_of_the_prg_register() {
+        let mut c = mmc1_cart(2, 0);
+        assert!(c.has_prg_ram(), "MMC1 has the $6000-$7FFF window");
+        assert!(!c.prg_ram_enabled(), "power-on PRG register disables it");
+        mmc1_write(&mut c, 0xE000, 0x10);
+        assert!(c.prg_ram_enabled(), "bit 4 enables PRG RAM");
+    }
+
+    #[test]
+    fn the_real_zelda_cartridge_loads_as_mmc1_with_a_battery() {
+        let Some(bytes) = test_rom("Legend of Zelda, The (Europe) (Rev 1).nes") else {
+            return;
+        };
+        let c = Cartridge::load(&bytes).expect("Zelda must load");
+        assert!(matches!(c.board, Board::Mmc1), "mapper 1 is MMC1");
+        assert!(c.has_battery(), "Zelda saves to battery-backed PRG RAM");
+        assert!(c.chr_is_ram(), "Zelda uploads its own tiles");
+        assert_eq!(c.mirroring(), Mirroring::Vertical, "MMC1 power-on wiring");
     }
 }

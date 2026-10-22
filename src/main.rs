@@ -370,6 +370,19 @@ fn run() -> Result<(), String> {
     bus.power_on();
     cpu.reset(&mut bus);
 
+    // Battery-backed PRG RAM (MMC1's Zelda save) lives next to the ROM. A
+    // missing or short file leaves the RAM zeroed; it is written back on a
+    // clean exit.
+    let save_path = bus
+        .cart
+        .has_battery()
+        .then(|| ::std::path::Path::new(&rom_path).with_extension("sav"));
+    if let Some(path) = &save_path {
+        if let Ok(saved) = ::std::fs::read(path) {
+            bus.load_prg_ram(&saved);
+        }
+    }
+
     if let Some(queue) = &audio {
         // The queue is opened with no allowed changes, so a device that cannot
         // do exactly this spec fails the open instead of renegotiating it; the
@@ -439,7 +452,7 @@ fn run() -> Result<(), String> {
         if play.is_none() && dump_list_ends_run(&dump_at, frames) {
             // With no script the dump list is the whole run, so the last frame
             // named ends it.
-            return Ok(());
+            break;
         }
         // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
         // all len*4 bytes of the frame are valid to read as u8.
@@ -458,6 +471,13 @@ fn run() -> Result<(), String> {
         match &audio {
             Some(queue) => ::std::thread::sleep(audio_sleep(queue.size())),
             None => ::std::thread::sleep(frame_sleep(frame_start.elapsed())),
+        }
+    }
+    // A battery save is only useful if the process gets to exit normally, so
+    // write it before the dump report can return an error.
+    if let Some(path) = &save_path {
+        if let Err(e) = ::std::fs::write(path, bus.prg_ram()) {
+            report::log_error(&format!("cannot write {}: {e}", path.display()));
         }
     }
     // The run stopped early -- the script ran out, or the user quit -- so any

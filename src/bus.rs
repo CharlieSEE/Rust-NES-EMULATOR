@@ -98,6 +98,8 @@ impl Bus {
         // that carries no CHR bytes at all gets RAM instead, which is what
         // blargg's 2005 suite uploads its tiles into.
         bus.ppu.load_chr_rom(bus.cart.chr_rom());
+        bus.ppu.set_chr_map(bus.cart.chr_map());
+        bus.ppu.set_mirroring(bus.cart.mirroring());
         if bus.cart.chr_is_ram() {
             bus.ppu.use_chr_ram();
         }
@@ -182,8 +184,10 @@ impl Bus {
             0x4017 => self.controllers[1].read(),
             // The cartridge may populate this window with PRG RAM. Both NROM
             // test images do -- blargg's ROMs report their results here -- and
-            // mappers 2 and 66 map nothing below `$8000`, so it is open bus.
-            0x6000..=0x7FFF if self.cart.has_prg_ram() => self.prg_ram[addr as usize - 0x6000],
+            // MMC1 exposes its battery save here. MMC1's PRG register can
+            // disable the window; the SMB and Contra boards map nothing below
+            // `$8000`, so for them it is open bus.
+            0x6000..=0x7FFF if self.cart.prg_ram_enabled() => self.prg_ram[addr as usize - 0x6000],
             // Mappers 2 and 66 map nothing below $8000: no PRG RAM, no
             // registers, so `$4020-$7FFF` is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
@@ -213,15 +217,16 @@ impl Bus {
                 }
             }
             // `$4020-$7FFF` is the mappers' unmapped window and drops.
-            0x6000..=0x7FFF if self.cart.has_prg_ram() => {
+            0x6000..=0x7FFF if self.cart.prg_ram_enabled() => {
                 self.prg_ram[addr as usize - 0x6000] = val;
             }
             0x8000..=0xFFFF => {
                 self.cart.cpu_write(addr, val);
-                // On GxROM the CHR bank is bits 1-0 of the same register the
-                // PRG bank is, so it moves on writes the PPU cares about too.
-                // UxROM has no CHR bank register and reports 0.
-                self.ppu.set_chr_bank(self.cart.chr_bank());
+                // MMC1 can change CHR banking and mirroring in a write, and
+                // GxROM's CHR bits live in the PRG register. Push whatever the
+                // mapper now reports on every write.
+                self.ppu.set_chr_map(self.cart.chr_map());
+                self.ppu.set_mirroring(self.cart.mirroring());
             }
             _ => {}
         }
@@ -231,6 +236,19 @@ impl Bus {
     /// an instruction. `tick` is what drains it.
     pub fn dma_busy(&self) -> bool {
         self.dma_stall > 0
+    }
+
+    /// The 8 KiB at `$6000-$7FFF`, for a battery-backed cartridge to write to
+    /// disk on exit.
+    pub fn prg_ram(&self) -> &[u8] {
+        &self.prg_ram
+    }
+
+    /// Restore a battery save. A save file of the wrong length keeps whatever
+    /// bytes it carries and leaves the rest zeroed.
+    pub fn load_prg_ram(&mut self, data: &[u8]) {
+        let n = data.len().min(self.prg_ram.len());
+        self.prg_ram[..n].copy_from_slice(&data[..n]);
     }
 
     /// Advance the PPU by **one dot** (and the APU once the dots make a whole
@@ -356,6 +374,7 @@ mod tests {
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
+        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // the 16 KiB CHR the header claims
         let at = 16 + POWER_ON_BANK * BANK;
         bytes[at..at + code.len()].copy_from_slice(code);
         // $FFFC is in the power-on bank: the window is one 32 KiB block, so the
@@ -385,6 +404,7 @@ mod tests {
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
+        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // the 16 KiB CHR the header claims
         let at = 16 + POWER_ON_BANK * BANK;
         bytes[at..at + 4].copy_from_slice(&[0x58, 0x4C, 0x00, 0x80]); // CLI; JMP $8000
         bytes[at + 0x10..at + 0x10 + handler.len()].copy_from_slice(handler);
@@ -405,6 +425,7 @@ mod tests {
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
+        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // the 16 KiB CHR the header claims
         bytes[16 + POWER_ON_BANK * BANK] = 0x11;
         let vectors = 16 + POWER_ON_BANK * BANK + (0xFFFC - 0x8000);
         bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
@@ -827,6 +848,7 @@ mod tests {
         for _ in 0..2 {
             bytes.extend(std::iter::repeat_n(0xBB, BANK));
         }
+        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // claimed CHR
         Cartridge::load(&bytes).expect("synthetic image must load")
     }
 

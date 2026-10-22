@@ -104,11 +104,29 @@ const PALETTE: [u32; 64] = [
 /// the same reason, so this is the one colour that is never looked up per pixel.
 const BACKDROP: u32 = 0x00_00_00_00;
 
-/// Nametable RAM: 2 KiB of physical RAM. The board wires nametables VERTICALLY,
-/// so `$2000` and `$2800` are the same 1 KiB and `$2400` and `$2C00` are the
-/// other one; the offset inside the 2 KiB is `addr & $07FF`.
-fn vram_index(addr: u16) -> usize {
-    (addr & 0x0FFF) as usize & 0x07FF
+/// Which nametable RAM each `$2000-$2FFF` address reaches. Boards wire the
+/// four logical nametables differently; MMC1 and later mappers can also change
+/// the wiring at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mirroring {
+    Vertical,
+    Horizontal,
+    SingleLower,
+    SingleUpper,
+}
+
+/// Nametable RAM: 2 KiB of physical RAM. The offset inside it depends on the
+/// board's mirroring: vertical folds `$2800` onto `$2000`, horizontal folds
+/// `$2400` onto `$2000`, and the single-screen modes make all four logical
+/// nametables the same 1 KiB.
+fn vram_index(addr: u16, mirroring: Mirroring) -> usize {
+    let addr = addr & 0x0FFF;
+    match mirroring {
+        Mirroring::Vertical => (addr & 0x07FF) as usize,
+        Mirroring::Horizontal => (((addr & 0x0800) >> 1) | (addr & 0x03FF)) as usize,
+        Mirroring::SingleLower => (addr & 0x03FF) as usize,
+        Mirroring::SingleUpper => 0x0400 | (addr & 0x03FF) as usize,
+    }
 }
 
 /// Palette RAM is 32 entries. Only four of the `$3F10-$3F1F` addresses are
@@ -134,10 +152,13 @@ pub struct Ppu {
     /// Pattern memory is PPU-bus memory the PPU fetches from every dot, so the
     /// PPU holds it and `Cartridge` keeps the bytes and any bank register.
     chr: [u8; 16384],
-    /// Which 8 KiB bank is mapped at `$0000-$1FFF`. Mapper 66's `xxPPxxCC`
-    /// register puts it in bits 1-0, and the game flips it mid-frame to show
-    /// both games' logos at once. Boards with no CHR bank register leave it 0.
-    chr_bank: usize,
+    /// Which 1 KiB CHR bank backs each of the eight 1 KiB slots at
+    /// `$0000-$1FFF`. Eight slots rather than one 8 KiB bank lets a mapper
+    /// switch 4 KiB (MMC1) or 1 KiB (MMC3) windows without the PPU knowing
+    /// which board it is running.
+    chr_map: [usize; 8],
+    /// How the board wires the four logical nametables onto the 2 KiB of RAM.
+    mirroring: Mirroring,
     /// Whether `$0000-$1FFF` is RAM instead of ROM: true for cartridges that
     /// carry no CHR bytes at all (blargg's 2005 suite), which upload their own
     /// tiles through `$2007`.
@@ -251,7 +272,8 @@ impl Ppu {
             vram: [0; 2048],
             palette: [0; 32],
             chr: [0; 16384],
-            chr_bank: 0,
+            chr_map: [0, 1, 2, 3, 4, 5, 6, 7],
+            mirroring: Mirroring::Vertical,
             chr_ram: false,
             oam: [0xFF; 256],
             secondary_oam: [0; 32],
@@ -389,7 +411,10 @@ impl Ppu {
         let dot = self.dot;
         if (1..=256).contains(&dot) || (321..=336).contains(&dot) {
             match dot % 8 {
-                1 => self.fetch.tile = self.vram[vram_index(0x2000 | (self.v & 0x0FFF))],
+                1 => {
+                    self.fetch.tile =
+                        self.vram[vram_index(0x2000 | (self.v & 0x0FFF), self.mirroring)]
+                }
                 3 => {
                     // "attribute address = $23C0 | (v & $0C00) | ((v >> 4) &
                     // $38) | ((v >> 2) & $07)". Which of the four 2-bit fields
@@ -402,7 +427,7 @@ impl Ppu {
                         | ((self.v >> 4) & 0x38)
                         | ((self.v >> 2) & 0x07);
                     let shift = (((self.v >> 6) & 1) << 2) | (((self.v >> 1) & 1) << 1);
-                    self.fetch.attr = (self.vram[vram_index(addr)] >> shift) & 3;
+                    self.fetch.attr = (self.vram[vram_index(addr, self.mirroring)] >> shift) & 3;
                 }
                 5 => self.fetch.lo = self.pattern_byte(0),
                 7 => {
@@ -846,12 +871,12 @@ impl Ppu {
                 if addr >= 0x3F00 {
                     self.palette[palette_index(addr)] = val & 0x3F;
                 } else if addr >= 0x2000 {
-                    self.vram[vram_index(addr)] = val;
+                    self.vram[vram_index(addr, self.mirroring)] = val;
                 } else if self.chr_ram {
-                    // The game uploads its tiles here through `$2007`. NROM
-                    // and UxROM have CHR RAM and no CHR bank register, so
-                    // `chr_bank` stays 0 and the address alone indexes.
-                    self.chr[addr as usize & 0x1FFF] = val;
+                    // The game uploads its tiles here through `$2007`. CHR RAM
+                    // goes through the same bank map as CHR ROM, because MMC1
+                    // can bank its 8 KiB of pattern RAM too.
+                    self.chr[self.crbank(addr)] = val;
                 }
                 // `$0000-$1FFF` is pattern memory. On a cartridge with CHR ROM
                 // the write goes NOWHERE; on one with none it is the 8 KiB RAM
@@ -873,7 +898,7 @@ impl Ppu {
         if addr < 0x2000 {
             self.chr[self.crbank(addr)]
         } else {
-            self.vram[vram_index(addr)]
+            self.vram[vram_index(addr, self.mirroring)]
         }
     }
 
@@ -883,22 +908,27 @@ impl Ppu {
         self.v = self.v.wrapping_add(step) & 0x7FFF;
     }
 
-    /// Index into the whole CHR ROM for a `$0000-$1FFF` pattern address, via the
-    /// bank the mapper's register currently maps there.
+    /// Index into the whole CHR array for a `$0000-$1FFF` pattern address, via
+    /// the 1 KiB slot the mapper currently maps there.
     fn crbank(&self, addr: u16) -> usize {
-        self.chr_bank * 8192 + (addr as usize & 0x1FFF)
+        self.chr_map[(addr as usize >> 10) & 7] * 1024 + (addr as usize & 0x03FF)
     }
 
-    /// Map a different 8 KiB CHR bank at `$0000-$1FFF`. The bus calls this after
-    /// every cartridge write, because the CHR bits live in the same register as
-    /// the PRG ones.
-    pub fn set_chr_bank(&mut self, bank: usize) {
-        self.chr_bank = bank;
+    /// Map each 1 KiB slot at `$0000-$1FFF` individually. MMC1 maps 4 KiB
+    /// windows and MMC3 maps 1 KiB windows; both are just assignments here.
+    pub fn set_chr_map(&mut self, map: [usize; 8]) {
+        self.chr_map = map;
+    }
+
+    /// Rewire the logical nametables. MMC1 changes this at runtime; simpler
+    /// boards set it once from the iNES header when the bus is built.
+    pub fn set_mirroring(&mut self, mirroring: Mirroring) {
+        self.mirroring = mirroring;
     }
 
     /// `$0000-$1FFF` is RAM: the cartridge carries no CHR bytes, so every
-    /// `$2007` write into pattern space lands there. NROM and UxROM have no
-    /// CHR bank register and `chr_bank` stays 0.
+    /// `$2007` write into pattern space lands there. The bank map decides
+    /// which 1 KiB of the 8 KiB window is written.
     pub fn use_chr_ram(&mut self) {
         self.chr_ram = true;
     }
@@ -984,7 +1014,7 @@ impl Ppu {
     fn read_vram_for_test(&mut self, addr: u16) -> u8 {
         self.cpu_write(0x2006, (addr >> 8) as u8);
         self.cpu_write(0x2006, addr as u8);
-        self.read_buffer = self.vram[vram_index(addr)];
+        self.read_buffer = self.vram[vram_index(addr, self.mirroring)];
         self.read_buffer
     }
 
@@ -1103,6 +1133,47 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_mirroring_folds_the_second_nametable_onto_the_first() {
+        let mut p = Ppu::new();
+        p.set_mirroring(Mirroring::Horizontal);
+        p.write_vram_for_test(0x2000, 0x11);
+        p.write_vram_for_test(0x2400, 0x22); // $2400 == $2000
+        assert_eq!(p.read_vram_for_test(0x2000), 0x22);
+        p.write_vram_for_test(0x2800, 0x33);
+        assert_eq!(
+            p.read_vram_for_test(0x2000),
+            0x22,
+            "$2800 is the other bank"
+        );
+        assert_eq!(p.read_vram_for_test(0x2C00), 0x33, "$2C00 == $2800");
+    }
+
+    #[test]
+    fn the_single_screen_modes_make_all_four_nametables_one() {
+        for mode in [Mirroring::SingleLower, Mirroring::SingleUpper] {
+            let mut p = Ppu::new();
+            p.set_mirroring(mode);
+            p.write_vram_for_test(0x2000, 0x5A);
+            for addr in [0x2400, 0x2800, 0x2C00] {
+                assert_eq!(
+                    p.read_vram_for_test(addr),
+                    0x5A,
+                    "{mode:?}: ${addr:04X} must see the same 1 KiB"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_chr_map_can_swap_four_kib_windows_independently() {
+        let mut p = Ppu::new();
+        p.set_chr_map([4, 5, 6, 7, 0, 1, 2, 3]);
+        assert_eq!(p.crbank(0x0000), 0x1000, "$0000 reads the second 4 KiB");
+        assert_eq!(p.crbank(0x1000), 0x0000, "$1000 reads the first 4 KiB");
+        assert_eq!(p.crbank(0x1FFF), 0x0FFF, "offset inside the mapped bank");
+    }
+
+    #[test]
     fn a_tile_is_fetched_and_shifted_into_the_framebuffer() {
         let mut p = Ppu::new();
         // CHR bank 0 is written directly by the caller in these tests.
@@ -1188,7 +1259,7 @@ mod tests {
             p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
             p.write_vram_for_test(0x3F01, 0x30); // colour 1 = white
             p.upload_tile_for_test(0, 0x00, 0x00, 0); // tile 0 at (0, 0)
-            p.set_chr_bank(bank);
+            p.set_chr_map(std::array::from_fn(|slot| bank * 8 + slot));
             show(&mut p, 0, 0);
             p.run_to(&[0]);
             let want = if bank == 0 { 0x00_FF_FF_FF } else { BACKDROP };

@@ -2,6 +2,7 @@ target/
 *.ppm
 *.png
 *.nes
+*.sav
 # Freely redistributable test ROMs are the one exception: they make the
 # integration tests run on a clean checkout and in CI. Game ROMs stay ignored.
 !test_roms/**/*.nes
