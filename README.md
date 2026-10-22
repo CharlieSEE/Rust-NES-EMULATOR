@@ -74,10 +74,16 @@ repository.
 | B | `X` |
 | Select | `Right Shift` |
 | Start | `Enter` |
+| Pause | `P` |
+| Reset | `R` |
+| Fullscreen | `F11` |
+| Mute | `M` |
 | Quit | `Esc` |
 
-One player, standard controller only. The Zapper is not emulated, so the Duck
-Hunt half of the cartridge runs but cannot be aimed.
+An SDL2 game controller works too: its D-pad, A, B, Back and Start map to the
+same buttons (A is the bottom face button, B the right one). One player,
+standard controller only. The Zapper is not emulated, so the Duck Hunt half of
+the cartridge runs but cannot be aimed.
 
 ## What runs
 
