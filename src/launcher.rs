@@ -316,9 +316,21 @@ fn to_logical_y(canvas: &Canvas<Window>, x: i32, y: i32) -> Option<usize> {
 
 /// Re-read a folder, keeping the current list when the read fails. A folder
 /// that was removed or chmod-ed under the launcher must not close it too.
-fn refresh(dir: &Path, list: &mut List) {
+/// The selection follows the same ROM across the re-read, so returning from a
+/// game leaves the cursor where it was instead of jumping to the top.
+fn refresh(dir: &Path, list: &mut List, visible: usize) {
     match scan(dir) {
-        Ok(roms) => list.reset(roms),
+        Ok(roms) => {
+            let selected = list.roms.get(list.selected).cloned();
+            let scroll = list.scroll;
+            list.reset(roms);
+            if let Some(path) = selected {
+                if let Some(index) = list.roms.iter().position(|rom| *rom == path) {
+                    list.selected = index;
+                    list.scroll = keep_visible(index, scroll, visible, list.roms.len());
+                }
+            }
+        }
         Err(e) => log_error(&format!("launcher: {e}")),
     }
 }
@@ -516,9 +528,9 @@ pub fn run() -> Result<(), String> {
             dirty = true;
             if games.is_empty() {
                 // Back to a list with nothing behind it. Raising it over a
-                // game that is still running would steal that game's screen,
-                // and resetting the list would lose the selection.
-                refresh(&dir, &mut list);
+                // game that is still running would steal that game's screen.
+                // Refreshing keeps the cursor on the ROM that just exited.
+                refresh(&dir, &mut list, visible);
                 canvas.window_mut().raise();
             }
         }
@@ -762,6 +774,41 @@ mod tests {
             assert!(list.selected < list.scroll + visible);
         }
         assert_eq!(list.selected, 0, "stops at the first entry");
+    }
+
+    #[test]
+    fn returning_from_a_game_keeps_the_cursor_on_that_rom() {
+        let dir = std::env::temp_dir().join(format!("nes-launcher-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..30 {
+            std::fs::write(dir.join(format!("rom-{n:02}.nes")), b"").unwrap();
+        }
+
+        let mut list = List::new(super::scan(&dir).unwrap());
+        let visible = visible_rows();
+        for _ in 0..25 {
+            list.move_by(1, visible);
+        }
+        assert_eq!(list.selected, 25);
+        assert_eq!(list.scroll, 4, "scrolled down while picking");
+
+        super::refresh(&dir, &mut list, visible);
+        assert_eq!(
+            list.roms[list.selected].file_name().unwrap(),
+            "rom-25.nes",
+            "the re-read must not move the cursor to the top"
+        );
+        assert_eq!(list.scroll, 4, "and must not move the window either");
+
+        // A file disappearing above the selection shifts its index; the same
+        // ROM must stay selected.
+        std::fs::remove_file(dir.join("rom-00.nes")).unwrap();
+        super::refresh(&dir, &mut list, visible);
+        assert_eq!(list.roms[list.selected].file_name().unwrap(), "rom-25.nes");
+        assert!(list.selected >= list.scroll && list.selected < list.scroll + visible);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
