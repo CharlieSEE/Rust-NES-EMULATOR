@@ -1,12 +1,20 @@
-//! iNES loader for the two boards this emulator knows: mapper 66 (UxROM
-//! variant with bus conflicts) for "Super Mario Bros. + Duck Hunt (USA)",
-//! and mapper 0 (NROM) for blargg's APU test ROMs -- NROM-128 and NROM-256,
-//! both with the `$6000-$7FFF` PRG RAM the tests need, and the 2005 suite
-//! with no CHR at all (the PPU gets RAM instead).
+//! iNES loader for the three boards this emulator knows: mapper 2 (UxROM)
+//! for "Contra (USA)", mapper 66 (UxROM variant with bus conflicts) for
+//! "Super Mario Bros. + Duck Hunt (USA)", and mapper 0 (NROM) for blargg's
+//! APU test ROMs -- NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM
+//! the tests need, and the 2005 suite with no CHR at all (the PPU gets RAM
+//! instead).
 //!
-//! The iNES header is honest about this cartridge: its `chr=2` really is 16 KiB
-//! of tile data, its `prg=4` really is 64 KiB, and its mirroring bit really is
-//! vertical. What the header does NOT carry is any of the below, so every one
+//! Mapper 2's window is 16 KiB switchable at `$8000-$BFFF` plus the LAST
+//! 16 KiB fixed at `$C000-$FFFF`. The bank register decodes any write in
+//! `$8000-$FFFF`; iNES mapper 2 is conventionally emulated without bus
+//! conflicts, and Contra's own bank table writes the byte already in ROM.
+//! Its header asks for 128 KiB PRG, no CHR bytes (CHR RAM) and vertical
+//! mirroring, all of which the existing PPU/bus paths already provide.
+//!
+//! The SMB + Duck Hunt iNES header is honest about that cartridge: its `chr=2`
+//! really is 16 KiB of tile data, its `prg=4` really is 64 KiB, and its
+//! mirroring bit really is vertical. What the header does NOT carry is any of the below, so every one
 //! was measured against the real cartridge image instead:
 //!
 //! 1. PRG banking is by BUS CONFLICT, not by the written value. A write to
@@ -49,7 +57,7 @@ const POWER_ON_BANK: usize = 0;
 /// One 8 KiB CHR bank: the window at `$0000-$1FFF`, selected by bits 1-0.
 const CHR_BANK: usize = 0x2000;
 
-/// PRG ROM, CHR ROM, and the mapper 66 bank register. The CHR bytes stay here
+/// PRG ROM, CHR ROM, and the mapper bank register. The CHR bytes stay here
 /// because the file owns them; the PPU holds the banks because it fetches
 /// pattern memory every dot, and the register writes swap one in for the other.
 pub struct Cartridge {
@@ -57,19 +65,23 @@ pub struct Cartridge {
     chr: Vec<u8>,
     /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
     board: Board,
-    /// Which 32 KiB bank is mapped at `$8000-$FFFF` (GxRom only).
+    /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
+    /// `$8000-$FFFF` on GxROM, a 16 KiB bank at `$8000-$BFFF` on UxROM.
     bank: usize,
     /// Which 8 KiB CHR bank is mapped at `$0000-$1FFF` (GxRom only).
     chr_bank: usize,
 }
 
-/// The two boards this emulator knows how to read.
+/// The three boards this emulator knows how to read.
 enum Board {
     /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
     /// both halves directly. Writes to the window go nowhere.
     Nrom,
     /// GxROM, the SMB + Duck Hunt board: bus-conflict banking, see above.
     GxRom,
+    /// UxROM, the Contra board: 16 KiB switchable low window, last 16 KiB
+    /// fixed high window, and no CHR banking.
+    UxRom,
 }
 
 impl Cartridge {
@@ -84,13 +96,15 @@ impl Cartridge {
         let mapper = bytes[7] & 0xF0 | bytes[6] >> 4;
         let board = match mapper {
             0 => Board::Nrom,
+            2 => Board::UxRom,
             66 => Board::GxRom,
-            other => return Err(format!("mapper {other}, only 0 and 66 are supported")),
+            other => return Err(format!("mapper {other}, only 0, 2 and 66 are supported")),
         };
-        // NROM has no register at all, and `POWER_ON_BANK % (prg_len / BANK)`
-        // would divide by zero for its 16 KiB images.
+        // NROM and UxROM start with bank 0. GxROM's power-on bank is measured,
+        // and `POWER_ON_BANK % (prg_len / BANK)` would divide by zero for a
+        // 16 KiB image.
         let bank = match board {
-            Board::Nrom => 0,
+            Board::Nrom | Board::UxRom => 0,
             Board::GxRom => POWER_ON_BANK % (prg_len / BANK),
         };
         Ok(Cartridge {
@@ -103,8 +117,8 @@ impl Cartridge {
     }
 
     /// Whether `$6000-$7FFF` is populated. Both NROM images this emulator
-    /// loads carry the 8 KiB PRG RAM the APU tests use for reporting; the
-    /// SMB board doesn't populate it and the game never reads it.
+    /// loads carry the 8 KiB PRG RAM the APU tests use for reporting; neither
+    /// the SMB board nor UxROM populates it.
     pub fn has_prg_ram(&self) -> bool {
         matches!(self.board, Board::Nrom)
     }
@@ -125,49 +139,70 @@ impl Cartridge {
         self.chr_bank
     }
 
-    /// One 32 KiB window: `$8000` is the bank base and `$FFFF` its last byte.
-    /// NROM has no register: 16 KiB images mirror their single block, 32 KiB
-    /// ones map both halves directly, and `& (len - 1)` does both.
+    /// The CPU's `$8000-$FFFF` window. NROM has no register: 16 KiB images
+    /// mirror their single block, 32 KiB ones map both halves directly, and
+    /// `& (len - 1)` does both. GxROM maps one 32 KiB bank across the whole
+    /// window. UxROM maps a 16 KiB bank at `$8000-$BFFF` and pins the last
+    /// 16 KiB of the file at `$C000-$FFFF`.
     pub fn cpu_read(&self, addr: u16) -> u8 {
         match self.board {
             Board::Nrom => self.prg[addr as usize & (self.prg.len() - 1)],
             Board::GxRom => self.prg[self.bank * BANK + (addr as usize - 0x8000)],
+            Board::UxRom if addr < 0xC000 => {
+                self.prg[self.bank * PRG_UNIT + (addr as usize - 0x8000)]
+            }
+            Board::UxRom => self.prg[self.prg.len() - PRG_UNIT + (addr as usize - 0xC000)],
         }
     }
 
-    /// Bus conflict: the bank register only moves when the byte written is
-    /// already the byte the CPU reads at that address.
+    /// Mapper register writes.
     ///
-    /// The register is `xxPPxxCC`, so PRG is BITS 5-4 (NESdev "GxROM": "the
-    /// board only supports 64KB PRG", hence two banks and one select bit) and
-    /// CHR is bits 1-0.
+    /// GxROM is a bus-conflict board: the bank register only moves when the
+    /// byte written is already the byte the CPU reads at that address. Its
+    /// register is `xxPPxxCC`, so PRG is BITS 5-4 (NESdev "GxROM": "the board
+    /// only supports 64KB PRG", hence two banks and one select bit) and CHR is
+    /// bits 1-0.
+    ///
+    /// UxROM selects a 16 KiB bank on any write in `$8000-$FFFF`. iNES mapper
+    /// 2 is conventionally emulated without bus conflicts, and Contra's bank
+    /// table writes the byte already in ROM anyway.
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
-        // NROM has no registers at all: every write to the window is ignored.
-        if matches!(self.board, Board::Nrom) {
-            return;
+        match self.board {
+            // NROM has no registers at all: every write to the window is
+            // ignored.
+            Board::Nrom => {}
+            Board::GxRom => {
+                // The register decodes `$8000-$BFFF` only. `$C000-$FFFF` is
+                // the upper half of the same window, not a second register,
+                // and reset writes `$FFFD` there for the stack scratch byte;
+                // that byte happens to be the very value written, so a conflict
+                // check spanning the whole `$8000-$FFFF` range would take bits
+                // 5-4 of `$80` mid-reset.
+                if !(0x8000..0xC000).contains(&addr) || val != self.cpu_read(addr) {
+                    return;
+                }
+                // `saturating_sub`, not `-`: the iNES header can claim more PRG
+                // or CHR than the file carries, and a bank count of 0 must not
+                // underflow.
+                self.bank = ((val >> 4) as usize) & (self.prg.len() / BANK).saturating_sub(1);
+                self.chr_bank = (val & 3) as usize & (self.chr.len() / CHR_BANK).saturating_sub(1);
+            }
+            Board::UxRom => {
+                if addr >= 0x8000 {
+                    // The 74HC161 counts modulo the ROM's bank count, so a
+                    // select past the end wraps rather than reading out of
+                    // bounds.
+                    self.bank = (val as usize) % (self.prg.len() / PRG_UNIT);
+                }
+            }
         }
-        // The register decodes `$8000-$BFFF` only. `$C000-$FFFF` is the upper
-        // half of the same window, not a second register, and reset writes
-        // `$FFFD` there for the stack scratch byte; that byte happens to be the
-        // very value written, so a conflict check spanning the whole
-        // `$8000-$FFFF` range would take bits 5-4 of `$80` mid-reset.
-        if !(0x8000..0xC000).contains(&addr) {
-            return;
-        }
-        if val != self.cpu_read(addr) {
-            return;
-        }
-        // `saturating_sub`, not `-`: the iNES header can claim more PRG or CHR
-        // than the file carries, and a bank count of 0 must not underflow.
-        self.bank = ((val >> 4) as usize) & (self.prg.len() / BANK).saturating_sub(1);
-        self.chr_bank = (val & 3) as usize & (self.chr.len() / CHR_BANK).saturating_sub(1);
     }
 }
 
 /// 16-byte iNES header for a synthetic image, shared by every image builder in
 /// the crate. `mapper` is split the way iNES has it: low nibble in byte 6, high
 /// nibble in byte 7. 66 is the SMB + Duck Hunt GxROM board, which this repo also
-/// declares vertical mirroring and battery for; 0 is a plain NROM.
+/// declares vertical mirroring and battery for; 2 is UxROM and 0 is plain NROM.
 #[cfg(test)]
 pub(crate) fn ines_header(prg_banks: u8, chr_banks: u8, mapper: u8) -> [u8; 16] {
     let mut h = [0u8; 16];
@@ -226,6 +261,21 @@ mod tests {
     /// gitignored, so a test that needs its actual bytes has to be able to skip.
     fn real_rom() -> Option<Vec<u8>> {
         test_rom("Super Mario Bros. + Duck Hunt (USA).nes")
+    }
+
+    /// A synthesized UxROM image: `prg_banks` 16 KiB blocks, each filled with
+    /// its own index, no CHR bytes (so the PPU gets CHR RAM), and mapper 2.
+    fn uxrom_cart(prg_banks: u8) -> Cartridge {
+        let mut bytes = ines_header(prg_banks, 0, 2).to_vec();
+        for bank in 0..prg_banks {
+            bytes.extend(std::iter::repeat_n(bank, PRG_UNIT));
+        }
+        Cartridge::load(&bytes).expect("synthetic UxROM image must load")
+    }
+
+    /// The real Contra cartridge, or `None` when it is not on disk.
+    fn contra_rom() -> Option<Vec<u8>> {
+        test_rom("Contra (USA).nes")
     }
 
     /// A synthesized NROM image: 16 KiB PRG block `i` filled with
@@ -356,6 +406,55 @@ mod tests {
             u16::from_le_bytes([c.cpu_read(0xFFFA), c.cpu_read(0xFFFB)]),
             0x8082
         );
+    }
+
+    /// UxROM switches the lower 16 KiB window and pins the top half to the
+    /// last bank. A model that keeps the old 32 KiB GxROM window leaves the
+    /// whole `$8000-$FFFF` range on the same bank and fails both boundary
+    /// checks.
+    #[test]
+    fn uxrom_switches_the_low_16k_window_and_keeps_the_last_bank_fixed() {
+        let mut c = uxrom_cart(4);
+        assert_eq!(c.cpu_read(0x8000), 0, "power-on bank 0");
+        assert_eq!(c.cpu_read(0xBFFF), 0, "last byte of the switchable window");
+        assert_eq!(c.cpu_read(0xC000), 3, "top half is the last bank");
+        assert_eq!(c.cpu_read(0xFFFF), 3);
+
+        c.cpu_write(0x8000, 2);
+        assert_eq!(c.cpu_read(0x8000), 2, "bank select moved the low window");
+        assert_eq!(c.cpu_read(0xBFFF), 2);
+        assert_eq!(c.cpu_read(0xC000), 3, "and never moved the fixed bank");
+
+        // UxROM's register decodes every write in the whole PRG window, not
+        // just the first 16 KiB like GxROM.
+        c.cpu_write(0xFFD0, 1);
+        assert_eq!(c.cpu_read(0x8000), 1);
+        assert_eq!(c.cpu_read(0xC000), 3);
+    }
+
+    /// The real Contra cartridge: mapper 2, 128 KiB PRG (eight 16 KiB banks),
+    /// CHR RAM, no PRG RAM. Its reset vector lives in the fixed last bank, and
+    /// its bank table at `$FFD0` is written back to select a bank.
+    #[test]
+    fn contra_loads_as_mapper_2_and_banks_without_moving_the_fixed_bank() {
+        let Some(bytes) = contra_rom() else { return };
+        let mut c = Cartridge::load(&bytes).expect("real Contra cartridge must load");
+        assert_eq!(c.prg.len(), 8 * PRG_UNIT, "128 KiB of PRG");
+        assert!(c.chr_is_ram(), "Contra carries no CHR bytes");
+        assert!(!c.has_prg_ram(), "UxROM has no $6000-$7FFF RAM");
+        assert_eq!(c.cpu_read(0x8000), 0, "bank 0 starts with its own index");
+        assert_eq!(c.cpu_read(0xC000), 7, "fixed bank is bank 7");
+        assert_eq!(
+            u16::from_le_bytes([c.cpu_read(0xFFFC), c.cpu_read(0xFFFD)]),
+            0xC001,
+            "RESET vector is in the fixed bank"
+        );
+
+        // Contra's bank table at $FFD0 holds 0..7 and is written back to
+        // itself; bank 3's first byte is 3.
+        c.cpu_write(0xFFD3, 3);
+        assert_eq!(c.cpu_read(0x8000), 3, "bank 3 is mapped low");
+        assert_eq!(c.cpu_read(0xC000), 7, "the fixed bank did not move");
     }
 
     /// NROM-128 (16 KiB PRG) mirrors the single block across the whole
