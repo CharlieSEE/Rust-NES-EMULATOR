@@ -100,9 +100,6 @@ impl Bus {
         bus.ppu.load_chr_rom(bus.cart.chr_rom());
         bus.ppu.set_chr_map(bus.cart.chr_map());
         bus.ppu.set_mirroring(bus.cart.mirroring());
-        if bus.cart.chr_is_ram() {
-            bus.ppu.use_chr_ram();
-        }
         bus
     }
 
@@ -359,11 +356,11 @@ mod tests {
     const POWER_ON_BANK: usize = 0;
 
     /// The GxROM header this suite keeps wanting: mapper 66, vertical
-    /// mirroring, 64 KiB PRG (two 32 KiB windows) and 2x8 KiB of CHR ROM --
-    /// 16 KiB of real tile data in the file, banked by register bits 1-0.
+    /// mirroring and 64 KiB PRG (two 32 KiB windows). These CPU tests never
+    /// fetch patterns, so the image carries no CHR bytes and the PPU gets RAM.
     /// `h[4]` is in 16 KiB units, which is why four of them is 64 KiB.
     fn ines_header() -> [u8; 16] {
-        crate::rom::ines_header(4, 2, 66)
+        crate::rom::ines_header(4, 0, 66)
     }
 
     /// A cartridge whose power-on bank holds `code` at `$8000` and whose RESET
@@ -373,7 +370,6 @@ mod tests {
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
-        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // the 16 KiB CHR the header claims
         let at = 16 + POWER_ON_BANK * BANK;
         bytes[at..at + code.len()].copy_from_slice(code);
         // $FFFC is in the power-on bank: the window is one 32 KiB block, so the
@@ -403,7 +399,6 @@ mod tests {
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
-        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // the 16 KiB CHR the header claims
         let at = 16 + POWER_ON_BANK * BANK;
         bytes[at..at + 4].copy_from_slice(&[0x58, 0x4C, 0x00, 0x80]); // CLI; JMP $8000
         bytes[at + 0x10..at + 0x10 + handler.len()].copy_from_slice(handler);
@@ -424,7 +419,6 @@ mod tests {
         for fill in 0..2u8 {
             bytes.extend(std::iter::repeat_n(fill, BANK));
         }
-        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // the 16 KiB CHR the header claims
         bytes[16 + POWER_ON_BANK * BANK] = 0x11;
         let vectors = 16 + POWER_ON_BANK * BANK + (0xFFFC - 0x8000);
         bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
@@ -847,7 +841,6 @@ mod tests {
         for _ in 0..2 {
             bytes.extend(std::iter::repeat_n(0xBB, BANK));
         }
-        bytes.extend(std::iter::repeat_n(0u8, 2 * 0x2000)); // claimed CHR
         Cartridge::load(&bytes).expect("synthetic image must load")
     }
 

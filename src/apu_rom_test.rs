@@ -30,7 +30,7 @@ pub struct Machine {
 }
 
 impl Machine {
-    fn boot(bytes: &[u8]) -> Machine {
+    pub(crate) fn boot(bytes: &[u8]) -> Machine {
         let mut bus = Bus::new(Cartridge::load(bytes).expect("test ROM must load"));
         let mut cpu = Cpu::new();
         bus.power_on();
@@ -40,7 +40,7 @@ impl Machine {
 
     /// One whole frame, with the frame-ready flag drained so the next call
     /// runs the next frame.
-    fn frame(&mut self) {
+    pub(crate) fn frame(&mut self) {
         self.bus.run_frame(&mut self.cpu);
         self.bus.ppu.take_frame();
     }

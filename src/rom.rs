@@ -173,29 +173,18 @@ impl Cartridge {
         })
     }
 
-    /// Whether `$6000-$7FFF` is populated. NROM's test images and MMC1's
-    /// battery save both use it; the SMB and Contra boards do not.
-    pub fn has_prg_ram(&self) -> bool {
-        matches!(self.board, Board::Nrom | Board::Mmc1)
-    }
-
-    /// Whether the CPU can reach PRG RAM right now. NROM has no register.
-    /// MMC1's PRG register bit 4 is MMC1B's disable bit: writes with it set make
-    /// `$6000-$7FFF` open bus until the game clears it again.
+    /// Whether the CPU can reach PRG RAM right now. NROM's test images and
+    /// MMC1's battery save both use the window; the SMB and Contra boards do
+    /// not. NROM has no register, while MMC1's PRG register bit 4 is MMC1B's
+    /// disable bit: writes with it set make `$6000-$7FFF` open bus until the
+    /// game clears it again.
     pub fn prg_ram_enabled(&self) -> bool {
-        self.has_prg_ram() && self.prg_ram_enabled
+        matches!(self.board, Board::Nrom | Board::Mmc1) && self.prg_ram_enabled
     }
 
     /// Whether the cartridge has battery-backed PRG RAM to persist.
     pub fn has_battery(&self) -> bool {
         self.battery
-    }
-
-    /// Whether pattern memory is RAM. True for images that carry no CHR bytes
-    /// at all -- the 2005 suite, Contra, Zelda -- where the game uploads its
-    /// own tiles.
-    pub fn chr_is_ram(&self) -> bool {
-        self.chr.is_empty()
     }
 
     /// The CHR ROM image, for the PPU to hold. Borrowed, not copied.
@@ -230,11 +219,7 @@ impl Cartridge {
     /// How many 4 KiB CHR banks exist. A CHR RAM cartridge has the 8 KiB the
     /// PPU provides; a short or absent CHR image must not divide by zero.
     fn chr_bank_count(&self) -> usize {
-        if self.chr.is_empty() {
-            2
-        } else {
-            (self.chr.len() / CHR_UNIT).max(1)
-        }
+        (self.chr.len() / CHR_UNIT).max(2)
     }
 
     /// How the board currently wires the nametables.
@@ -609,8 +594,8 @@ mod tests {
         let Some(bytes) = contra_rom() else { return };
         let mut c = Cartridge::load(&bytes).expect("real Contra cartridge must load");
         assert_eq!(c.prg.len(), 8 * PRG_UNIT, "128 KiB of PRG");
-        assert!(c.chr_is_ram(), "Contra carries no CHR bytes");
-        assert!(!c.has_prg_ram(), "UxROM has no $6000-$7FFF RAM");
+        assert!(c.chr_rom().is_empty(), "Contra carries no CHR bytes");
+        assert!(!c.prg_ram_enabled(), "UxROM has no $6000-$7FFF RAM");
         assert_eq!(c.cpu_read(0x8000), 0, "bank 0 starts with its own index");
         assert_eq!(c.cpu_read(0xC000), 7, "fixed bank is bank 7");
         assert_eq!(
@@ -637,8 +622,11 @@ mod tests {
         assert_eq!(c.cpu_read(0x8000 + 0x1234), 0x34, "lower half");
         assert_eq!(c.cpu_read(0xC000 + 0x1234), 0x34, "upper half mirrors it");
         assert_eq!(c.cpu_read(0xFFFF), 0xFF, "last byte of the window");
-        assert!(c.has_prg_ram(), "NROM carries the $6000-$7FFF RAM");
-        assert!(c.chr_is_ram(), "no CHR bytes in the file -> CHR RAM");
+        assert!(c.prg_ram_enabled(), "NROM carries the $6000-$7FFF RAM");
+        assert!(
+            c.chr_rom().is_empty(),
+            "no CHR bytes in the file -> CHR RAM"
+        );
     }
 
     /// NROM-256 (32 KiB PRG) has two distinct 16 KiB blocks, and no bank
@@ -651,8 +639,8 @@ mod tests {
         assert_eq!(c.cpu_read(0xC000), 0x22, "second block, not a mirror");
         c.cpu_write(0x8000, 0x11); // NROM has no bank register
         assert_eq!(c.cpu_read(0xC000), 0x22, "the write changed nothing");
-        assert!(!c.chr_is_ram(), "8 KiB of CHR ROM in the file");
-        assert!(c.has_prg_ram());
+        assert!(!c.chr_rom().is_empty(), "8 KiB of CHR ROM in the file");
+        assert!(c.prg_ram_enabled());
     }
 
     /// The real test suites must load: apu_reset is NROM-256 with 8 KiB CHR,
@@ -662,15 +650,18 @@ mod tests {
         if let Some(bytes) = test_rom("test_roms/apu_reset/4015_cleared.nes") {
             let c = Cartridge::load(&bytes).expect("apu_reset image must load");
             assert_eq!(c.prg.len(), 2 * PRG_UNIT, "32 KiB NROM-256");
-            assert!(c.has_prg_ram());
-            assert!(!c.chr_is_ram());
+            assert!(c.prg_ram_enabled());
+            assert!(!c.chr_rom().is_empty());
             assert_eq!(c.chr_rom().len(), 8192, "8 KiB of CHR ROM");
         }
         if let Some(bytes) = test_rom("test_roms/apu_2005/01.len_ctr.nes") {
             let c = Cartridge::load(&bytes).expect("apu_2005 image must load");
             assert_eq!(c.prg.len(), PRG_UNIT, "16 KiB NROM-128");
-            assert!(c.has_prg_ram());
-            assert!(c.chr_is_ram(), "no CHR bytes -> the PPU must get RAM");
+            assert!(c.prg_ram_enabled());
+            assert!(
+                c.chr_rom().is_empty(),
+                "no CHR bytes -> the PPU must get RAM"
+            );
         }
     }
 
@@ -798,7 +789,7 @@ mod tests {
         let c = Cartridge::load(&bytes).expect("Zelda must load");
         assert!(matches!(c.board, Board::Mmc1), "mapper 1 is MMC1");
         assert!(c.has_battery(), "Zelda saves to battery-backed PRG RAM");
-        assert!(c.chr_is_ram(), "Zelda uploads its own tiles");
+        assert!(c.chr_rom().is_empty(), "Zelda uploads its own tiles");
         assert_eq!(
             c.mirroring(),
             Mirroring::SingleLower,

@@ -929,19 +929,14 @@ impl Ppu {
         self.mirroring = mirroring;
     }
 
-    /// `$0000-$1FFF` is RAM: the cartridge carries no CHR bytes, so every
-    /// `$2007` write into pattern space lands there. The bank map decides
-    /// which 1 KiB of the 8 KiB window is written.
-    pub fn use_chr_ram(&mut self) {
-        self.chr_ram = true;
-    }
-
     /// The whole CHR image the `Cartridge` parsed out of the file, banked by
     /// the mapper. A short -- or absent -- image is zero-filled to at least the
-    /// PPU's 8 KiB pattern window.
+    /// PPU's 8 KiB pattern window. With no image at all, the window is RAM:
+    /// every `$2007` write into pattern space lands there.
     pub fn load_chr_rom(&mut self, data: &[u8]) {
         self.chr = vec![0; data.len().max(8192)];
         self.chr[..data.len()].copy_from_slice(data);
+        self.chr_ram = data.is_empty();
     }
 }
 
