@@ -12,8 +12,11 @@ use sdl2::mouse::MouseButton;
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::render::{Canvas, Texture, TextureAccess};
 use sdl2::video::Window;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+
+use crate::report::{exe_dir, log_error, popup_for, NO_POPUP_ENV};
 
 /// Logical size, the same as the NES frame: the window starts at 3x and SDL
 /// scales whatever the window manager makes of it.
@@ -59,16 +62,6 @@ fn scan(dir: &Path) -> Result<Vec<PathBuf>, String> {
             .to_lowercase()
     });
     Ok(roms)
-}
-
-/// The folder holding this executable. Both a terminal run and a desktop icon
-/// land here.
-fn exe_dir() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    Ok(exe
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".")))
 }
 
 /// The launcher's one setting lives beside the executable, the same place the
@@ -238,7 +231,7 @@ fn fill_row(fb: &mut [u32], y: usize, height: usize, colour: u32) {
 }
 
 /// Paint the whole launcher frame from `dir` and `list`.
-fn render(fb: &mut [u32], dir: &Path, list: &List) {
+fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
     fb.fill(BG);
     put_text(fb, MARGIN, 6, "NES LAUNCHER", FG);
     put_text(
@@ -285,13 +278,12 @@ fn render(fb: &mut [u32], dir: &Path, list: &List) {
         );
     }
 
-    put_text(
-        fb,
-        MARGIN,
-        LIST_BOTTOM + 4,
-        "ENTER play   O folder   ESC quit",
-        DIM,
-    );
+    let footer = match running {
+        0 => "ENTER play   O folder   ESC quit".to_string(),
+        1 => "GAME RUNNING   O folder   ESC quit".to_string(),
+        n => format!("{n} GAMES RUNNING   O folder   ESC quit"),
+    };
+    put_text(fb, MARGIN, LIST_BOTTOM + 4, &footer, DIM);
 }
 
 /// Upload the software frame and show it. Same streaming ARGB texture path the
@@ -327,30 +319,65 @@ fn to_logical_y(canvas: &Canvas<Window>, x: i32, y: i32) -> Option<usize> {
 fn refresh(dir: &Path, list: &mut List) {
     match scan(dir) {
         Ok(roms) => list.reset(roms),
-        Err(e) => eprintln!("launcher: {e}"),
+        Err(e) => log_error(&format!("launcher: {e}")),
     }
 }
 
-/// Hide the launcher, run the emulator on `rom`, then show it again. Failure
-/// to start is reported and the list stays usable, so one bad file is not a
-/// dead end.
-fn launch(canvas: &mut Canvas<Window>, rom: &Path) {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            eprintln!("launcher: cannot find own executable: {e}");
-            return;
-        }
-    };
-    canvas.window_mut().hide();
-    let status = Command::new(exe).arg(rom).status();
-    canvas.window_mut().show();
-    canvas.window_mut().raise();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("{}: emulator exited with {status}", rom.display()),
-        Err(e) => eprintln!("{}: cannot start emulator: {e}", rom.display()),
+/// Log a launcher failure and show it over the launcher. Unlike `report`, the
+/// box is owned by the launcher window, so a maximized launcher cannot hide
+/// it.
+fn report_over(canvas: &Canvas<Window>, msg: &str) {
+    log_error(msg);
+    popup_for(canvas.window(), msg);
+}
+
+/// The emulator child, its ROM, and the thread draining its stderr. The child
+/// suppresses its own error box (the launcher's maximized window would hide
+/// it), so the text is captured here and shown by the launcher on exit.
+struct Game {
+    child: Child,
+    rom: PathBuf,
+    // Option: Game's Drop owns the child, so the handle cannot move out.
+    stderr: Option<std::thread::JoinHandle<String>>,
+}
+
+/// Killing on drop ties the game's life to the launcher's: closing the
+/// launcher stops the emulator instead of leaving it running with no window
+/// to return to.
+impl Drop for Game {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
+}
+
+/// Start the emulator on `rom`. The launcher stays up behind the games, so a
+/// child owns the keyboard while it has focus; `run` keeps repainting and
+/// reaps children as they exit. Failure to start is reported and the list
+/// stays usable, so one bad file is not a dead end.
+fn start(rom: &Path) -> Result<Game, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("launcher: cannot find own executable: {e}"))?;
+    let mut child = Command::new(exe)
+        .arg(rom)
+        .env(NO_POPUP_ENV, "1")
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: cannot start emulator: {e}", rom.display()))?;
+    // Drained on its own thread: a child that dies mid-print (or with a long
+    // backtrace) must not block on a full pipe while this process waits for it.
+    let stderr = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.read_to_string(&mut text);
+            text
+        })
+    });
+    Ok(Game {
+        child,
+        rom: rom.to_path_buf(),
+        stderr,
+    })
 }
 
 /// Run the launcher until the window is closed. Returns an error only for a
@@ -374,6 +401,7 @@ pub fn run() -> Result<(), String> {
         .window("NES Launcher", (W as u32) * SCALE, (H as u32) * SCALE)
         .position_centered()
         .resizable()
+        .maximized()
         .build()
         .map_err(|e| e.to_string())?;
     let mut canvas: Canvas<Window> = window.into_canvas().build().map_err(|e| e.to_string())?;
@@ -394,106 +422,175 @@ pub fn run() -> Result<(), String> {
     let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
     let mut frame = vec![0u32; W * H];
     let visible = visible_rows();
+    // The games currently running, one per emulator process. More than one is
+    // allowed: the list can start another while the first stays up.
+    let mut games: Vec<Game> = Vec::new();
 
-    render(&mut frame, &dir, &list);
+    render(&mut frame, &dir, &list, 0);
     present(&mut canvas, &mut texture, &frame)?;
 
     loop {
-        // A timeout keeps the loop alive for the window manager's expose event
-        // even on a desktop that sends nothing while the pointer is still.
-        let Some(event) = events.wait_event_timeout(250) else {
-            continue;
-        };
         let mut dirty = false;
-        match event {
-            Event::Quit { .. } => break,
-            Event::KeyDown {
-                keycode: Some(key), ..
-            } => match key {
-                Keycode::Escape | Keycode::Q => break,
-                Keycode::Up => {
-                    list.move_by(-1, visible);
-                    dirty = true;
-                }
-                Keycode::Down => {
-                    list.move_by(1, visible);
-                    dirty = true;
-                }
-                Keycode::PageUp => {
-                    list.page(-1, visible);
-                    dirty = true;
-                }
-                Keycode::PageDown => {
-                    list.page(1, visible);
-                    dirty = true;
-                }
-                Keycode::Home => {
-                    list.home(visible);
-                    dirty = true;
-                }
-                Keycode::End => {
-                    list.end(visible);
-                    dirty = true;
-                }
-                Keycode::Return | Keycode::KpEnter => {
-                    if let Some(rom) = list.roms.get(list.selected).cloned() {
-                        launch(&mut canvas, &rom);
-                        refresh(&dir, &mut list);
-                        dirty = true;
-                    }
-                }
-                Keycode::O => {
-                    if let Some(picked) = rfd::FileDialog::new()
-                        .set_title("NES ROM folder")
-                        .set_directory(&dir)
-                        .pick_folder()
-                    {
-                        // An unreadable pick leaves the old folder and list up
-                        // rather than replacing them with nothing.
-                        match scan(&picked) {
-                            Ok(roms) => {
-                                remember(&picked);
-                                dir = picked;
-                                list.reset(roms);
-                                dirty = true;
-                            }
-                            Err(e) => eprintln!("launcher: {e}"),
+        // Reap the games even when the desktop sends no events: the wait below
+        // times out, the loop comes back here, and this is where exits are
+        // noticed.
+        let mut still_running = Vec::with_capacity(games.len());
+        let mut any_exited = false;
+        for mut game in games.drain(..) {
+            match game.child.try_wait() {
+                Ok(None) => still_running.push(game),
+                Ok(Some(status)) => {
+                    any_exited = true;
+                    // Join the stderr reader before showing anything; the
+                    // Game's Drop reaps the already-exited child.
+                    let text = game
+                        .stderr
+                        .take()
+                        .map(|reader| reader.join().unwrap_or_default())
+                        .unwrap_or_default();
+                    if !status.success() {
+                        let text = text.trim();
+                        if text.is_empty() {
+                            // Killed by a signal, or a failure that never
+                            // reached the report path: the launcher is the
+                            // only witness.
+                            report_over(
+                                &canvas,
+                                &format!("{}: emulator exited with {status}", game.rom.display()),
+                            );
+                        } else {
+                            // Already logged by the child; only announce it,
+                            // over the launcher so it cannot land behind it.
+                            popup_for(canvas.window(), text);
                         }
                     }
                 }
-                _ => {}
-            },
-            Event::MouseButtonDown {
-                mouse_btn: MouseButton::Left,
-                x,
-                y,
-                ..
-            } => {
-                if let Some(ly) = to_logical_y(&canvas, x, y) {
-                    if let Some(index) = row_at(ly, LIST_TOP, visible, list.roms.len(), list.scroll)
-                    {
-                        list.selected = index;
-                        let rom = list.roms[index].clone();
-                        launch(&mut canvas, &rom);
-                        refresh(&dir, &mut list);
+                Err(e) => {
+                    any_exited = true;
+                    report_over(&canvas, &format!("launcher: cannot wait for emulator: {e}"));
+                }
+            }
+        }
+        games = still_running;
+        if any_exited {
+            // The footer counts the games, so any exit is a repaint.
+            dirty = true;
+            if games.is_empty() {
+                // Back to a list with nothing behind it. Raising it over a
+                // game that is still running would steal that game's screen,
+                // and resetting the list would lose the selection.
+                refresh(&dir, &mut list);
+                canvas.window_mut().raise();
+            }
+        }
+
+        // A timeout keeps the loop alive for the window manager's expose event
+        // even on a desktop that sends nothing while the pointer is still.
+        // The launcher stays live while games run: the list still scrolls, the
+        // folder can still be changed, and another game can be started.
+        if let Some(event) = events.wait_event_timeout(250) {
+            match event {
+                Event::Quit { .. } => break,
+                Event::KeyDown {
+                    keycode: Some(key),
+                    repeat,
+                    ..
+                } => match key {
+                    Keycode::Escape | Keycode::Q => break,
+                    Keycode::Up => {
+                        list.move_by(-1, visible);
+                        dirty = true;
+                    }
+                    Keycode::Down => {
+                        list.move_by(1, visible);
+                        dirty = true;
+                    }
+                    Keycode::PageUp => {
+                        list.page(-1, visible);
+                        dirty = true;
+                    }
+                    Keycode::PageDown => {
+                        list.page(1, visible);
+                        dirty = true;
+                    }
+                    Keycode::Home => {
+                        list.home(visible);
+                        dirty = true;
+                    }
+                    Keycode::End => {
+                        list.end(visible);
+                        dirty = true;
+                    }
+                    // Held Enter repeats: one press is one game.
+                    Keycode::Return | Keycode::KpEnter if !repeat => {
+                        if let Some(rom) = list.roms.get(list.selected).cloned() {
+                            match start(&rom) {
+                                Ok(started) => games.push(started),
+                                Err(e) => report_over(&canvas, &e),
+                            }
+                        }
+                    }
+                    Keycode::O => {
+                        if let Some(picked) = rfd::FileDialog::new()
+                            .set_title("NES ROM folder")
+                            .set_directory(&dir)
+                            .pick_folder()
+                        {
+                            // An unreadable pick leaves the old folder and list up
+                            // rather than replacing them with nothing.
+                            match scan(&picked) {
+                                Ok(roms) => {
+                                    remember(&picked);
+                                    dir = picked;
+                                    list.reset(roms);
+                                    dirty = true;
+                                }
+                                Err(e) => report_over(&canvas, &format!("launcher: {e}")),
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Event::MouseButtonDown {
+                    mouse_btn: MouseButton::Left,
+                    clicks,
+                    x,
+                    y,
+                    ..
+                } => {
+                    if let Some(ly) = to_logical_y(&canvas, x, y) {
+                        if let Some(index) =
+                            row_at(ly, LIST_TOP, visible, list.roms.len(), list.scroll)
+                        {
+                            list.selected = index;
+                            // The second press of a double-click is the same
+                            // click again; it must not start a second copy.
+                            if clicks == 1 {
+                                let rom = list.roms[index].clone();
+                                match start(&rom) {
+                                    Ok(started) => games.push(started),
+                                    Err(e) => report_over(&canvas, &e),
+                                }
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                Event::MouseWheel { y, .. } => {
+                    if y != 0 {
+                        list.move_by(3 * y as isize, visible);
                         dirty = true;
                     }
                 }
+                Event::Window {
+                    win_event: WindowEvent::Exposed,
+                    ..
+                } => dirty = true,
+                _ => {}
             }
-            Event::MouseWheel { y, .. } => {
-                if y != 0 {
-                    list.move_by(3 * y as isize, visible);
-                    dirty = true;
-                }
-            }
-            Event::Window {
-                win_event: WindowEvent::Exposed,
-                ..
-            } => dirty = true,
-            _ => {}
         }
         if dirty {
-            render(&mut frame, &dir, &list);
+            render(&mut frame, &dir, &list, games.len());
             present(&mut canvas, &mut texture, &frame)?;
         }
     }
