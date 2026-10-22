@@ -572,10 +572,10 @@ mod tests {
         // The first frame is ~27510 cycles: short of the 29831-cycle step, and
         // a three-times-too-fast APU would already have fired.
         b.run_frame(&mut cpu);
-        let _ = b.ppu.take_frame();
+        b.ppu.take_frame();
         assert_eq!(b.cpu_read(0x0000), 0, "no IRQ before the frame step");
         b.run_frame(&mut cpu);
-        let _ = b.ppu.take_frame();
+        b.ppu.take_frame();
         assert!(
             b.cpu_read(0x0000) >= 1,
             "the frame IRQ must reach the handler at $FFFE"
@@ -592,7 +592,7 @@ mod tests {
         b.cpu_write(0x4017, 0x00);
         for _ in 0..3 {
             b.run_frame(&mut cpu);
-            let _ = b.ppu.take_frame();
+            b.ppu.take_frame();
         }
         assert_eq!(
             b.cpu_read(0x0000),

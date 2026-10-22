@@ -74,7 +74,7 @@ const PALETTE: [u32; 64] = [
     0x00_AE_A9_00,
     0x00_78_C4_00,
     0x00_4A_D2_11,
-    0x00_2F_CF_64,
+    0x002F_CF64,
     0x00_2F_BD_C4,
     0x00_41_41_41,
     0x00_00_00_00,
@@ -119,7 +119,7 @@ fn vram_index(addr: u16) -> usize {
 /// all sixteen down leaves a sprite palette no writer can reach.
 fn palette_index(addr: u16) -> usize {
     let i = (addr & 0x1F) as usize;
-    if i >= 0x10 && i % 4 == 0 {
+    if i >= 0x10 && i.is_multiple_of(4) {
         i - 0x10
     } else {
         i
@@ -419,15 +419,15 @@ impl Ppu {
         // will continue through the next scanline at 8, 16, 24 ... 256". Dot 0
         // is a reload without a step, and it is where the two tiles prefetched
         // at the end of the previous scanline start being drawn.
-        let reload =
-            dot % 8 == 0 && (dot == 0 || (8..=256).contains(&dot) || (321..=336).contains(&dot));
+        let reload = dot.is_multiple_of(8)
+            && (dot == 0 || (8..=256).contains(&dot) || (321..=336).contains(&dot));
         if reload {
             self.bg_lo = ((self.prev.lo as u16) << 8) | self.cur.lo as u16;
             self.bg_hi = ((self.prev.hi as u16) << 8) | self.cur.hi as u16;
             self.attr_prev = self.prev.attr;
             self.attr_cur = self.cur.attr;
         }
-        if dot % 8 == 0 && ((8..=256).contains(&dot) || (321..=336).contains(&dot)) {
+        if dot.is_multiple_of(8) && ((8..=256).contains(&dot) || (321..=336).contains(&dot)) {
             self.increment_coarse_x();
         }
         if dot < 256 && self.scanline < VISIBLE_LINES {
@@ -1180,9 +1180,7 @@ mod tests {
     #[test]
     fn the_chr_bank_register_decides_which_8_kib_pattern_table_is_fetched() {
         let mut chr = [0u8; 16384];
-        for row in 0..8 {
-            chr[row] = 0xFF; // bank 0, tile 0 low plane: opaque, colour 1
-        }
+        chr[..8].fill(0xFF); // bank 0, tile 0 low plane: opaque, colour 1
         for bank in 0..2 {
             let mut p = Ppu::new();
             p.load_chr_rom(&chr);

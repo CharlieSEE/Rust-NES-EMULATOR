@@ -135,9 +135,7 @@ fn mask_for_name(name: &str) -> Option<u8> {
 fn parse_script(script: &str) -> Result<Vec<(u8, u32)>, String> {
     let names = "A, B, SELECT, START, UP, DOWN, LEFT, RIGHT, JUMP, RUN, FIRE or WAIT";
     if script.trim().is_empty() {
-        return Err(format!(
-            "--play needs at least one step, e.g. START,WAIT60,RIGHT120"
-        ));
+        return Err("--play needs at least one step, e.g. START,WAIT60,RIGHT120".to_string());
     }
     let mut steps = Vec::new();
     for token in script.split(',') {
