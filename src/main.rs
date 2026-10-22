@@ -12,6 +12,8 @@ mod launcher;
 #[cfg(test)]
 mod nestest_test;
 mod ppu;
+#[cfg(test)]
+mod ppu_rom_test;
 mod report;
 mod rom;
 

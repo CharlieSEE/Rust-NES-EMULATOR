@@ -307,9 +307,10 @@ impl Bus {
     /// `dma_stall` at the END of the copy, and `main` waits it out on
     /// `dma_busy()`; see the note there.
     ///
-    /// The copy goes in through the PPU's existing registers -- `$2003` to aim,
-    /// `$2004` to write and advance -- so no OAM API is added to the PPU, and
-    /// it ends with `oam_addr` back at 0 after wrapping, as on hardware.
+    /// The copy goes in through the PPU's existing registers -- `$2004` writes
+    /// at the current `$2003` address and advances -- so no OAM API is added to
+    /// the PPU. Starting at a nonzero address wraps and leaves `oam_addr` where
+    /// it started, as on hardware.
     ///
     /// Every source byte is read back through `cpu_read`, so a DMA out of
     /// `$20xx` samples PPU registers and one out of `$40xx` the APU window.
@@ -319,7 +320,6 @@ impl Bus {
         // be placed on a cycle, and a page of `$40` reads APU registers (which
         // `$4015` clears the frame IRQ flag on, as on hardware).
         self.instr_cycles = 0;
-        self.ppu.cpu_write(0x2003, 0);
         for offset in 0..256u16 {
             let byte = self.cpu_read(base + offset);
             self.ppu.cpu_write(0x2004, byte);
@@ -878,25 +878,37 @@ mod tests {
         );
     }
 
-    /// The copy goes in through `$2003`/`$2004`, so it lands at OAM byte 0
-    /// whatever `OAMADDR` was left at, and the wrap leaves `OAMADDR` at 0 -- so a
-    /// stale pointer cannot shear a sprite frame.
+    /// The copy starts at the current `OAMADDR` and wraps, as hardware does.
     #[test]
-    fn oam_dma_starts_at_oam_byte_zero_whatever_oamaddr_was() {
+    fn oam_dma_starts_at_oamaddr_and_wraps() {
         let mut b = Bus::new(blank_cart());
         for i in 0..256u16 {
             b.cpu_write(0x0300 + i, i as u8);
         }
-        b.cpu_write(0x2003, 0x40); // point OAMADDR into the middle of OAM
+        b.ppu.cpu_write(0x2003, 10);
         b.write_dma_from(0x0300);
-        let oam = b.oam();
-        assert_eq!(oam[0], 0x00, "source byte 0 went to OAM byte 0");
-        assert_eq!(oam[1], 0x01);
-        assert_eq!(oam[0x3F], 0x3F);
-        assert_eq!(
-            oam[0x40], 0x40,
-            "and the rest of the page followed it round"
-        );
+        // Read OAM back the slow way: one `$2003` per byte.
+        for i in 0..256usize {
+            b.ppu.cpu_write(0x2003, ((10 + i) & 0xFF) as u8);
+            assert_eq!(
+                b.ppu.cpu_read(0x2004),
+                i as u8,
+                "source byte {i} lands at OAM address {}",
+                (10 + i) & 0xFF
+            );
+        }
+    }
+
+    /// A full 256-byte copy advances `OAMADDR` all the way round, so it ends
+    /// where it started; `$4014` does not reset it to 0.
+    #[test]
+    fn oam_dma_leaves_oamaddr_alone() {
+        let mut b = Bus::new(blank_cart());
+        b.ppu.cpu_write(0x2003, 10);
+        b.write_dma_from(0x0300);
+        b.ppu.cpu_write(0x2004, 0xEE); // goes to byte 10 only if OAMADDR is 10
+        b.ppu.cpu_write(0x2003, 10);
+        assert_eq!(b.ppu.cpu_read(0x2004), 0xEE);
     }
 
     /// A DMA out of `$20xx` must read PPU registers, because every source byte
