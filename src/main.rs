@@ -1,3 +1,4 @@
+use sdl2::controller::Button;
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
 
@@ -8,7 +9,11 @@ mod bus;
 mod controller;
 mod cpu;
 mod launcher;
+#[cfg(test)]
+mod nestest_test;
 mod ppu;
+#[cfg(test)]
+mod ppu_rom_test;
 mod report;
 mod rom;
 
@@ -26,6 +31,12 @@ const SCALE: u32 = 3;
 /// frame including the odd-frame pre-render dot skip -- this constant is only
 /// the wall-clock half of the period.
 const FRAME_BUDGET: ::std::time::Duration = ::std::time::Duration::from_micros(16_667);
+
+/// How often a battery-backed cartridge's 8 KiB of PRG RAM is flushed to disk
+/// while the game runs. The process can be killed (the launcher's old drop path
+/// did exactly that), so waiting for a clean exit loses every save made since
+/// boot. Five seconds bounds that loss without making the disk the bottleneck.
+const SAVE_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_secs(5);
 
 /// Bytes one stereo frame of the mixer's `i16` output occupies.
 const AUDIO_FRAME_BYTES: u32 = 4;
@@ -74,11 +85,31 @@ fn button_for(key: Keycode) -> Option<u8> {
     BUTTONS.iter().find(|row| row.0 == key).map(|row| row.2)
 }
 
-/// Fold one SDL event into the held mask, returning whether the run continues.
-/// `false` quits. Out of `main` so the arms are reachable from a test: `Event`
-/// is a plain enum value, so a headless test can build a `FocusLost` without a
-/// window ever existing.
-fn apply_event(ev: Event, buttons: &mut u8) -> bool {
+/// The same eight bits from an SDL game controller. A is the bottom face
+/// button (jump in SMB), B is the right one (run/fire); the D-pad is the NES
+/// D-pad. Analogue sticks are deliberately not mapped: a d-pad is what the
+/// games were written for and what every controller reports.
+fn pad_bit(button: Button) -> Option<u8> {
+    match button {
+        Button::A => Some(0x01),
+        Button::B => Some(0x02),
+        Button::Back => Some(0x04),
+        Button::Start => Some(0x08),
+        Button::DPadUp => Some(0x10),
+        Button::DPadDown => Some(0x20),
+        Button::DPadLeft => Some(0x40),
+        Button::DPadRight => Some(0x80),
+        _ => None,
+    }
+}
+
+/// Fold one SDL event into the held masks, returning whether the run continues.
+/// `false` quits. Keyboard and gamepad are separate masks so releasing one
+/// source cannot clear a button the other still holds; the caller ORs them.
+/// Out of `main` so the arms are reachable from a test: `Event` is a plain enum
+/// value, so a headless test can build a `FocusLost` without a window ever
+/// existing.
+fn apply_event(ev: Event, keys: &mut u8, pad: &mut u8) -> bool {
     match ev {
         Event::Quit { .. } => false,
         Event::KeyDown {
@@ -89,7 +120,7 @@ fn apply_event(ev: Event, buttons: &mut u8) -> bool {
             keycode: Some(key), ..
         } => {
             if let Some(bit) = button_for(key) {
-                *buttons |= bit;
+                *keys |= bit;
             }
             true
         }
@@ -97,18 +128,31 @@ fn apply_event(ev: Event, buttons: &mut u8) -> bool {
             keycode: Some(key), ..
         } => {
             if let Some(bit) = button_for(key) {
-                *buttons &= !bit;
+                *keys &= !bit;
+            }
+            true
+        }
+        Event::ControllerButtonDown { button, .. } => {
+            if let Some(bit) = pad_bit(button) {
+                *pad |= bit;
+            }
+            true
+        }
+        Event::ControllerButtonUp { button, .. } => {
+            if let Some(bit) = pad_bit(button) {
+                *pad &= !bit;
             }
             true
         }
         // No KeyUp ever arrives for a key released while another window has the
         // focus, so alt-tabbing away holding Right would latch it on for good.
-        // Forget the whole mask instead.
+        // Forget both masks instead.
         Event::Window {
             win_event: WindowEvent::FocusLost,
             ..
         } => {
-            *buttons = 0;
+            *keys = 0;
+            *pad = 0;
             true
         }
         _ => true,
@@ -135,9 +179,7 @@ fn mask_for_name(name: &str) -> Option<u8> {
 fn parse_script(script: &str) -> Result<Vec<(u8, u32)>, String> {
     let names = "A, B, SELECT, START, UP, DOWN, LEFT, RIGHT, JUMP, RUN, FIRE or WAIT";
     if script.trim().is_empty() {
-        return Err(format!(
-            "--play needs at least one step, e.g. START,WAIT60,RIGHT120"
-        ));
+        return Err("--play needs at least one step, e.g. START,WAIT60,RIGHT120".to_string());
     }
     let mut steps = Vec::new();
     for token in script.split(',') {
@@ -372,6 +414,32 @@ fn run() -> Result<(), String> {
     bus.power_on();
     cpu.reset(&mut bus);
 
+    // Battery-backed PRG RAM (MMC1's Zelda save) lives next to the ROM. A
+    // missing file starts zeroed; any other read failure is reported rather
+    // than silently treated as a blank save and overwritten later.
+    let save_path = bus
+        .cart
+        .has_battery()
+        .then(|| ::std::path::Path::new(&rom_path).with_extension("sav"));
+    if let Some(path) = &save_path {
+        match ::std::fs::read(path) {
+            Ok(saved) => {
+                if saved.len() != bus.prg_ram().len() {
+                    report::log_error(&format!(
+                        "{}: save is {} bytes, expected {}; loading what is there",
+                        path.display(),
+                        saved.len(),
+                        bus.prg_ram().len()
+                    ));
+                }
+                bus.load_prg_ram(&saved);
+            }
+            Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => {}
+            Err(e) => report::log_error(&format!("cannot read {}: {e}", path.display())),
+        }
+    }
+    let mut last_save = ::std::time::Instant::now();
+
     if let Some(queue) = &audio {
         // The queue is opened with no allowed changes, so a device that cannot
         // do exactly this spec fails the open instead of renegotiating it; the
@@ -381,8 +449,26 @@ fn run() -> Result<(), String> {
     }
 
     let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
+    // Game controllers are optional and hot-pluggable. The handles must stay
+    // alive for their button events to keep arriving, so they live in `pads`
+    // for the whole run even though nothing reads the vec.
+    let controller_subsystem = sdl.game_controller().ok();
+    let mut pads = Vec::new();
+    if let Some(controllers) = &controller_subsystem {
+        for index in 0..controllers.num_joysticks().unwrap_or(0) {
+            if controllers.is_game_controller(index) {
+                if let Ok(gamepad) = controllers.open(index) {
+                    pads.push(gamepad);
+                }
+            }
+        }
+    }
     let mut play = script.map(Play::new);
-    let mut buttons = 0u8;
+    let mut keys = 0u8;
+    let mut pad = 0u8;
+    let mut paused = false;
+    let mut muted = false;
+    let mut fullscreen = false;
     let mut running = true;
     let mut frames = 0u32;
     while running {
@@ -390,59 +476,144 @@ fn run() -> Result<(), String> {
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
         for event in events.poll_iter() {
-            if !apply_event(event, &mut buttons) {
-                running = false;
-            }
-        }
-        // A script is not a second input path: it assigns the same mask a key
-        // press assigns, and it goes through the one `set_buttons` call below.
-        if let Some(script) = play.as_mut() {
-            match script.mask_for_next_frame() {
-                Some(mask) => buttons = mask,
-                // The script is over. Release what its last step held instead of
-                // emulating one more frame with it still down -- the frame that
-                // `running = false` still runs would be played with a key that
-                // the script already let go of.
-                None => {
-                    buttons = 0;
-                    running = false;
+            match event {
+                Event::KeyDown {
+                    keycode: Some(Keycode::P),
+                    repeat: false,
+                    ..
+                } => {
+                    paused = !paused;
+                    if let Some(queue) = &audio {
+                        if paused {
+                            queue.pause();
+                        } else if !muted {
+                            queue.resume();
+                        }
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::R),
+                    repeat: false,
+                    ..
+                } => {
+                    // RESET keeps RAM and the battery save; only the clock and
+                    // the APU restart.
+                    bus.reset();
+                    cpu.reset(&mut bus);
+                    if let Some(queue) = &audio {
+                        queue.clear();
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F11),
+                    repeat: false,
+                    ..
+                } => {
+                    fullscreen = !fullscreen;
+                    let mode = if fullscreen {
+                        sdl2::video::FullscreenType::Desktop
+                    } else {
+                        sdl2::video::FullscreenType::Off
+                    };
+                    canvas
+                        .window_mut()
+                        .set_fullscreen(mode)
+                        .map_err(|e| e.to_string())?;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::M),
+                    repeat: false,
+                    ..
+                } => {
+                    muted = !muted;
+                    if let Some(queue) = &audio {
+                        if muted {
+                            queue.pause();
+                            queue.clear();
+                        } else if !paused {
+                            queue.resume();
+                        }
+                    }
+                }
+                Event::ControllerDeviceAdded { which, .. } => {
+                    if let Some(controllers) = &controller_subsystem {
+                        if let Ok(gamepad) = controllers.open(which) {
+                            pads.push(gamepad);
+                        }
+                    }
+                }
+                other => {
+                    if !apply_event(other, &mut keys, &mut pad) {
+                        running = false;
+                    }
                 }
             }
         }
-        bus.controllers[0].set_buttons(buttons);
-        // Run the CPU until the PPU has a whole frame, taking the NMI the
-        // vblank flag raises and the APU's frame IRQ off its level line. SMB
-        // gates its status bar on a sprite-0 hit and its NMI handler on
-        // `$2002`, so this is where the machine actually lives.
-        bus.run_frame(&mut cpu);
-        if let Some(queue) = &audio {
-            let samples = bus.apu.take_samples();
-            if !samples.is_empty() {
-                // A queue past `AUDIO_MAX_QUEUED` is a stall being played back:
-                // drop this frame and let the device catch up to the picture
-                // rather than fall further behind it. A device that stops
-                // accepting samples must not stop the emulator either -- the
-                // picture is the primary output.
-                if queue.size() < AUDIO_MAX_QUEUED {
-                    let _ = queue.queue_audio(&samples);
+        // A paused machine keeps its frame on screen and its script on hold;
+        // time does not advance for either.
+        if !paused {
+            // A script is not a second input path: it assigns the same mask a
+            // key press assigns, and it goes through the one `set_buttons` call
+            // below.
+            let mut buttons = keys | pad;
+            if let Some(script) = play.as_mut() {
+                match script.mask_for_next_frame() {
+                    Some(mask) => buttons = mask,
+                    // The script is over. Release what its last step held instead
+                    // of emulating one more frame with it still down -- the frame
+                    // that `running = false` still runs would be played with a key
+                    // that the script already let go of.
+                    None => {
+                        buttons = 0;
+                        running = false;
+                    }
                 }
             }
+            bus.controllers[0].set_buttons(buttons);
+            // Run the CPU until the PPU has a whole frame, taking the NMI the
+            // vblank flag raises and the APU's frame IRQ off its level line. SMB
+            // gates its status bar on a sprite-0 hit and its NMI handler on
+            // `$2002`, so this is where the machine actually lives.
+            bus.run_frame(&mut cpu);
+            if let Some(queue) = &audio {
+                let samples = bus.apu.take_samples();
+                // Muted still drains the APU's queue, or the mix would grow
+                // without bound; the samples are simply not handed to the device.
+                if !muted && !samples.is_empty() {
+                    // A queue past `AUDIO_MAX_QUEUED` is a stall being played
+                    // back: drop this frame and let the device catch up to the
+                    // picture rather than fall further behind it. A device that
+                    // stops accepting samples must not stop the emulator either
+                    // -- the picture is the primary output.
+                    if queue.size() < AUDIO_MAX_QUEUED {
+                        let _ = queue.queue_audio(&samples);
+                    }
+                }
+            }
+            // `take_frame` is what clears the ready flag, and it is the ONLY thing
+            // that does -- without this the loop above exits once and never runs
+            // again. The upload reads the PPU's own buffer by reference; a frame
+            // is never copied.
+            bus.ppu.take_frame();
+            frames += 1;
+            if let Some(path) = &save_path {
+                if last_save.elapsed() >= SAVE_INTERVAL {
+                    if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+                        report::log_error(&e);
+                    }
+                    last_save = ::std::time::Instant::now();
+                }
+            }
+            if let Some(n) = dump_at.iter().find(|&&n| n == frames) {
+                write_ppm(&format!("frame-{n}.ppm"), bus.ppu.framebuffer())?;
+            }
+            if play.is_none() && dump_list_ends_run(&dump_at, frames) {
+                // With no script the dump list is the whole run, so the last
+                // frame named ends it.
+                break;
+            }
         }
-        // `take_frame` is what clears the ready flag, and it is the ONLY thing that
-        // does -- without this the loop above exits once and never runs again.
-        // The upload reads the PPU's own buffer by reference; a frame is never
-        // copied.
-        bus.ppu.take_frame();
         let frame = bus.ppu.framebuffer();
-        frames += 1;
-        if let Some(n) = dump_at.iter().find(|&&n| n == frames) {
-            write_ppm(&format!("frame-{n}.ppm"), frame)?;
-        }
-        if play.is_none() && dump_list_ends_run(&dump_at, frames) {
-            // With no script the dump list is the whole run, so the last frame
-            // named ends it.
-            return Ok(());
-        }
         // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
         // all len*4 bytes of the frame are valid to read as u8.
         let frame_bytes =
@@ -456,10 +627,23 @@ fn run() -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         canvas.present();
         // With a device, its queue sets the pace; without one, the wall-clock
-        // budget does. Either way the emulation is untouched by the wait.
-        match &audio {
-            Some(queue) => ::std::thread::sleep(audio_sleep(queue.size())),
-            None => ::std::thread::sleep(frame_sleep(frame_start.elapsed())),
+        // budget does. Either way the emulation is untouched by the wait. A
+        // paused or muted run has no queue to follow, so it falls back to the
+        // wall clock and keeps the window responsive.
+        if paused {
+            ::std::thread::sleep(FRAME_BUDGET);
+        } else {
+            match &audio {
+                Some(queue) if !muted => ::std::thread::sleep(audio_sleep(queue.size())),
+                _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed())),
+            }
+        }
+    }
+    // A battery save is only useful if the process gets to exit normally, so
+    // write it before the dump report can return an error.
+    if let Some(path) = &save_path {
+        if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+            report::log_error(&e);
         }
     }
     // The run stopped early -- the script ran out, or the user quit -- so any
@@ -473,6 +657,21 @@ fn run() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Flush battery-backed PRG RAM without ever leaving a half-written `.sav` in
+/// place. The bytes go to a sibling temp file, are synced, and only then replace
+/// the save by rename; a crash or a kill during the write leaves the previous
+/// save intact.
+fn write_battery_save(path: &::std::path::Path, ram: &[u8]) -> Result<(), String> {
+    let temp = path.with_extension("sav.tmp");
+    let write = (|| {
+        let mut file = ::std::fs::File::create(&temp)?;
+        ::std::io::Write::write_all(&mut file, ram)?;
+        file.sync_all()?;
+        ::std::fs::rename(&temp, path)
+    })();
+    write.map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// One framebuffer pixel is `0x00RRGGBB` (see `Ppu::colour`), and binary PPM
@@ -494,12 +693,30 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         apply_event, audio_sleep, button_for, dump_list_ends_run, frame_sleep, mask_for_name,
-        missed_dumps, parse_script, Play, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
-        FRAME_BUDGET,
+        missed_dumps, parse_script, write_battery_save, Play, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        AUDIO_TARGET, FRAME_BUDGET,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::Keycode;
     use std::time::Duration;
+
+    #[test]
+    fn a_battery_save_replaces_the_old_file_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("nes-save-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("game.sav");
+        std::fs::write(&path, b"old save").expect("seed save");
+
+        let ram = [0x5Au8; 8192];
+        write_battery_save(&path, &ram).expect("save must be written");
+
+        assert_eq!(std::fs::read(&path).unwrap(), ram, "the new save landed");
+        assert!(
+            !path.with_extension("sav.tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     #[test]
     fn a_script_is_a_list_of_mask_and_frame_pairs() {
@@ -787,18 +1004,19 @@ mod tests {
     /// no X server -- it needed the handler extracted from `main` to be
     /// reachable at all, not a real alt-tab.
     #[test]
-    fn a_focus_loss_clears_the_held_mask() {
-        let mut buttons = 0xFF;
+    fn a_focus_loss_clears_the_held_masks() {
+        let mut keys = 0xFF;
+        let mut pad = 0xFF;
         let lost = Event::Window {
             timestamp: 0,
             window_id: 0,
             win_event: WindowEvent::FocusLost,
         };
         assert!(
-            apply_event(lost, &mut buttons),
+            apply_event(lost, &mut keys, &mut pad),
             "losing focus is not a quit"
         );
-        assert_eq!(buttons, 0, "every held bit must be forgotten");
+        assert_eq!((keys, pad), (0, 0), "every held bit must be forgotten");
     }
 
     #[test]
@@ -819,29 +1037,74 @@ mod tests {
             keymod: sdl2::keyboard::Mod::empty(),
             repeat: false,
         };
-        let mut buttons = 0u8;
+        let mut keys = 0u8;
+        let mut pad = 0u8;
         for key in [Keycode::Z, Keycode::Right, Keycode::Return] {
-            assert!(apply_event(down(key), &mut buttons), "{key:?} down");
+            assert!(apply_event(down(key), &mut keys, &mut pad), "{key:?} down");
         }
-        assert_eq!(buttons, 0x01 | 0x80 | 0x08, "Z, Right and Return held");
-        assert!(apply_event(up(Keycode::Right), &mut buttons), "Right up");
+        assert_eq!(keys, 0x01 | 0x80 | 0x08, "Z, Right and Return held");
+        assert!(
+            apply_event(up(Keycode::Right), &mut keys, &mut pad),
+            "Right up"
+        );
         assert_eq!(
-            buttons,
+            keys,
             0x01 | 0x08,
             "only Right's bit goes; Z and Return are still down"
         );
         // Escape quits, a key with no bit does nothing, and both still say the
         // run continues.
         assert!(
-            !apply_event(down(Keycode::Escape), &mut buttons),
+            !apply_event(down(Keycode::Escape), &mut keys, &mut pad),
             "Escape ends the run"
         );
-        let before = buttons;
+        let before = keys;
         assert!(
-            apply_event(down(Keycode::F5), &mut buttons),
+            apply_event(down(Keycode::F5), &mut keys, &mut pad),
             "F5 is not a quit"
         );
-        assert_eq!(buttons, before, "F5 is not on the pad");
+        assert_eq!(keys, before, "F5 is not on the pad");
+    }
+
+    /// Keyboard and gamepad are separate masks so releasing one source cannot
+    /// release a button the other still holds.
+    #[test]
+    fn keyboard_and_gamepad_hold_the_same_bits_independently() {
+        let key_down = Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(Keycode::Z),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat: false,
+        };
+        let key_up = Event::KeyUp {
+            timestamp: 1,
+            window_id: 0,
+            keycode: Some(Keycode::Z),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat: false,
+        };
+        let pad_down = Event::ControllerButtonDown {
+            timestamp: 2,
+            which: 0,
+            button: sdl2::controller::Button::A,
+        };
+        let pad_up = Event::ControllerButtonUp {
+            timestamp: 3,
+            which: 0,
+            button: sdl2::controller::Button::A,
+        };
+        let mut keys = 0u8;
+        let mut pad = 0u8;
+        apply_event(key_down, &mut keys, &mut pad);
+        apply_event(pad_down, &mut keys, &mut pad);
+        assert_eq!((keys, pad), (0x01, 0x01), "Z and pad A both hold A");
+        apply_event(key_up, &mut keys, &mut pad);
+        assert_eq!((keys, pad), (0x00, 0x01), "pad A keeps A held");
+        apply_event(pad_up, &mut keys, &mut pad);
+        assert_eq!((keys, pad), (0x00, 0x00));
     }
 
     /// A dump frame past the end of the run is written nowhere and reported

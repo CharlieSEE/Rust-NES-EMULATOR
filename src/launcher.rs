@@ -316,9 +316,21 @@ fn to_logical_y(canvas: &Canvas<Window>, x: i32, y: i32) -> Option<usize> {
 
 /// Re-read a folder, keeping the current list when the read fails. A folder
 /// that was removed or chmod-ed under the launcher must not close it too.
-fn refresh(dir: &Path, list: &mut List) {
+/// The selection follows the same ROM across the re-read, so returning from a
+/// game leaves the cursor where it was instead of jumping to the top.
+fn refresh(dir: &Path, list: &mut List, visible: usize) {
     match scan(dir) {
-        Ok(roms) => list.reset(roms),
+        Ok(roms) => {
+            let selected = list.roms.get(list.selected).cloned();
+            let scroll = list.scroll;
+            list.reset(roms);
+            if let Some(path) = selected {
+                if let Some(index) = list.roms.iter().position(|rom| *rom == path) {
+                    list.selected = index;
+                    list.scroll = keep_visible(index, scroll, visible, list.roms.len());
+                }
+            }
+        }
         Err(e) => log_error(&format!("launcher: {e}")),
     }
 }
@@ -341,13 +353,52 @@ struct Game {
     stderr: Option<std::thread::JoinHandle<String>>,
 }
 
-/// Killing on drop ties the game's life to the launcher's: closing the
+/// Ask a running game to quit. SDL installs a SIGTERM handler that turns the
+/// signal into a quit event, so the game leaves its frame loop normally and
+/// flushes the battery save. SIGKILL, which `Child::kill` sends, skips all of
+/// that.
+#[cfg(unix)]
+fn request_stop(child: &Child) {
+    // SAFETY: `kill` only reads the pid and signal number; an already-reaped
+    // pid just returns ESRCH, which the caller's fallback handles.
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+}
+
+#[cfg(not(unix))]
+fn request_stop(_: &Child) {}
+
+/// Wait up to `timeout` for the child to exit. Returns whether it did; a child
+/// that already exited is reaped here and still counts.
+fn wait_for_exit(child: &mut Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Stopping on drop ties the game's life to the launcher's: closing the
 /// launcher stops the emulator instead of leaving it running with no window
-/// to return to.
+/// to return to. Give it a grace period to save first, then kill it.
 impl Drop for Game {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // `run` may already have reaped this child. Do not signal a pid that
+        // has exited: the OS could have handed it to an unrelated process.
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        request_stop(&self.child);
+        if !wait_for_exit(&mut self.child, std::time::Duration::from_secs(2)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 
@@ -477,9 +528,9 @@ pub fn run() -> Result<(), String> {
             dirty = true;
             if games.is_empty() {
                 // Back to a list with nothing behind it. Raising it over a
-                // game that is still running would steal that game's screen,
-                // and resetting the list would lose the selection.
-                refresh(&dir, &mut list);
+                // game that is still running would steal that game's screen.
+                // Refreshing keeps the cursor on the ROM that just exited.
+                refresh(&dir, &mut list, visible);
                 canvas.window_mut().raise();
             }
         }
@@ -603,6 +654,27 @@ mod tests {
         elide, is_rom, keep_visible, read_saved, row_at, visible_rows, List, CELL, LIST_TOP,
     };
     use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_child_exits_within_the_grace_period() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a long-running child");
+        super::request_stop(&child);
+        let stopped = super::wait_for_exit(&mut child, Duration::from_secs(2));
+        if !stopped {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert!(
+            stopped,
+            "SIGTERM must end the child, not leave it for SIGKILL"
+        );
+    }
 
     #[test]
     fn only_nes_files_are_roms_whatever_their_case() {
@@ -702,6 +774,41 @@ mod tests {
             assert!(list.selected < list.scroll + visible);
         }
         assert_eq!(list.selected, 0, "stops at the first entry");
+    }
+
+    #[test]
+    fn returning_from_a_game_keeps_the_cursor_on_that_rom() {
+        let dir = std::env::temp_dir().join(format!("nes-launcher-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..30 {
+            std::fs::write(dir.join(format!("rom-{n:02}.nes")), b"").unwrap();
+        }
+
+        let mut list = List::new(super::scan(&dir).unwrap());
+        let visible = visible_rows();
+        for _ in 0..25 {
+            list.move_by(1, visible);
+        }
+        assert_eq!(list.selected, 25);
+        assert_eq!(list.scroll, 4, "scrolled down while picking");
+
+        super::refresh(&dir, &mut list, visible);
+        assert_eq!(
+            list.roms[list.selected].file_name().unwrap(),
+            "rom-25.nes",
+            "the re-read must not move the cursor to the top"
+        );
+        assert_eq!(list.scroll, 4, "and must not move the window either");
+
+        // A file disappearing above the selection shifts its index; the same
+        // ROM must stay selected.
+        std::fs::remove_file(dir.join("rom-00.nes")).unwrap();
+        super::refresh(&dir, &mut list, visible);
+        assert_eq!(list.roms[list.selected].file_name().unwrap(), "rom-25.nes");
+        assert!(list.selected >= list.scroll && list.selected < list.scroll + visible);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

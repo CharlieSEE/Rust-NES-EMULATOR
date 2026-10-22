@@ -13,5 +13,10 @@ rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # dependency instead of SDL2_ttf plus a font file to find at runtime.
 font8x8 = "0.3"
 
+# The launcher asks the game to quit with SIGTERM before falling back to
+# SIGKILL, so the game's battery save gets its final flush.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3

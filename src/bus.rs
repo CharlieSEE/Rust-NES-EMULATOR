@@ -98,9 +98,8 @@ impl Bus {
         // that carries no CHR bytes at all gets RAM instead, which is what
         // blargg's 2005 suite uploads its tiles into.
         bus.ppu.load_chr_rom(bus.cart.chr_rom());
-        if bus.cart.chr_is_ram() {
-            bus.ppu.use_chr_ram();
-        }
+        bus.ppu.set_chr_map(bus.cart.chr_map());
+        bus.ppu.set_mirroring(bus.cart.mirroring());
         bus
     }
 
@@ -132,9 +131,8 @@ impl Bus {
     /// The RESET button: both RAMs keep their contents -- hardware does not
     /// clear RAM on reset, and apu_reset's `4015_cleared` ROM measures exactly
     /// that a `$4015` write survives one -- while the cycle count restarts at
-    /// an even cycle like power-on's. The player does not expose a reset key
-    /// yet; the `apu_reset` harness is what drives it.
-    #[allow(dead_code)]
+    /// an even cycle like power-on's. The player's `R` key and the `apu_reset`
+    /// harness both drive it.
     pub fn reset(&mut self) {
         self.clear_clock();
         self.apu.reset();
@@ -182,8 +180,10 @@ impl Bus {
             0x4017 => self.controllers[1].read(),
             // The cartridge may populate this window with PRG RAM. Both NROM
             // test images do -- blargg's ROMs report their results here -- and
-            // mappers 2 and 66 map nothing below `$8000`, so it is open bus.
-            0x6000..=0x7FFF if self.cart.has_prg_ram() => self.prg_ram[addr as usize - 0x6000],
+            // MMC1 exposes its battery save here. MMC1's PRG register can
+            // disable the window; the SMB and Contra boards map nothing below
+            // `$8000`, so for them it is open bus.
+            0x6000..=0x7FFF if self.cart.prg_ram_enabled() => self.prg_ram[addr as usize - 0x6000],
             // Mappers 2 and 66 map nothing below $8000: no PRG RAM, no
             // registers, so `$4020-$7FFF` is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
@@ -213,15 +213,16 @@ impl Bus {
                 }
             }
             // `$4020-$7FFF` is the mappers' unmapped window and drops.
-            0x6000..=0x7FFF if self.cart.has_prg_ram() => {
+            0x6000..=0x7FFF if self.cart.prg_ram_enabled() => {
                 self.prg_ram[addr as usize - 0x6000] = val;
             }
             0x8000..=0xFFFF => {
                 self.cart.cpu_write(addr, val);
-                // On GxROM the CHR bank is bits 1-0 of the same register the
-                // PRG bank is, so it moves on writes the PPU cares about too.
-                // UxROM has no CHR bank register and reports 0.
-                self.ppu.set_chr_bank(self.cart.chr_bank());
+                // MMC1 can change CHR banking and mirroring in a write, and
+                // GxROM's CHR bits live in the PRG register. Push whatever the
+                // mapper now reports on every write.
+                self.ppu.set_chr_map(self.cart.chr_map());
+                self.ppu.set_mirroring(self.cart.mirroring());
             }
             _ => {}
         }
@@ -231,6 +232,19 @@ impl Bus {
     /// an instruction. `tick` is what drains it.
     pub fn dma_busy(&self) -> bool {
         self.dma_stall > 0
+    }
+
+    /// The 8 KiB at `$6000-$7FFF`, for a battery-backed cartridge to write to
+    /// disk on exit.
+    pub fn prg_ram(&self) -> &[u8] {
+        &self.prg_ram
+    }
+
+    /// Restore a battery save. A save file of the wrong length keeps whatever
+    /// bytes it carries and leaves the rest zeroed.
+    pub fn load_prg_ram(&mut self, data: &[u8]) {
+        let n = data.len().min(self.prg_ram.len());
+        self.prg_ram[..n].copy_from_slice(&data[..n]);
     }
 
     /// Advance the PPU by **one dot** (and the APU once the dots make a whole
@@ -289,9 +303,10 @@ impl Bus {
     /// `dma_stall` at the END of the copy, and `main` waits it out on
     /// `dma_busy()`; see the note there.
     ///
-    /// The copy goes in through the PPU's existing registers -- `$2003` to aim,
-    /// `$2004` to write and advance -- so no OAM API is added to the PPU, and
-    /// it ends with `oam_addr` back at 0 after wrapping, as on hardware.
+    /// The copy goes in through the PPU's existing registers -- `$2004` writes
+    /// at the current `$2003` address and advances -- so no OAM API is added to
+    /// the PPU. Starting at a nonzero address wraps and leaves `oam_addr` where
+    /// it started, as on hardware.
     ///
     /// Every source byte is read back through `cpu_read`, so a DMA out of
     /// `$20xx` samples PPU registers and one out of `$40xx` the APU window.
@@ -301,7 +316,6 @@ impl Bus {
         // be placed on a cycle, and a page of `$40` reads APU registers (which
         // `$4015` clears the frame IRQ flag on, as on hardware).
         self.instr_cycles = 0;
-        self.ppu.cpu_write(0x2003, 0);
         for offset in 0..256u16 {
             let byte = self.cpu_read(base + offset);
             self.ppu.cpu_write(0x2004, byte);
@@ -342,11 +356,11 @@ mod tests {
     const POWER_ON_BANK: usize = 0;
 
     /// The GxROM header this suite keeps wanting: mapper 66, vertical
-    /// mirroring, 64 KiB PRG (two 32 KiB windows) and 2x8 KiB of CHR ROM --
-    /// 16 KiB of real tile data in the file, banked by register bits 1-0.
+    /// mirroring and 64 KiB PRG (two 32 KiB windows). These CPU tests never
+    /// fetch patterns, so the image carries no CHR bytes and the PPU gets RAM.
     /// `h[4]` is in 16 KiB units, which is why four of them is 64 KiB.
     fn ines_header() -> [u8; 16] {
-        crate::rom::ines_header(4, 2, 66)
+        crate::rom::ines_header(4, 0, 66)
     }
 
     /// A cartridge whose power-on bank holds `code` at `$8000` and whose RESET
@@ -573,10 +587,10 @@ mod tests {
         // The first frame is ~27510 cycles: short of the 29831-cycle step, and
         // a three-times-too-fast APU would already have fired.
         b.run_frame(&mut cpu);
-        let _ = b.ppu.take_frame();
+        b.ppu.take_frame();
         assert_eq!(b.cpu_read(0x0000), 0, "no IRQ before the frame step");
         b.run_frame(&mut cpu);
-        let _ = b.ppu.take_frame();
+        b.ppu.take_frame();
         assert!(
             b.cpu_read(0x0000) >= 1,
             "the frame IRQ must reach the handler at $FFFE"
@@ -593,7 +607,7 @@ mod tests {
         b.cpu_write(0x4017, 0x00);
         for _ in 0..3 {
             b.run_frame(&mut cpu);
-            let _ = b.ppu.take_frame();
+            b.ppu.take_frame();
         }
         assert_eq!(
             b.cpu_read(0x0000),
@@ -856,25 +870,37 @@ mod tests {
         );
     }
 
-    /// The copy goes in through `$2003`/`$2004`, so it lands at OAM byte 0
-    /// whatever `OAMADDR` was left at, and the wrap leaves `OAMADDR` at 0 -- so a
-    /// stale pointer cannot shear a sprite frame.
+    /// The copy starts at the current `OAMADDR` and wraps, as hardware does.
     #[test]
-    fn oam_dma_starts_at_oam_byte_zero_whatever_oamaddr_was() {
+    fn oam_dma_starts_at_oamaddr_and_wraps() {
         let mut b = Bus::new(blank_cart());
         for i in 0..256u16 {
             b.cpu_write(0x0300 + i, i as u8);
         }
-        b.cpu_write(0x2003, 0x40); // point OAMADDR into the middle of OAM
+        b.ppu.cpu_write(0x2003, 10);
         b.write_dma_from(0x0300);
-        let oam = b.oam();
-        assert_eq!(oam[0], 0x00, "source byte 0 went to OAM byte 0");
-        assert_eq!(oam[1], 0x01);
-        assert_eq!(oam[0x3F], 0x3F);
-        assert_eq!(
-            oam[0x40], 0x40,
-            "and the rest of the page followed it round"
-        );
+        // Read OAM back the slow way: one `$2003` per byte.
+        for i in 0..256usize {
+            b.ppu.cpu_write(0x2003, ((10 + i) & 0xFF) as u8);
+            assert_eq!(
+                b.ppu.cpu_read(0x2004),
+                i as u8,
+                "source byte {i} lands at OAM address {}",
+                (10 + i) & 0xFF
+            );
+        }
+    }
+
+    /// A full 256-byte copy advances `OAMADDR` all the way round, so it ends
+    /// where it started; `$4014` does not reset it to 0.
+    #[test]
+    fn oam_dma_leaves_oamaddr_alone() {
+        let mut b = Bus::new(blank_cart());
+        b.ppu.cpu_write(0x2003, 10);
+        b.write_dma_from(0x0300);
+        b.ppu.cpu_write(0x2004, 0xEE); // goes to byte 10 only if OAMADDR is 10
+        b.ppu.cpu_write(0x2003, 10);
+        assert_eq!(b.ppu.cpu_read(0x2004), 0xEE);
     }
 
     /// A DMA out of `$20xx` must read PPU registers, because every source byte

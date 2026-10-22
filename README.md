@@ -1,8 +1,8 @@
 # NES Emulator in Rust
 
 A from-scratch NES emulator. It boots a real cartridge image and plays
-**Super Mario Bros.** and **Contra** with picture, sound, and keyboard
-controls.
+**Super Mario Bros.**, **Contra** and **The Legend of Zelda** with picture,
+sound, and keyboard controls.
 
 One binary. Run it with no arguments for a small ROM launcher, or point it
 straight at a `.nes` file. The launcher's only setting, its last folder, lives
@@ -32,6 +32,7 @@ Point the emulator at a `.nes` file:
 ```sh
 cargo run --release -- "Super Mario Bros. + Duck Hunt (USA).nes"
 cargo run --release -- "Contra (USA).nes"
+cargo run --release -- "Legend of Zelda, The (Europe) (Rev 1).nes"
 ```
 
 Or run the built binary directly:
@@ -73,18 +74,26 @@ repository.
 | B | `X` |
 | Select | `Right Shift` |
 | Start | `Enter` |
+| Pause | `P` |
+| Reset | `R` |
+| Fullscreen | `F11` |
+| Mute | `M` |
 | Quit | `Esc` |
 
-One player, standard controller only. The Zapper is not emulated, so the Duck
-Hunt half of the cartridge runs but cannot be aimed.
+An SDL2 game controller works too: its D-pad, A, B, Back and Start map to the
+same buttons (A is the bottom face button, B the right one). One player,
+standard controller only. The Zapper is not emulated, so the Duck Hunt half of
+the cartridge runs but cannot be aimed.
 
 ## What runs
 
 - **Super Mario Bros.** — playable, with music and sound effects.
 - **Contra** — playable on mapper 2 (UxROM).
-- iNES **mapper 0 (NROM)**, **mapper 2 (UxROM)** and **mapper 66** (the
-  SMB/Duck Hunt board) are supported. Most other games will not boot and will
-  exit with a mapper error.
+- **The Legend of Zelda** — playable on mapper 1 (MMC1); progress is saved to
+  a `.sav` file beside the ROM periodically while playing and on exit.
+- iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)** and
+  **mapper 66** (the SMB/Duck Hunt board) are supported. Most other games will
+  not boot and will exit with a mapper error.
 - No save states, rewind, cheats, PAL support, or DMC audio channel.
 
 ## For tinkerers

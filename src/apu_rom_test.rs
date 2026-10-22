@@ -30,7 +30,7 @@ pub struct Machine {
 }
 
 impl Machine {
-    fn boot(bytes: &[u8]) -> Machine {
+    pub(crate) fn boot(bytes: &[u8]) -> Machine {
         let mut bus = Bus::new(Cartridge::load(bytes).expect("test ROM must load"));
         let mut cpu = Cpu::new();
         bus.power_on();
@@ -40,7 +40,7 @@ impl Machine {
 
     /// One whole frame, with the frame-ready flag drained so the next call
     /// runs the next frame.
-    fn frame(&mut self) {
+    pub(crate) fn frame(&mut self) {
         self.bus.run_frame(&mut self.cpu);
         self.bus.ppu.take_frame();
     }
@@ -90,7 +90,7 @@ fn smb_runs_sixty_frames_with_the_frame_irq_flag_up() {
 
 /// blargg's audible result code: he beeps the code, so a passing 2005 ROM
 /// (code 1) beeps exactly once.
-fn beep_count(samples: &[i16]) -> usize {
+pub(crate) fn beep_count(samples: &[i16]) -> usize {
     /// 10 ms of stereo samples at 48 kHz. `Machine` always mixes at 48 kHz.
     const BLOCK: usize = 480 * 2;
     /// Out of `i16`'s 32767: a pulse channel at volume 15 alone peaks near 4900.
