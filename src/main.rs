@@ -9,6 +9,7 @@ mod controller;
 mod cpu;
 mod launcher;
 mod ppu;
+mod report;
 mod rom;
 
 use bus::Bus;
@@ -269,7 +270,17 @@ fn missed_dumps(dump_at: &[u32], frames: u32) -> Vec<u32> {
     missed
 }
 
-fn main() -> Result<(), String> {
+/// Every failure ends here: logged beside the executable and shown in a
+/// message box, because a desktop launch has no terminal to read.
+fn main() {
+    report::install_panic_hook();
+    if let Err(e) = run() {
+        report::report(&e);
+        ::std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
     let mut args = ::std::env::args().skip(1);
     // No ROM named is the launcher: a desktop icon and a bare `nes` both land
     // here, and the launcher starts this same executable with a ROM when one
@@ -334,8 +345,10 @@ fn main() -> Result<(), String> {
         // Resizable is what gives the window manager a maximize button to grey
         // out otherwise. The canvas keeps the 256x240 logical size, so SDL
         // scales the frame into whatever window the WM makes and letterboxes
-        // the rest.
+        // the rest. Starting maximized is the same scaling on the first frame,
+        // with no lost screen on a desktop that has plenty.
         .resizable()
+        .maximized()
         .build()
         .map_err(|e| e.to_string())?;
     let mut canvas = window.into_canvas().build().map_err(|e| e.to_string())?;
@@ -454,10 +467,10 @@ fn main() -> Result<(), String> {
     // exit code 0 is indistinguishable from a frozen game.
     let missed = missed_dumps(&dump_at, frames);
     if !missed.is_empty() {
-        eprintln!(
+        report::log_error(&format!(
             "--dump asked for frame{} {missed:?} but the run only reached frame {frames}",
             if missed.len() == 1 { "" } else { "s" },
-        );
+        ));
     }
     Ok(())
 }
