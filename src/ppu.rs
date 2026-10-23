@@ -397,7 +397,8 @@ impl Ppu {
     pub fn tick(&mut self) {
         let pre_render = self.pre_render();
         // "The VBlank flag of the PPU is set at tick 1 (the second tick) of
-        // scanline 241" and cleared 6820 dots later, at 261.1.
+        // scanline 241" and cleared 20 scanlines later, at dot 1 of the
+        // pre-render line (261 on NTSC, 311 on PAL).
         if self.scanline == VBLANK_FIRST && self.dot == 1 {
             self.status |= 0x80;
             self.frame_done = true;

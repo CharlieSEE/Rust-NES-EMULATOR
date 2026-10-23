@@ -143,19 +143,22 @@ impl Cartridge {
         // plain iNES header only has flags 9 bit 0 and flags 10 bits 0-1, and
         // those bytes are padding in every other header variant -- including
         // the "DiskDude!" corruption, whose 's' in flags 9 would otherwise
-        // claim PAL. Only read them when flags 7 says plain iNES.
+        // claim PAL. NESdev's detection requires flags 7 bits 2-3 clear AND
+        // bytes 12-15 zero before iNES fields are trusted; a ripper signature
+        // in the tail can leave anything in flags 9/10.
         //
         // ponytail: Dendy and multiple-region fall back to NTSC. Both are a
         // mixed clock this emulator has no model for; add a Region variant
         // when a Dendy game turns up.
         let flags7 = bytes[7];
         let nes20 = flags7 & 0x0C == 0x08;
+        let plain_ines = flags7 & 0x0C == 0x00 && bytes[12..16] == [0; 4];
         let region = if nes20 {
             match bytes[12] & 0x03 {
                 1 => Region::Pal,
                 _ => Region::Ntsc,
             }
-        } else if flags7 & 0x0C == 0x00 && (bytes[9] & 0x01 != 0 || bytes[10] & 0x03 == 0x02) {
+        } else if plain_ines && (bytes[9] & 0x01 != 0 || bytes[10] & 0x03 == 0x02) {
             Region::Pal
         } else {
             Region::Ntsc
@@ -858,6 +861,18 @@ mod tests {
             load(junk).region(),
             Region::Ntsc,
             "reserved flags 7 bits do not claim PAL"
+        );
+
+        // NESdev's iNES detection also requires bytes 12-15 to be zero. A
+        // ripper signature there can leave garbage in flags 9/10, so those
+        // bytes must not select the region.
+        let mut signature = ines_header(1, 0, 0);
+        signature[9] = 0x01;
+        signature[12..].copy_from_slice(b"JUNK");
+        assert_eq!(
+            load(signature).region(),
+            Region::Ntsc,
+            "a signed header is not plain iNES"
         );
     }
 
