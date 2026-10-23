@@ -86,13 +86,9 @@ pub struct Bus {
     /// so it is extra time rather than part of the instruction's own cycles.
     dmc_dma: Option<DmcDma>,
     dmc_stall: u16,
-    /// True only on the CPU cycle a DMC request started its halt. A controller
-    /// read conflicts when the halt starts on the instruction's last cycle; a
-    /// DMA already in its dummy cycle does not.
-    dmc_halt_started: bool,
-    /// Extra controller clocks caused by a DMC DMA landing on this
-    /// instruction's last cycle, computed by `apu_advance_ahead`.
-    dmc_controller_extra: u8,
+    /// Whether a DMC DMA landing on this instruction's last cycle adds an
+    /// extra controller clock, computed by `apu_advance_ahead`.
+    dmc_controller_extra: bool,
     /// True between `instruction_cycles(n)` and `instruction_cycles(0)`, even
     /// while an OAM DMA has temporarily zeroed `instr_cycles`.
     in_instruction: bool,
@@ -131,8 +127,7 @@ impl Bus {
             dma_stall: 0,
             dmc_dma: None,
             dmc_stall: 0,
-            dmc_halt_started: false,
-            dmc_controller_extra: 0,
+            dmc_controller_extra: false,
             in_instruction: false,
             apu_skip: 0,
             instr_cycles: 0,
@@ -171,8 +166,7 @@ impl Bus {
         self.dma_stall = 0;
         self.dmc_dma = None;
         self.dmc_stall = 0;
-        self.dmc_halt_started = false;
-        self.dmc_controller_extra = 0;
+        self.dmc_controller_extra = false;
         self.in_instruction = false;
         self.apu_skip = 0;
         self.instr_cycles = 0;
@@ -220,15 +214,15 @@ impl Bus {
         let last = cycles.saturating_sub(1);
         for cycle in 0..cycles {
             self.apu.tick();
-            self.dmc_cycle();
-            if cycle == last && self.dmc_halt_started {
+            let halt_started = self.dmc_cycle();
+            if cycle == last && halt_started {
                 // A halted CPU repeats the same read on every no-op cycle,
                 // but a standard controller clocks once per contiguous set of
                 // reads: the no-op block is one set and the resumed read after
                 // the DMA get is another. So a conflict deletes one bit, not
                 // one per cycle. Only a halt that starts on this last cycle
                 // conflicts; a DMA already in its dummy cycle does not.
-                self.dmc_controller_extra = 1;
+                self.dmc_controller_extra = true;
             }
         }
         self.apu_skip = cycles;
@@ -245,13 +239,9 @@ impl Bus {
         }
         // The 2A07 has no DPCM/joypad conflict; only the NTSC 2A03 repeats
         // the read.
-        let extra = if self.region == Region::Ntsc {
-            self.dmc_controller_extra
-        } else {
-            0
-        };
+        let extra = self.region == Region::Ntsc && self.dmc_controller_extra;
         let mut value = self.controllers[port].read();
-        for _ in 0..extra {
+        if extra {
             value = self.controllers[port].read();
         }
         value
@@ -329,8 +319,8 @@ impl Bus {
     /// ponytail: the CPU is atomic per instruction, so the halt is charged
     /// after the instruction retires. Controller reads get the extra clock;
     /// a halt retry on a write cycle is not modeled.
-    fn dmc_cycle(&mut self) {
-        self.dmc_halt_started = false;
+    fn dmc_cycle(&mut self) -> bool {
+        let mut halt_started = false;
         if self.dmc_dma.is_none() {
             if let Some(req) = self.apu.take_dmc_fetch() {
                 let cost = if self.dma_stall > 0 {
@@ -356,7 +346,7 @@ impl Bus {
                     cycles_left: cost,
                 });
                 self.dmc_stall += cost as u16;
-                self.dmc_halt_started = true;
+                halt_started = true;
             }
         }
         if let Some(mut dma) = self.dmc_dma {
@@ -369,6 +359,7 @@ impl Bus {
                 self.dmc_dma = Some(dma);
             }
         }
+        halt_started
     }
 
     /// Whether a DMA is mid-stall, i.e. whether the CPU must not execute an
@@ -501,7 +492,7 @@ impl BusLike for Bus {
 
     fn instruction_cycles(&mut self, cycles: u8) {
         self.instr_cycles = cycles;
-        self.dmc_controller_extra = 0;
+        self.dmc_controller_extra = false;
         self.in_instruction = cycles != 0;
     }
 }
@@ -1254,7 +1245,7 @@ mod tests {
         b.cpu_write(0x4016, 1);
         b.cpu_write(0x4016, 0);
         b.instruction_cycles(4);
-        b.dmc_controller_extra = 1;
+        b.dmc_controller_extra = true;
 
         let got = b.cpu_read(0x4016);
         assert_eq!(
@@ -1333,7 +1324,7 @@ mod tests {
         b.cpu_write(0x4016, 1);
         b.cpu_write(0x4016, 0);
         b.instruction_cycles(4);
-        b.dmc_controller_extra = 1;
+        b.dmc_controller_extra = true;
 
         let got = b.cpu_read(0x4016);
         assert_eq!(

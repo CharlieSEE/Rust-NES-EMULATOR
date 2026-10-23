@@ -752,9 +752,6 @@ impl Dmc {
     fn for_region(region: Region) -> Dmc {
         let mut dmc = Dmc {
             region,
-            rate: 0,
-            timer: dmc_periods(region)[0] / 2 - 1,
-            fetch_kind: DmcFetchKind::Load,
             ..Dmc::default()
         };
         dmc.set_rate(0);
@@ -812,6 +809,17 @@ impl Dmc {
         self.sample_len = (val as u16) * 16 + 1;
     }
 
+    /// Whether the reader may start a fetch: enabled, bytes remain, the buffer
+    /// is empty, and no request is scheduled or in flight.
+    fn can_fetch(&self) -> bool {
+        self.enabled
+            && self.remaining > 0
+            && self.buffer.is_none()
+            && self.request.is_none()
+            && !self.in_flight
+            && self.fetch_wait == 0
+    }
+
     /// `$4015` bit 4. A 1 only restarts playback when the bytes-remaining
     /// counter is zero; a 0 sets it to zero and leaves the current shifter and
     /// buffer to finish.
@@ -832,11 +840,7 @@ impl Dmc {
             // A load only requires an empty sample buffer. The shifter may
             // still be playing the previous sample's byte, and waiting for it
             // to run dry would delay the load by up to eight DMC clocks.
-            if self.buffer.is_none()
-                && self.request.is_none()
-                && !self.in_flight
-                && self.fetch_wait == 0
-            {
+            if self.can_fetch() {
                 self.fetch_wait = load_delay;
                 self.fetch_kind = DmcFetchKind::Load;
             }
@@ -844,13 +848,7 @@ impl Dmc {
     }
 
     fn schedule_reload(&mut self) {
-        if self.enabled
-            && self.remaining > 0
-            && self.buffer.is_none()
-            && self.request.is_none()
-            && !self.in_flight
-            && self.fetch_wait == 0
-        {
+        if self.can_fetch() {
             self.fetch_wait = DMC_RELOAD_DELAY;
             self.fetch_kind = DmcFetchKind::Reload;
         }
@@ -902,13 +900,7 @@ impl Dmc {
             return;
         }
         self.fetch_wait -= 1;
-        if self.fetch_wait == 0
-            && self.enabled
-            && self.remaining > 0
-            && self.buffer.is_none()
-            && self.request.is_none()
-            && !self.in_flight
-        {
+        if self.can_fetch() {
             self.request = Some(DmcFetch {
                 addr: self.addr,
                 kind: self.fetch_kind,
@@ -1254,12 +1246,6 @@ impl Apu {
     /// pre-advance for conflict detection.
     pub fn dmc_playing(&self) -> bool {
         self.dmc.enabled && (self.dmc.remaining > 0 || self.dmc.request.is_some())
-    }
-
-    /// Test and debug view of the output counter.
-    #[cfg(test)]
-    pub(crate) fn dmc_level(&self) -> u8 {
-        self.dmc.output()
     }
 
     /// Test view of the reader state: live address, bytes remaining, buffer.
@@ -2014,7 +2000,7 @@ mod tests {
         // The mixer sees the counter even when playback is disabled.
         let mut apu = Apu::new();
         apu.cpu_write(0x4011, 0x7F);
-        assert_eq!(apu.dmc_level(), 0x7F);
+        assert_eq!(apu.dmc.output(), 0x7F);
         assert!(apu.mix() > 0, "the DMC term reaches the mixer");
     }
 
