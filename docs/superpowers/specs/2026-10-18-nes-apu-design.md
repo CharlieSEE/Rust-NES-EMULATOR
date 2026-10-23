@@ -2,6 +2,11 @@
 
 **Date:** 2026-10-18
 
+**Update 2026-10-23:** the DMC is no longer cut. `$4010-$4013`, sample
+fetching through the CPU bus, the sample-end IRQ and `$4015` bits 4/7 are
+implemented, and `apu_reset/works_immediately.nes` now passes (17/17). The DMC
+sections below record the original decision and its measured cost.
+
 ## Intent
 
 Give the emulator the machine part it never had: sound. Today `$4015` reads 0

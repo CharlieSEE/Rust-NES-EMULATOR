@@ -136,22 +136,16 @@ const APU_2005_ROMS: [&str; 11] = [
     "11.len_reload_timing.nes",
 ];
 
-/// Every apu_reset ROM and the code it reports. Every check passes (code 0)
-/// with one exception, measured and explained rather than waved through:
-///
-/// * `works_immediately` wants `$4015` to read `$1F` -- the four length
-///   counters plus the DMC's "sample playing" bit -- straight after
-///   `$4015 = $1F` loads a sample length. The DMC is cut (`apu.rs`), so that
-///   bit reads 0 and the ROM reports its code 2, "At power, writes should work
-///   immediately". Reading `$4015` back as `$0F` there is the cut showing, not
-///   a timing bug.
+/// Every apu_reset ROM and the code it reports. Every check passes (code 0),
+/// including `works_immediately`: it writes `$4015 = $1F` and requires the
+/// DMC's "sample playing" bit straight away, which the DMC now supplies.
 const APU_RESET_ROMS: [(&str, u8); 6] = [
     ("4015_cleared.nes", 0),
     ("4017_timing.nes", 0),
     ("4017_written.nes", 0),
     ("irq_flag_cleared.nes", 0),
     ("len_ctrs_enabled.nes", 0),
-    ("works_immediately.nes", 2),
+    ("works_immediately.nes", 0),
 ];
 
 /// Ten emulated seconds each: the suite's offsets run to tens of thousands of

@@ -1,8 +1,8 @@
 # Feature backlog
 
 Current state: mappers 0/1/2/66, cycle-based PPU with scanline IRQ support in the
-cartridge, APU without DMC, NTSC and PAL timing, battery saves, launcher,
-scripted input and frame dumps. Everything below is not implemented.
+cartridge, APU with DMC, NTSC and PAL timing, battery saves, launcher,
+scripted input and frame dumps. Everything unchecked below is not implemented.
 
 Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
@@ -10,9 +10,8 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 1. Mapper 4 (MMC3) — largest library gain.
 2. Save states — unlocks rewind, frame advance and better debugging.
-3. DMC channel — completes the APU.
-4. Unofficial CPU opcodes — removes hard crashes.
-5. Zapper — makes the bundled Duck Hunt fully playable.
+3. Unofficial CPU opcodes — removes hard crashes.
+4. Zapper — makes the bundled Duck Hunt fully playable.
 
 ---
 
@@ -24,7 +23,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
 - [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
 - [ ] **Unofficial CPU opcodes** — `cpu.rs` currently panics on undocumented opcodes. Implement the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants). *Effort: M.*
-- [ ] **DMC channel** — `$4010–$4013` are currently dropped. Sample fetching through the bus, output level, IRQ, `$4015` status bits, CPU stall conflicts. *Effort: M.*
+- [x] **DMC channel** — `$4010–$4013` registers, sample fetching through the CPU bus, 3/4-cycle DMA stalls, controller-read corruption, output level, sample-end IRQ, and `$4015` status bits. *Done.*
 - [x] **PAL support** — 50 Hz timing (312 scanlines, 5:16 CPU:PPU dots), 2A07 APU clock, noise and frame-counter tables, 2C07 palette, and region detection from NES 2.0 byte 12 or iNES flags 9/10. Dendy and dual-region headers fall back to NTSC. *Done.*
 - [ ] **NES 2.0 header support** — parse console type, mapper/submapper, PRG/CHR size exponents, RAM sizes. *Effort: S.*
 - [ ] **FDS support** — BIOS, disk I/O, disk IRQs, writable media, per-side saves. *Effort: XL.*
