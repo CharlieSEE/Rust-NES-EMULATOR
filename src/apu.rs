@@ -1,15 +1,19 @@
 //! The 2A03 APU: the frame counter, the length counters, `$4015`/`$4017`, the
-//! two pulse channels, the triangle, the noise channel, and the mixer that
-//! turns their outputs into samples.
+//! two pulse channels, the triangle, the noise channel, the DMC, and the mixer
+//! that turns their outputs into samples.
 //!
 //! References: NESdev "APU Frame Counter" (steps in APU cycles, the 3-or-4
 //! CPU cycle write delay, and the flag "set three times in a row"), NESdev
-//! "APU Length Counter" (the table and the halt/reload edge cases), and
-//! blargg's `test_roms/apu_2005/readme.txt`, which is the measured authority
-//! wherever the two disagree.
+//! "APU Length Counter" (the table and the halt/reload edge cases), NESdev
+//! "APU DMC" (registers, rate table, reader/output split), and blargg's
+//! `test_roms/apu_2005/readme.txt`, which is the measured authority wherever
+//! the two disagree.
 //!
-//! DMC is cut: `$4010-$4013` writes are dropped and `$4015` bits 4 and 7
-//! always read 0.
+//! The DMC's memory reader is the CPU bus, so a fetch is a request this type
+//! hands to `Bus`: `take_dmc_fetch` returns the address and `dmc_fetch_complete`
+//! hands the byte back after the DMA. `Bus` owns the stall accounting and the
+//! controller-read corruption; this file owns the sample timer, buffer,
+//! shifter, level and IRQ flag.
 
 use crate::region::Region;
 
@@ -50,6 +54,34 @@ fn noise_periods(region: Region) -> &'static [u16; 16] {
         Region::Pal => &PAL_NOISE_PERIODS,
     }
 }
+
+/// DMC playback periods in CPU cycles (NESdev "APU DMC", "Pitch table").
+const DMC_PERIODS: [u16; 16] = [
+    428, 380, 340, 320, 286, 254, 226, 214, 190, 160, 142, 128, 106, 84, 72, 54,
+];
+
+/// The 2A07's table: the same rate indices, different clock.
+const PAL_DMC_PERIODS: [u16; 16] = [
+    398, 354, 316, 298, 276, 236, 210, 198, 176, 148, 132, 118, 98, 78, 66, 50,
+];
+
+fn dmc_periods(region: Region) -> &'static [u16; 16] {
+    match region {
+        Region::Ntsc => &DMC_PERIODS,
+        Region::Pal => &PAL_DMC_PERIODS,
+    }
+}
+
+/// CPU cycles from a `$4015` start to the load DMA's request. NESdev "DMA"
+/// schedules the halt on a get cycle during the second APU cycle after the
+/// write: four cycles after a get-cycle write, three after a put-cycle write.
+/// `apu_phase == true` is a get cycle.
+const DMC_LOAD_DELAY_GET: u8 = 4;
+const DMC_LOAD_DELAY_PUT: u8 = 3;
+/// CPU cycles from the output unit emptying its buffer to the reload DMA's
+/// request. The output unit clocks on a get cycle, so the next put cycle is
+/// one CPU cycle later.
+const DMC_RELOAD_DELAY: u8 = 1;
 
 /// One second of stereo samples at 48 kHz: 96,000 `i16`, which is 48,000
 /// stereo pairs. When the queue is full the newest pair is dropped, which
@@ -658,12 +690,273 @@ impl Noise {
     }
 }
 
+/// Which of the DMC's two DMA kinds a fetch is. Loads schedule on a get cycle
+/// after `$4015` starts a sample and cost 3 cycles; reloads schedule on a put
+/// cycle when the output unit empties its buffer and cost 4 (NESdev "DMA").
+/// The kind picks the request delay in `Apu::write_status`; the cost is the
+/// bus's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DmcFetchKind {
+    #[default]
+    Load,
+    Reload,
+}
+
+/// A memory-reader request: the CPU address to read and which DMA kind it is.
+/// `Bus` turns this into a cycle-counted fetch through `cpu_read`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmcFetch {
+    pub addr: u16,
+    pub kind: DmcFetchKind,
+}
+
+/// The delta modulation channel (NESdev "APU DMC"). The memory reader is a
+/// request/response handshake with `Bus`; everything else is local.
+#[derive(Clone, Copy, Default)]
+struct Dmc {
+    region: Region,
+    /// `$4010` bits.
+    irq_enable: bool,
+    looping: bool,
+    rate: u8,
+    /// The output divider, clocked on APU cycles. `timer` is `period / 2 - 1`
+    /// so reloading it yields a clock every `period` CPU cycles.
+    timer: u16,
+    divider: u16,
+    /// The 7-bit counter the mixer sees; `$4011` loads it directly.
+    level: u8,
+    /// Reload values from `$4012` and `$4013`.
+    sample_addr: u16,
+    sample_len: u16,
+    /// The reader's live address and bytes-remaining counter.
+    addr: u16,
+    remaining: u16,
+    /// The one-byte buffer between reader and shifter, and the shifter.
+    buffer: Option<u8>,
+    shift: u8,
+    bits: u8,
+    /// `$4010` bit 7 raised a sample-end interrupt.
+    irq: bool,
+    /// `$4015` bit 4. The output level is independent of this; only automatic
+    /// playback is gated.
+    enabled: bool,
+    /// CPU cycles until the scheduled fetch becomes a request, and its kind.
+    fetch_wait: u8,
+    fetch_kind: DmcFetchKind,
+    /// A request waiting for `Bus`, and one accepted but not yet completed.
+    request: Option<DmcFetch>,
+    in_flight: bool,
+}
+
+impl Dmc {
+    fn for_region(region: Region) -> Dmc {
+        let mut dmc = Dmc {
+            region,
+            ..Dmc::default()
+        };
+        dmc.set_rate(0);
+        dmc
+    }
+
+    fn power_on(&mut self) {
+        let region = self.region;
+        *self = Dmc::for_region(region);
+    }
+
+    /// RESET keeps the written registers and the output level, clears `$4015`'s
+    /// enable (and therefore playback) and the sample-end flag.
+    fn reset(&mut self) {
+        self.enabled = false;
+        self.remaining = 0;
+        self.buffer = None;
+        self.shift = 0;
+        self.bits = 0;
+        self.irq = false;
+        self.fetch_wait = 0;
+        self.request = None;
+        self.in_flight = false;
+    }
+
+    fn set_rate(&mut self, rate: u8) {
+        self.rate = rate & 0x0F;
+        let period = dmc_periods(self.region)[self.rate as usize];
+        self.timer = period / 2 - 1;
+        if self.divider > self.timer {
+            self.divider = self.timer;
+        }
+    }
+
+    fn write_ctrl(&mut self, val: u8) {
+        self.irq_enable = val & 0x80 != 0;
+        self.looping = val & 0x40 != 0;
+        self.set_rate(val);
+        // "It can be cleared by ... clearing the sample-end interrupt flag
+        // (I bit) in $4010."
+        if !self.irq_enable {
+            self.irq = false;
+        }
+    }
+
+    fn write_level(&mut self, val: u8) {
+        self.level = val & 0x7F;
+    }
+
+    fn write_addr(&mut self, val: u8) {
+        self.sample_addr = 0xC000 + ((val as u16) << 6);
+    }
+
+    fn write_len(&mut self, val: u8) {
+        self.sample_len = (val as u16) * 16 + 1;
+    }
+
+    /// Whether the reader may start a fetch: enabled, bytes remain, the buffer
+    /// is empty, and no request is scheduled or in flight.
+    fn can_fetch(&self) -> bool {
+        self.enabled
+            && self.remaining > 0
+            && self.buffer.is_none()
+            && self.request.is_none()
+            && !self.in_flight
+            && self.fetch_wait == 0
+    }
+
+    /// `$4015` bit 4. A 1 only restarts playback when the bytes-remaining
+    /// counter is zero; a 0 sets it to zero and leaves the current shifter and
+    /// buffer to finish.
+    fn set_enabled(&mut self, on: bool, load_delay: u8) {
+        if !on {
+            self.enabled = false;
+            self.remaining = 0;
+            self.fetch_wait = 0;
+            self.request = None;
+            // A bus DMA may still be in flight; its byte is stale now.
+            self.in_flight = false;
+            return;
+        }
+        self.enabled = true;
+        if self.remaining == 0 {
+            self.addr = self.sample_addr;
+            self.remaining = self.sample_len;
+            // A load only requires an empty sample buffer. The shifter may
+            // still be playing the previous sample's byte, and waiting for it
+            // to run dry would delay the load by up to eight DMC clocks.
+            if self.can_fetch() {
+                self.fetch_wait = load_delay;
+                self.fetch_kind = DmcFetchKind::Load;
+            }
+        }
+    }
+
+    fn schedule_reload(&mut self) {
+        if self.can_fetch() {
+            self.fetch_wait = DMC_RELOAD_DELAY;
+            self.fetch_kind = DmcFetchKind::Reload;
+        }
+    }
+
+    /// One APU clock: the timer clocks the output unit, which shifts one bit
+    /// (or idles) whether or not automatic playback is enabled.
+    fn tick_apu(&mut self) {
+        if self.divider == 0 {
+            self.divider = self.timer;
+            self.clock_output();
+        } else {
+            self.divider -= 1;
+        }
+    }
+
+    /// "The output unit takes the sample byte from the sample buffer and
+    /// update[s] the output level accordingly": bit 0 picks up or down by 2,
+    /// the register shifts right, and a spent byte is replaced from the
+    /// buffer (or the reader is asked for another byte).
+    fn clock_output(&mut self) {
+        if self.bits > 0 {
+            if self.shift & 1 == 0 {
+                if self.level > 1 {
+                    self.level -= 2;
+                }
+            } else if self.level < 126 {
+                self.level += 2;
+            }
+            self.shift >>= 1;
+            self.bits -= 1;
+        }
+        if self.bits == 0 {
+            if let Some(byte) = self.buffer.take() {
+                self.shift = byte;
+                self.bits = 8;
+            }
+        }
+        // Ask for the next byte as soon as the buffer is empty, even while the
+        // shifter still has bits. Waiting for the shifter to run dry delays the
+        // reload (and a multi-byte sample's IRQ) by up to eight DMC clocks.
+        self.schedule_reload();
+    }
+
+    /// One CPU cycle: a scheduled load/reload becomes a request after its
+    /// delay. `Bus` takes the request on the next cycle.
+    fn tick_cpu(&mut self) {
+        if self.fetch_wait == 0 {
+            return;
+        }
+        self.fetch_wait -= 1;
+        if self.can_fetch() {
+            self.request = Some(DmcFetch {
+                addr: self.addr,
+                kind: self.fetch_kind,
+            });
+        }
+    }
+
+    fn take_fetch(&mut self) -> Option<DmcFetch> {
+        let req = self.request.take()?;
+        self.in_flight = true;
+        Some(req)
+    }
+
+    /// The reader's byte has arrived. Incrementing past `$FFFF` wraps to
+    /// `$8000`; the last byte either restarts the loop or raises the sample-end
+    /// flag.
+    fn complete_fetch(&mut self, byte: u8) {
+        if !self.in_flight {
+            // Disabled (or reset) after the bus accepted the request; drop the
+            // stale byte.
+            return;
+        }
+        self.in_flight = false;
+        if !self.enabled || self.remaining == 0 {
+            return;
+        }
+        self.buffer = Some(byte);
+        self.addr = self.addr.wrapping_add(1);
+        if self.addr == 0 {
+            self.addr = 0x8000;
+        }
+        self.remaining -= 1;
+        if self.remaining == 0 {
+            if self.looping {
+                self.addr = self.sample_addr;
+                self.remaining = self.sample_len;
+            } else if self.irq_enable {
+                self.irq = true;
+            }
+        }
+    }
+
+    fn output(&self) -> u8 {
+        self.level
+    }
+}
+
 pub struct Apu {
     pulses: [Pulse; 2],
     triangle: Triangle,
     noise: Noise,
+    dmc: Dmc,
     frame: Frame,
     /// The APU clock: channels' timers advance on every other CPU cycle.
+    /// `true` is the get (first) half of the APU cycle, which is the phase the
+    /// DMC's load/reload DMA scheduling aligns to.
     apu_phase: bool,
     /// The configured output rate in Hz.
     rate: u32,
@@ -691,6 +984,7 @@ impl Apu {
             pulses: [Pulse::new(true), Pulse::new(false)],
             triangle: Triangle::default(),
             noise: Noise::for_region(region),
+            dmc: Dmc::for_region(region),
             frame: Frame::new(region),
             apu_phase: false,
             rate: 48_000,
@@ -710,6 +1004,7 @@ impl Apu {
         self.pulses = [Pulse::new(true), Pulse::new(false)];
         self.triangle = Triangle::default();
         self.noise = Noise::for_region(self.region);
+        self.dmc.power_on();
         self.frame = Frame::new(self.region);
         self.frame.start(0x00, RESET_PRE);
     }
@@ -736,6 +1031,7 @@ impl Apu {
         }
         self.triangle.len.clear();
         self.noise.len.clear();
+        self.dmc.reset();
         self.frame = Frame::new(self.region);
         self.frame.start(last, RESET_PRE);
     }
@@ -759,12 +1055,17 @@ impl Apu {
 
     pub fn tick(&mut self) {
         self.ticks += 1;
+        // CPU-cycle work first: a reload scheduled by this cycle's APU clock
+        // must wait for the next CPU cycle (the next put cycle), not consume
+        // its wait in the same tick that scheduled it.
+        self.dmc.tick_cpu();
         // The channels' timers run at half the CPU rate...
         self.apu_phase = !self.apu_phase;
         if self.apu_phase {
             for p in &mut self.pulses {
                 p.tick();
             }
+            self.dmc.tick_apu();
         }
         // ...except the triangle's and the noise's, which run at the CPU rate.
         self.triangle.tick();
@@ -806,8 +1107,9 @@ impl Apu {
         }
     }
 
-    /// The nonlinear mixer, straight from NESdev "APU Mixer" with the DMC
-    /// term removed. Both terms are non-negative, so the result is too.
+    /// The nonlinear mixer, straight from NESdev "APU Mixer": the pulse term
+    /// plus the triangle/noise/DMC term. All terms are non-negative, so the
+    /// result is too.
     fn mix(&self) -> i16 {
         let p = self.pulses[0].output() as u16 + self.pulses[1].output() as u16;
         let pulse_out = if p == 0 {
@@ -817,10 +1119,11 @@ impl Apu {
         };
         let t = self.triangle.output();
         let n = self.noise.output();
-        let tnd_out = if t == 0 && n == 0 {
+        let d = self.dmc.output();
+        let tnd_out = if t == 0 && n == 0 && d == 0 {
             0.0
         } else {
-            159.79 / (1.0 / (t as f64 / 8227.0 + n as f64 / 12_241.0) + 100.0)
+            159.79 / (1.0 / (t as f64 / 8227.0 + n as f64 / 12_241.0 + d as f64 / 22_638.0) + 100.0)
         };
         ((pulse_out + tnd_out) * 32_767.0).clamp(0.0, 32_767.0) as i16
     }
@@ -851,6 +1154,12 @@ impl Apu {
                 if self.noise.len.length > 0 {
                     v |= 0x08;
                 }
+                if self.dmc.remaining > 0 {
+                    v |= 0x10;
+                }
+                if self.dmc.irq {
+                    v |= 0x80;
+                }
                 if self.frame.flag {
                     v |= 0x40;
                     self.frame.flag = false;
@@ -877,15 +1186,26 @@ impl Apu {
             0x400C => self.noise.write_ctrl(val),
             0x400E => self.noise.write_period(val),
             0x400F => self.noise.write_length(val),
+            0x4010 => self.dmc.write_ctrl(val),
+            0x4011 => self.dmc.write_level(val),
+            0x4012 => self.dmc.write_addr(val),
+            0x4013 => self.dmc.write_len(val),
             0x4015 => self.write_status(val),
             0x4017 => self.frame.write(val),
-            // $4010-$4013 are the DMC, which is cut: nothing is stored and
-            // nothing is read back.
             _ => {}
         }
     }
 
     fn write_status(&mut self, val: u8) {
+        // "Writing to this register also clears the DMC sample-end interrupt
+        // flag regardless of the written value."
+        self.dmc.irq = false;
+        let load_delay = if self.apu_phase {
+            DMC_LOAD_DELAY_GET
+        } else {
+            DMC_LOAD_DELAY_PUT
+        };
+        self.dmc.set_enabled(val & 0x10 != 0, load_delay);
         for (i, p) in self.pulses.iter_mut().enumerate() {
             if val & (1 << i) != 0 {
                 p.len.enabled = true;
@@ -906,7 +1226,32 @@ impl Apu {
     }
 
     pub fn irq_pending(&self) -> bool {
-        self.frame.flag
+        self.frame.flag || self.dmc.irq
+    }
+
+    /// Hand the DMC's pending memory-reader request to the bus. The bus turns
+    /// it into a 3/4-cycle DMA and returns the byte through
+    /// `dmc_fetch_complete`.
+    pub fn take_dmc_fetch(&mut self) -> Option<DmcFetch> {
+        self.dmc.take_fetch()
+    }
+
+    /// The byte the DMC's memory reader fetched through the CPU bus.
+    pub fn dmc_fetch_complete(&mut self, byte: u8) {
+        self.dmc.complete_fetch(byte);
+    }
+
+    /// Whether automatic DMC playback can still ask for bytes. Controller
+    /// reads use this to decide whether an instruction needs the bus's DMC
+    /// pre-advance for conflict detection.
+    pub fn dmc_playing(&self) -> bool {
+        self.dmc.enabled && (self.dmc.remaining > 0 || self.dmc.request.is_some())
+    }
+
+    /// Test view of the reader state: live address, bytes remaining, buffer.
+    #[cfg(test)]
+    pub(crate) fn dmc_state(&self) -> (u16, u16, Option<u8>) {
+        (self.dmc.addr, self.dmc.remaining, self.dmc.buffer)
     }
 
     pub fn take_samples(&mut self) -> Vec<i16> {
@@ -1554,5 +1899,262 @@ mod tests {
             apu.tick();
         }
         assert_eq!(apu.take_samples().len(), SAMPLE_QUEUE_CAP);
+    }
+
+    /// `$4015` starts the reader, the load DMA asks for the first byte after
+    /// its delay, and fetching the last byte raises the sample-end flag. A
+    /// `$4015` write clears that flag; a read does not.
+    #[test]
+    fn the_dmc_loads_a_sample_and_raises_its_irq() {
+        let mut apu = Apu::new();
+        apu.cpu_write(0x4017, 0x40); // inhibit the frame IRQ for this test
+        apu.cpu_write(0x4010, 0x8F); // IRQ on, rate $F
+        apu.cpu_write(0x4012, 0x00); // $C000
+        apu.cpu_write(0x4013, 0x00); // one byte
+        apu.cpu_write(0x4015, 0x10);
+
+        assert_eq!(apu.cpu_read(0x4015) & 0x10, 0x10, "sample is playing");
+        for _ in 0..DMC_LOAD_DELAY_PUT {
+            apu.tick();
+        }
+        assert_eq!(
+            apu.take_dmc_fetch(),
+            Some(DmcFetch {
+                addr: 0xC000,
+                kind: DmcFetchKind::Load,
+            }),
+            "the load DMA arrives after its delay"
+        );
+        apu.dmc_fetch_complete(0xAA);
+
+        assert_eq!(apu.cpu_read(0x4015) & 0x10, 0, "last byte fetched");
+        assert_eq!(apu.cpu_read(0x4015) & 0x80, 0x80, "sample-end flag");
+        assert!(apu.dmc.irq);
+
+        apu.cpu_read(0x4015);
+        assert!(apu.dmc.irq, "reading $4015 does not clear the DMC flag");
+        apu.cpu_write(0x4015, 0x10);
+        assert!(!apu.dmc.irq, "writing $4015 clears it");
+    }
+
+    /// The loop flag reloads both counters at the last byte, so playback
+    /// continues and the sample-end flag never rises.
+    #[test]
+    fn the_dmc_loop_reloads_the_address_and_length() {
+        let mut apu = Apu::new();
+        apu.cpu_write(0x4010, 0x4F); // loop, rate $F, IRQ off
+        apu.cpu_write(0x4012, 0x01); // $C040
+        apu.cpu_write(0x4013, 0x00); // one byte
+        apu.cpu_write(0x4015, 0x10);
+        for _ in 0..DMC_LOAD_DELAY_PUT {
+            apu.tick();
+        }
+        assert!(apu.take_dmc_fetch().is_some());
+        apu.dmc_fetch_complete(0x00);
+
+        assert_eq!(apu.dmc.remaining, 1, "the length reloads");
+        assert_eq!(apu.dmc.addr, 0xC040, "and so does the address");
+        assert!(!apu.dmc.irq, "the loop flag suppresses the IRQ");
+    }
+
+    /// The reader wraps past `$FFFF` to `$8000`, not to zero.
+    #[test]
+    fn the_dmc_reader_wraps_to_8000() {
+        let mut dmc = Dmc::for_region(Region::Ntsc);
+        dmc.enabled = true;
+        dmc.in_flight = true;
+        dmc.addr = 0xFFFF;
+        dmc.remaining = 2;
+        dmc.complete_fetch(0x00);
+        assert_eq!(dmc.addr, 0x8000);
+        assert_eq!(dmc.remaining, 1);
+    }
+
+    /// The output unit moves by two per bit, clamps at both ends, and loads
+    /// the buffer only after the previous byte's eight bits are spent.
+    #[test]
+    fn the_dmc_output_moves_by_two_and_clamps() {
+        let mut dmc = Dmc::for_region(Region::Ntsc);
+        dmc.write_level(64);
+        dmc.buffer = Some(0b0000_0011);
+        dmc.bits = 0;
+
+        dmc.clock_output(); // the buffer moves into the shifter, no output yet
+        assert_eq!(dmc.level, 64);
+        dmc.clock_output(); // bit 0 = 1
+        assert_eq!(dmc.level, 66);
+        dmc.clock_output(); // bit 1 = 1
+        assert_eq!(dmc.level, 68);
+
+        dmc.write_level(126);
+        dmc.shift = 0xFF;
+        dmc.bits = 8;
+        dmc.clock_output();
+        assert_eq!(dmc.level, 126, "increments stop below 126");
+        dmc.write_level(1);
+        dmc.shift = 0;
+        dmc.bits = 8;
+        dmc.clock_output();
+        assert_eq!(dmc.level, 1, "decrements stop above 1");
+
+        // The mixer sees the counter even when playback is disabled.
+        let mut apu = Apu::new();
+        apu.cpu_write(0x4011, 0x7F);
+        assert_eq!(apu.dmc.output(), 0x7F);
+        assert!(apu.mix() > 0, "the DMC term reaches the mixer");
+    }
+
+    /// The DMC's timer is clocked at APU rate, so its reload is half the CPU
+    /// period; PAL uses the 2A07 table.
+    #[test]
+    fn the_dmc_rate_table_uses_the_region() {
+        let mut ntsc = Dmc::for_region(Region::Ntsc);
+        ntsc.set_rate(0x0F);
+        assert_eq!(ntsc.timer, 54 / 2 - 1);
+        let mut pal = Dmc::for_region(Region::Pal);
+        pal.set_rate(0x0F);
+        assert_eq!(pal.timer, 50 / 2 - 1);
+    }
+
+    /// The reader prefetches as soon as the output unit takes the buffer, not
+    /// after the shifter has spent all eight bits. A late prefetch delays the
+    /// sample-end IRQ of every multi-byte sample by up to eight DMC clocks.
+    #[test]
+    fn the_dmc_prefetches_while_the_shifter_still_has_bits() {
+        let mut dmc = Dmc::for_region(Region::Ntsc);
+        dmc.enabled = true;
+        dmc.remaining = 2;
+        dmc.addr = 0xC000;
+        dmc.buffer = Some(0xAA);
+        dmc.bits = 0;
+
+        dmc.clock_output();
+        assert_eq!(dmc.bits, 8, "the buffer moved into the shifter");
+        assert!(dmc.buffer.is_none());
+        assert_eq!(
+            dmc.request, None,
+            "the reload is scheduled, not requested yet"
+        );
+
+        dmc.tick_cpu();
+        assert_eq!(
+            dmc.request,
+            Some(DmcFetch {
+                addr: 0xC000,
+                kind: DmcFetchKind::Reload,
+            }),
+            "the next byte is requested while the shifter is still busy"
+        );
+    }
+
+    /// A `$4015` start is a load DMA whenever the sample buffer is empty, even
+    /// if the previous sample's shifter is still playing. The load must not
+    /// wait for the shifter to run dry.
+    #[test]
+    fn a_4015_start_loads_with_an_empty_buffer_while_the_shifter_plays() {
+        let mut apu = Apu::new();
+        apu.cpu_write(0x4010, 0x0F); // rate $F, no IRQ
+        apu.cpu_write(0x4012, 0x00);
+        apu.cpu_write(0x4013, 0x00);
+        apu.dmc.bits = 4; // a previous sample is still shifting
+        apu.dmc.remaining = 0;
+        apu.cpu_write(0x4015, 0x10);
+
+        for _ in 0..3 {
+            apu.tick();
+        }
+        assert_eq!(
+            apu.take_dmc_fetch(),
+            Some(DmcFetch {
+                addr: 0xC000,
+                kind: DmcFetchKind::Load,
+            }),
+            "the empty buffer starts a load even while bits remain"
+        );
+    }
+
+    /// A load DMA from a get-cycle write halts four CPU cycles later; a
+    /// put-cycle write halts three cycles later. Both land on a get cycle.
+    #[test]
+    fn the_dmc_load_delay_follows_the_write_cycle_phase() {
+        for (phase, delay) in [(true, 4u8), (false, 3u8)] {
+            let mut apu = Apu::new();
+            apu.apu_phase = phase;
+            apu.cpu_write(0x4010, 0x0F);
+            apu.cpu_write(0x4012, 0x00);
+            apu.cpu_write(0x4013, 0x00);
+            apu.cpu_write(0x4015, 0x10);
+
+            for _ in 0..delay - 1 {
+                apu.tick();
+            }
+            assert_eq!(apu.take_dmc_fetch(), None, "phase {phase}: too early");
+            apu.tick();
+            assert!(apu.take_dmc_fetch().is_some(), "phase {phase}: request");
+        }
+    }
+
+    /// The output unit clocks on a get cycle; the reload request belongs to the
+    /// following put cycle. It must not consume its one-cycle wait in the same
+    /// CPU tick that scheduled it.
+    #[test]
+    fn a_reload_request_waits_for_the_next_cpu_cycle() {
+        let mut apu = Apu::new();
+        apu.dmc.enabled = true;
+        apu.dmc.remaining = 2;
+        apu.dmc.buffer = Some(0xAA);
+        apu.dmc.bits = 0;
+        apu.dmc.divider = 0;
+        apu.apu_phase = false; // the next tick is an APU clock (get)
+
+        apu.tick();
+        assert!(
+            apu.dmc.request.is_none(),
+            "the reload is scheduled this cycle"
+        );
+        apu.tick();
+        assert!(apu.dmc.request.is_some(), "the next put cycle requests it");
+    }
+
+    /// A two-byte sample raises the sample-end IRQ when the second byte is
+    /// fetched, which happens while the first byte is still shifting.
+    #[test]
+    fn a_multi_byte_sample_raises_the_irq_when_the_last_byte_is_prefetched() {
+        let mut apu = Apu::new();
+        apu.cpu_write(0x4017, 0x40); // inhibit the frame IRQ
+        apu.cpu_write(0x4010, 0x8F); // IRQ on, rate $F
+        apu.cpu_write(0x4012, 0x00);
+        apu.cpu_write(0x4013, 0x00);
+        apu.dmc.sample_len = 2;
+        apu.cpu_write(0x4015, 0x10);
+
+        for _ in 0..3 {
+            apu.tick();
+        }
+        let first = apu.take_dmc_fetch().expect("first byte");
+        assert_eq!(first.kind, DmcFetchKind::Load);
+        apu.dmc_fetch_complete(0x11);
+        assert!(!apu.irq_pending(), "one byte remains");
+
+        apu.dmc.clock_output(); // take the first byte into the shifter
+        assert!(apu.dmc.bits > 0);
+
+        let mut waited = 0;
+        let second = loop {
+            if let Some(req) = apu.take_dmc_fetch() {
+                break req;
+            }
+            apu.tick();
+            waited += 1;
+            assert!(waited < 4, "the second byte was not prefetched");
+        };
+        assert_eq!(second.addr, 0xC001);
+        assert_eq!(second.kind, DmcFetchKind::Reload);
+        apu.dmc_fetch_complete(0x22);
+        assert!(
+            apu.irq_pending(),
+            "the last byte raises the sample-end flag"
+        );
+        assert_eq!(apu.dmc.remaining, 0);
     }
 }

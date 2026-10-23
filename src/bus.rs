@@ -10,23 +10,30 @@
 //!   chart" puts it the same way: "OAM DMA 513 (+1 if starting on CPU get
 //!   cycles)".
 //! - NESdev "DMA" -- the copy "begins on the cycle immediately after the
-//!   write", from a page-aligned source, through `$2004`.
+//!   write", from a page-aligned source, through `$2004`; DMC DMA's load and
+//!   reload cycle counts, and its controller-read conflicts.
+//! - NESdev "APU DMC" -- the reader/output split, sample-end IRQ, `$4015`
+//!   bits 4 and 7, and the rate table.
 //! - NESdev "Standard controller" -- `$4016` strobes both ports, `$4016`/`$4017`
 //!   report controller 1 / controller 2.
 //!
 //! Two deliberate ceilings:
 //!
-//! * OAM DMA's stall is COUNTED here and ENFORCED by the caller: the 256 bytes
-//!   are already in OAM by the time `dma_stall` is set, and the stall never
-//!   becomes extra `ppu.tick()` calls, so the CPU is the only clock held back.
-//!   `main` gates on `dma_busy()` and ticks without stepping until the stall
-//!   drains, which is what puts OAM 513 (or 514) cycles later than the CPU.
-//!   `tick` here only decrements the counter, once every third dot, because
-//!   `BusLike::tick` is one DOT and not one CPU cycle.
+//! * OAM and DMC DMA stalls are COUNTED here and ENFORCED by the caller: the
+//!   256 OAM bytes are already in OAM by the time `dma_stall` is set, and the
+//!   DMC's sample byte is read through `cpu_read` on the DMA's get cycle. The
+//!   stalls become extra `ppu.tick()` calls, so the CPU is the only clock held
+//!   back. `main` gates on `dma_busy()` and ticks without stepping until the
+//!   stall drains, which is what puts OAM 513 (or 514) cycles later than the
+//!   CPU and a DMC fetch 3/4 cycles later. `tick` here only decrements the
+//!   counters, once every third dot, because `BusLike::tick` is one DOT and not
+//!   one CPU cycle. The CPU is otherwise atomic per instruction, so a DMC halt
+//!   is charged between instructions; its total length and the sample-end IRQ
+//!   cycle are exact, but a write-cycle halt retry is not modeled.
 //! * Unmapped and write-only reads return 0 where hardware returns open bus,
 //!   matching the PPU's own choice for `$2002` bits 4-0.
 
-use crate::apu::Apu;
+use crate::apu::{Apu, DmcFetchKind};
 use crate::controller::Controller;
 use crate::cpu::{BusLike, Cpu};
 use crate::ppu::Ppu;
@@ -38,6 +45,15 @@ use crate::rom::Cartridge;
 const DMA_STALL: u16 = 513;
 /// ...and one more when the write landed on an odd CPU cycle (same page).
 const DMA_STALL_ODD: u16 = DMA_STALL + 1;
+
+/// A DMC memory-reader DMA in flight. `cycles_left` counts CPU cycles to the
+/// fetch; the bus charges the full 3/4-cycle stall to the CPU and reads the
+/// sample on the last one.
+#[derive(Clone, Copy)]
+struct DmcDma {
+    addr: u16,
+    cycles_left: u8,
+}
 
 pub struct Bus {
     pub cart: Cartridge,
@@ -65,6 +81,17 @@ pub struct Bus {
     /// spends these cycles ticking the PPU, which keeps clocking during the
     /// stall exactly as it does on hardware.
     dma_stall: u16,
+    /// The DMC's memory-reader DMA, and the CPU cycles it owes. The stall is
+    /// charged in full but not drained until the current instruction retires,
+    /// so it is extra time rather than part of the instruction's own cycles.
+    dmc_dma: Option<DmcDma>,
+    dmc_stall: u16,
+    /// Whether a DMC DMA landing on this instruction's last cycle adds an
+    /// extra controller clock, computed by `apu_advance_ahead`.
+    dmc_controller_extra: bool,
+    /// True between `instruction_cycles(n)` and `instruction_cycles(0)`, even
+    /// while an OAM DMA has temporarily zeroed `instr_cycles`.
+    in_instruction: bool,
     /// CPU cycles of APU advancement the instruction in progress still owes its
     /// own ticks: an APU-register access is placed on the cycle it really
     /// happens by advancing the APU now and skipping that many ticks. `Cpu::step`
@@ -98,6 +125,10 @@ impl Bus {
             region,
             pal_extra: 0,
             dma_stall: 0,
+            dmc_dma: None,
+            dmc_stall: 0,
+            dmc_controller_extra: false,
+            in_instruction: false,
             apu_skip: 0,
             instr_cycles: 0,
             irq_line: false,
@@ -133,6 +164,10 @@ impl Bus {
         self.dot = 0;
         self.pal_extra = 0;
         self.dma_stall = 0;
+        self.dmc_dma = None;
+        self.dmc_stall = 0;
+        self.dmc_controller_extra = false;
+        self.in_instruction = false;
         self.apu_skip = 0;
         self.instr_cycles = 0;
         self.irq_line = false;
@@ -149,7 +184,8 @@ impl Bus {
         self.apu.reset();
     }
 
-    /// Put an APU-register access on the cycle it really happens.
+    /// Put an APU-register or controller access on the cycle it really
+    /// happens.
     ///
     /// `Cpu::step` performs every access of an instruction before ticking any of
     /// its cycles, but on hardware the last access *is* the last cycle, and the
@@ -162,17 +198,53 @@ impl Bus {
     /// `apu_2005` measures on both sides: `07.irq_flag_timing` wants the frame
     /// IRQ flag the step raised in that cycle to be there, and `05` wants a read
     /// landing on the cycle *after* a length clock to see it.
+    ///
+    /// The same pre-advance runs the DMC's DMA. If a fetch's halt starts on the
+    /// instruction's last cycle, the controller read is repeated once, which is
+    /// the 2A03's DPCM/joypad conflict. A DMA already in its dummy/alignment
+    /// cycles does not conflict.
     fn apu_advance_ahead(&mut self, cycles: u8) {
-        // Only the first APU access of an instruction is placed; a second one
-        // lands on the same cycle anyway, and `0` means nobody said how long the
-        // instruction is (a DMA's reads, a test), so leave the access alone.
+        // Only the first APU/controller access of an instruction is placed; a
+        // second one lands on the same cycle anyway, and `0` means nobody said
+        // how long the instruction is (a DMA's reads, a test), so leave the
+        // access alone.
         if self.apu_skip > 0 || self.instr_cycles == 0 {
             return;
         }
-        for _ in 0..cycles {
+        let last = cycles.saturating_sub(1);
+        for cycle in 0..cycles {
             self.apu.tick();
+            let halt_started = self.dmc_cycle();
+            if cycle == last && halt_started {
+                // A halted CPU repeats the same read on every no-op cycle,
+                // but a standard controller clocks once per contiguous set of
+                // reads: the no-op block is one set and the resumed read after
+                // the DMA get is another. So a conflict deletes one bit, not
+                // one per cycle. Only a halt that starts on this last cycle
+                // conflicts; a DMA already in its dummy cycle does not.
+                self.dmc_controller_extra = true;
+            }
         }
         self.apu_skip = cycles;
+    }
+
+    /// A controller read: a DMC halt starting on the instruction's last cycle
+    /// repeats the read, so clock the shift register the extra time NTSC
+    /// hardware does and return the last value. PAL has no such conflict. The
+    /// pre-advance is only needed when the DMC can still fetch; with playback
+    /// off this is the one plain read.
+    fn read_controller(&mut self, port: usize) -> u8 {
+        if self.instr_cycles > 0 && self.apu.dmc_playing() {
+            self.apu_advance_ahead(self.instr_cycles);
+        }
+        // The 2A07 has no DPCM/joypad conflict; only the NTSC 2A03 repeats
+        // the read.
+        let extra = self.region == Region::Ntsc && self.dmc_controller_extra;
+        let mut value = self.controllers[port].read();
+        if extra {
+            value = self.controllers[port].read();
+        }
+        value
     }
 
     pub fn cpu_read(&mut self, addr: u16) -> u8 {
@@ -187,8 +259,8 @@ impl Bus {
                 self.apu_advance_ahead(self.instr_cycles);
                 self.apu.cpu_read(addr)
             }
-            0x4016 => self.controllers[0].read(),
-            0x4017 => self.controllers[1].read(),
+            0x4016 => self.read_controller(0),
+            0x4017 => self.read_controller(1),
             // The cartridge may populate this window with PRG RAM. Both NROM
             // test images do -- blargg's ROMs report their results here -- and
             // MMC1 exposes its battery save here. MMC1's PRG register can
@@ -207,9 +279,8 @@ impl Bus {
             0x0000..=0x1FFF => self.cpu_ram[addr as usize & 0x07FF] = val,
             0x2000..=0x3FFF => self.ppu.cpu_write(addr, val),
             0x4014 => self.oam_dma(val),
-            // `$4000-$4013` are the APU's channels -- `$4010-$4013` being the
-            // DMC, which this APU drops -- and `$4015`/`$4017` its status and
-            // frame counter.
+            // `$4000-$4013` are the APU's channels (`$4010-$4013` the DMC) and
+            // `$4015`/`$4017` its status and frame counter.
             0x4000..=0x4013 | 0x4015 | 0x4017 => {
                 self.apu_advance_ahead(self.instr_cycles);
                 self.apu.cpu_write(addr, val)
@@ -239,10 +310,62 @@ impl Bus {
         }
     }
 
-    /// Whether an OAM DMA is mid-stall, i.e. whether the CPU must not execute
-    /// an instruction. `tick` is what drains it.
+    /// One CPU cycle of the DMC memory reader. A request becomes a DMA with
+    /// the 3/4-cycle cost NESdev "DMA" gives it; the fetch itself is the last
+    /// cycle and goes through `cpu_read`, so it sees the same bus a CPU read
+    /// would. During OAM DMA the units overlap: the common case costs 2 cycles,
+    /// the second-to-last OAM put costs 1 and the last put costs 3.
+    ///
+    /// ponytail: the CPU is atomic per instruction, so the halt is charged
+    /// after the instruction retires. Controller reads get the extra clock;
+    /// a halt retry on a write cycle is not modeled.
+    fn dmc_cycle(&mut self) -> bool {
+        let mut halt_started = false;
+        if self.dmc_dma.is_none() {
+            if let Some(req) = self.apu.take_dmc_fetch() {
+                let cost = if self.dma_stall > 0 {
+                    // OAM DMA's last cycle is always a put. A remaining count
+                    // of 1 is that last put (the whole DMC sequence follows);
+                    // 3 is the second-to-last put, whose following get/put
+                    // cover all but one DMC cycle. Every other overlap costs 2.
+                    match self.dma_stall {
+                        1 => 3,
+                        3 => 1,
+                        _ => 2,
+                    }
+                } else {
+                    match req.kind {
+                        DmcFetchKind::Load => 3,
+                        DmcFetchKind::Reload => 4,
+                    }
+                };
+                // The halt cycle is this request cycle; the remaining count is
+                // the dummy/alignment cycles before the get.
+                self.dmc_dma = Some(DmcDma {
+                    addr: req.addr,
+                    cycles_left: cost,
+                });
+                self.dmc_stall += cost as u16;
+                halt_started = true;
+            }
+        }
+        if let Some(mut dma) = self.dmc_dma {
+            dma.cycles_left -= 1;
+            if dma.cycles_left == 0 {
+                self.dmc_dma = None;
+                let byte = self.cpu_read(dma.addr);
+                self.apu.dmc_fetch_complete(byte);
+            } else {
+                self.dmc_dma = Some(dma);
+            }
+        }
+        halt_started
+    }
+
+    /// Whether a DMA is mid-stall, i.e. whether the CPU must not execute an
+    /// instruction. `tick` is what drains it.
     pub fn dma_busy(&self) -> bool {
-        self.dma_stall > 0
+        self.dma_stall > 0 || self.dmc_stall > 0
     }
 
     /// The 8 KiB at `$6000-$7FFF`, for a battery-backed cartridge to write to
@@ -278,10 +401,17 @@ impl Bus {
         }
         self.dot = 0;
         self.cycles += 1;
+        // Drain the DMC stall before this cycle's APU/DMA work. A request made
+        // later in this same tick must not consume one of its own stall cycles,
+        // and a DMC stall waits for OAM DMA to finish.
+        if self.dma_stall == 0 && self.dmc_stall > 0 && !self.in_instruction {
+            self.dmc_stall -= 1;
+        }
         if self.apu_skip > 0 {
             self.apu_skip -= 1;
         } else {
             self.apu.tick();
+            self.dmc_cycle();
         }
         self.irq_line_delayed = self.irq_line;
         self.irq_line = self.apu.irq_pending();
@@ -362,6 +492,8 @@ impl BusLike for Bus {
 
     fn instruction_cycles(&mut self, cycles: u8) {
         self.instr_cycles = cycles;
+        self.dmc_controller_extra = false;
+        self.in_instruction = cycles != 0;
     }
 }
 
@@ -1060,5 +1192,297 @@ mod tests {
         }
         assert_eq!(b.oam()[0], 0xAA, "the CPU ran DMA into the PPU");
         assert!(b.ppu.frame_ready(), "the PPU never reached vblank");
+    }
+
+    /// The DMC's reader goes through `cpu_read`, so the byte comes from the
+    /// cartridge like any CPU read. A load DMA costs 3 cycles, and those
+    /// cycles are extra time: they wait for the instruction to retire.
+    #[test]
+    fn a_dmc_fetch_reads_through_the_cpu_bus_and_owes_three_cycles() {
+        let mut b = Bus::new(cart_all_banks_bb());
+        b.apu.cpu_write(0x4010, 0x0F); // rate $F, no IRQ
+        b.apu.cpu_write(0x4012, 0x00); // $C000
+        b.apu.cpu_write(0x4013, 0x00); // one byte
+        b.apu.cpu_write(0x4015, 0x10);
+        b.instruction_cycles(4);
+
+        // Three CPU cycles of load delay, then the request becomes a DMA.
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 3, "a load DMA costs three cycles");
+        assert!(b.dmc_dma.is_some());
+
+        // Three more cycles: the halt/dummy cycles finish and the fetch reads
+        // $C000 through the cartridge.
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        let (_, remaining, buffer) = b.apu.dmc_state();
+        assert_eq!(remaining, 0, "the last byte was fetched");
+        assert_eq!(buffer, Some(0xBB), "the byte came through cpu_read");
+        assert_eq!(b.dmc_stall, 3, "the stall waits for the instruction");
+
+        b.instruction_cycles(0);
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 0, "and drains after it retires");
+    }
+
+    /// A DMC DMA landing on the last cycle repeats the controller read, which
+    /// clocks the 4021 shift register once more.
+    #[test]
+    fn a_dmc_dma_on_the_last_cycle_repeats_a_controller_read() {
+        let mut b = Bus::new(blank_cart());
+        b.controllers[0].set_buttons(0x02); // only B held
+        b.cpu_write(0x4016, 1);
+        b.cpu_write(0x4016, 0);
+        b.instruction_cycles(4);
+        b.dmc_controller_extra = true;
+
+        let got = b.cpu_read(0x4016);
+        assert_eq!(
+            got & 1,
+            1,
+            "the extra clock consumed A, so B is now in bit 0"
+        );
+
+        // The same two clocks by hand: the second read is what the CPU sees.
+        let mut c = Controller::new();
+        c.set_buttons(0x02);
+        c.write_strobe(1);
+        c.write_strobe(0);
+        let _ = c.read();
+        assert_eq!(got, c.read());
+        b.instruction_cycles(0);
+    }
+
+    /// The real path: `read_controller` pre-advances the APU, sees the load DMA
+    /// halt start on the instruction's last cycle, and clocks the controller one
+    /// extra time.
+    #[test]
+    fn the_bus_finds_a_dmc_dma_that_lands_on_a_controller_read() {
+        let mut b = Bus::new(blank_cart());
+        b.controllers[0].set_buttons(0x02); // only B held
+        b.cpu_write(0x4016, 1);
+        b.cpu_write(0x4016, 0);
+        b.apu.tick(); // make the $4015 write land on a get cycle: 4-cycle load delay
+        b.apu.cpu_write(0x4010, 0x0F); // rate $F, no IRQ
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00); // one byte
+        b.apu.cpu_write(0x4015, 0x10);
+        b.instruction_cycles(4);
+
+        let got = b.cpu_read(0x4016);
+        assert_eq!(
+            got & 1,
+            1,
+            "one extra clock consumed A, so B is now in bit 0"
+        );
+        assert_eq!(b.dmc_stall, 3, "the load DMA still owes its three cycles");
+        b.instruction_cycles(0);
+    }
+
+    /// A DMC DMA that is already in its dummy cycle on the instruction's last
+    /// cycle does not repeat the controller read. Only the cycle the halt
+    /// starts causes the DPCM/joypad conflict.
+    #[test]
+    fn a_dmc_dma_in_its_dummy_cycle_does_not_clock_the_controller() {
+        let mut b = Bus::new(blank_cart());
+        b.controllers[0].set_buttons(0x02); // only B held
+        b.cpu_write(0x4016, 1);
+        b.cpu_write(0x4016, 0);
+        b.apu.cpu_write(0x4010, 0x0F); // rate $F, no IRQ
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00); // one byte
+        b.apu.cpu_write(0x4015, 0x10); // put-cycle write: halt starts on cycle 2
+        b.instruction_cycles(4);
+
+        let got = b.cpu_read(0x4016);
+        assert_eq!(
+            got & 1,
+            0,
+            "the dummy cycle does not repeat the read; A is still in bit 0"
+        );
+        assert_eq!(b.dmc_stall, 3, "the load DMA still owes its three cycles");
+        b.instruction_cycles(0);
+    }
+
+    /// The 2A07 has no DPCM/joypad conflict, so PAL never adds the extra
+    /// controller clock.
+    #[test]
+    fn pal_does_not_repeat_a_controller_read_for_dmc() {
+        let mut b = Bus::new(cart_running_in(Region::Pal, &[]));
+        b.controllers[0].set_buttons(0x02); // only B held
+        b.cpu_write(0x4016, 1);
+        b.cpu_write(0x4016, 0);
+        b.instruction_cycles(4);
+        b.dmc_controller_extra = true;
+
+        let got = b.cpu_read(0x4016);
+        assert_eq!(
+            got & 1,
+            0,
+            "PAL has no DMC/controller conflict; A is still in bit 0"
+        );
+        b.instruction_cycles(0);
+    }
+
+    /// A reload DMA costs four cycles, and the next fetch starts only after
+    /// the output unit has spent the buffered byte.
+    #[test]
+    fn a_dmc_reload_dma_costs_four_cycles() {
+        let mut b = Bus::new(cart_all_banks_bb());
+        b.apu.cpu_write(0x4010, 0x4F); // loop, rate $F, no IRQ
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00); // one byte
+        b.apu.cpu_write(0x4015, 0x10);
+        b.instruction_cycles(4);
+
+        // Load delay plus the three-cycle load DMA.
+        for _ in 0..6 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 3, "the load DMA is still owed");
+
+        let mut cycles = 0;
+        while b.dmc_stall == 3 {
+            b.tick();
+            b.tick();
+            b.tick();
+            cycles += 1;
+            assert!(cycles < 2_000, "the output unit never asked for a reload");
+        }
+        assert_eq!(b.dmc_stall, 7, "3-cycle load plus 4-cycle reload");
+
+        b.instruction_cycles(0);
+        while b.dmc_stall > 0 {
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 0);
+    }
+
+    /// A DMC fetch requested during OAM DMA is two extra cycles: it must not
+    /// disappear into the 513/514-cycle OAM stall.
+    #[test]
+    fn a_dmc_fetch_during_oam_dma_costs_two_extra_cycles() {
+        let mut b = Bus::new(blank_cart());
+        b.apu.cpu_write(0x4010, 0x0F);
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00);
+        b.apu.cpu_write(0x4015, 0x10);
+        b.dma_stall = 10; // pretend an OAM DMA is in progress
+        b.instruction_cycles(0);
+
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 2, "the overlapping fetch costs two cycles");
+        assert_eq!(b.dma_stall, 7);
+
+        // The DMC's two cycles wait until OAM DMA finishes.
+        for _ in 0..2 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 2);
+        assert_eq!(b.dma_stall, 5);
+
+        while b.dma_stall > 0 {
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 2, "OAM finishing does not eat the DMC cycles");
+        for _ in 0..2 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 0);
+    }
+
+    /// The IRQ line rises on the cycle the last sample byte is fetched: three
+    /// CPU cycles of load delay plus the load DMA's halt/dummy/get.
+    #[test]
+    fn the_dmc_irq_rises_on_the_fetch_cycle() {
+        let mut b = Bus::new(cart_all_banks_bb());
+        b.apu.cpu_write(0x4017, 0x40); // inhibit the frame IRQ
+        b.apu.cpu_write(0x4010, 0x8F); // IRQ on, rate $F
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00); // one byte
+        b.apu.cpu_write(0x4015, 0x10);
+        b.instruction_cycles(0);
+
+        let mut cycles = 0;
+        while !b.irq_line {
+            b.tick();
+            b.tick();
+            b.tick();
+            cycles += 1;
+            assert!(cycles < 20, "the DMC IRQ never rose");
+        }
+        assert_eq!(cycles, 5, "3-cycle load delay plus 2 more DMA cycles");
+        assert_eq!(b.dmc_stall, 1, "the get cycle is the last stall cycle");
+        b.tick();
+        b.tick();
+        b.tick();
+        assert_eq!(b.dmc_stall, 0, "the CPU resumes after the get");
+    }
+
+    /// A DMC fetch landing on OAM DMA's second-to-last put costs one extra
+    /// cycle, because the OAM fetch's own dummy/alignment cycles cover the DMC
+    /// halt.
+    #[test]
+    fn a_dmc_fetch_on_the_second_to_last_oam_put_costs_one_cycle() {
+        let mut b = Bus::new(blank_cart());
+        b.apu.cpu_write(0x4010, 0x0F);
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00);
+        b.apu.cpu_write(0x4015, 0x10);
+        b.dma_stall = 5; // after the 3-cycle load delay, 3 OAM cycles remain
+        b.instruction_cycles(0);
+
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(
+            b.dmc_stall, 1,
+            "the second-to-last put overlaps all but one"
+        );
+        assert_eq!(b.dma_stall, 2);
+    }
+
+    /// A DMC fetch landing on OAM DMA's last put costs three extra cycles: the
+    /// DMC still needs its dummy, alignment and get cycles after OAM finishes.
+    #[test]
+    fn a_dmc_fetch_on_the_last_oam_put_costs_three_cycles() {
+        let mut b = Bus::new(blank_cart());
+        b.apu.cpu_write(0x4010, 0x0F);
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00);
+        b.apu.cpu_write(0x4015, 0x10);
+        b.dma_stall = 3; // after the 3-cycle load delay, 1 OAM cycle remains
+        b.instruction_cycles(0);
+
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 3, "the last put leaves the whole DMC sequence");
+        assert_eq!(b.dma_stall, 0);
     }
 }
