@@ -86,6 +86,10 @@ pub struct Bus {
     /// so it is extra time rather than part of the instruction's own cycles.
     dmc_dma: Option<DmcDma>,
     dmc_stall: u16,
+    /// True only on the CPU cycle a DMC request started its halt. A controller
+    /// read conflicts when the halt starts on the instruction's last cycle; a
+    /// DMA already in its dummy cycle does not.
+    dmc_halt_started: bool,
     /// Extra controller clocks caused by a DMC DMA landing on this
     /// instruction's last cycle, computed by `apu_advance_ahead`.
     dmc_controller_extra: u8,
@@ -127,6 +131,7 @@ impl Bus {
             dma_stall: 0,
             dmc_dma: None,
             dmc_stall: 0,
+            dmc_halt_started: false,
             dmc_controller_extra: 0,
             in_instruction: false,
             apu_skip: 0,
@@ -166,6 +171,7 @@ impl Bus {
         self.dma_stall = 0;
         self.dmc_dma = None;
         self.dmc_stall = 0;
+        self.dmc_halt_started = false;
         self.dmc_controller_extra = 0;
         self.in_instruction = false;
         self.apu_skip = 0;
@@ -199,10 +205,10 @@ impl Bus {
     /// IRQ flag the step raised in that cycle to be there, and `05` wants a read
     /// landing on the cycle *after* a length clock to see it.
     ///
-    /// The same pre-advance runs the DMC's DMA. If a fetch is still in its
-    /// halt/dummy/alignment cycles on the instruction's last cycle, the
-    /// controller read is repeated that many times, which is the 2A03's
-    /// DPCM/joypad conflict.
+    /// The same pre-advance runs the DMC's DMA. If a fetch's halt starts on the
+    /// instruction's last cycle, the controller read is repeated once, which is
+    /// the 2A03's DPCM/joypad conflict. A DMA already in its dummy/alignment
+    /// cycles does not conflict.
     fn apu_advance_ahead(&mut self, cycles: u8) {
         // Only the first APU/controller access of an instruction is placed; a
         // second one lands on the same cycle anyway, and `0` means nobody said
@@ -215,31 +221,35 @@ impl Bus {
         for cycle in 0..cycles {
             self.apu.tick();
             self.dmc_cycle();
-            if cycle == last {
-                if let Some(dma) = self.dmc_dma {
-                    if dma.cycles_left > 0 {
-                        // A halted CPU repeats the same read on every no-op
-                        // cycle, but a standard controller clocks once per
-                        // contiguous set of reads: the no-op block is one set
-                        // and the resumed read after the DMA get is another.
-                        // So a conflict deletes one bit, not one per cycle.
-                        self.dmc_controller_extra = 1;
-                    }
-                }
+            if cycle == last && self.dmc_halt_started {
+                // A halted CPU repeats the same read on every no-op cycle,
+                // but a standard controller clocks once per contiguous set of
+                // reads: the no-op block is one set and the resumed read after
+                // the DMA get is another. So a conflict deletes one bit, not
+                // one per cycle. Only a halt that starts on this last cycle
+                // conflicts; a DMA already in its dummy cycle does not.
+                self.dmc_controller_extra = 1;
             }
         }
         self.apu_skip = cycles;
     }
 
-    /// A controller read: a DMC DMA overlapping the instruction's last cycle
-    /// repeats the read, so clock the shift register the extra times hardware
-    /// does and return the last value. The pre-advance is only needed when the
-    /// DMC can still fetch; with playback off this is the one plain read.
+    /// A controller read: a DMC halt starting on the instruction's last cycle
+    /// repeats the read, so clock the shift register the extra time NTSC
+    /// hardware does and return the last value. PAL has no such conflict. The
+    /// pre-advance is only needed when the DMC can still fetch; with playback
+    /// off this is the one plain read.
     fn read_controller(&mut self, port: usize) -> u8 {
         if self.instr_cycles > 0 && self.apu.dmc_playing() {
             self.apu_advance_ahead(self.instr_cycles);
         }
-        let extra = self.dmc_controller_extra;
+        // The 2A07 has no DPCM/joypad conflict; only the NTSC 2A03 repeats
+        // the read.
+        let extra = if self.region == Region::Ntsc {
+            self.dmc_controller_extra
+        } else {
+            0
+        };
         let mut value = self.controllers[port].read();
         for _ in 0..extra {
             value = self.controllers[port].read();
@@ -313,16 +323,26 @@ impl Bus {
     /// One CPU cycle of the DMC memory reader. A request becomes a DMA with
     /// the 3/4-cycle cost NESdev "DMA" gives it; the fetch itself is the last
     /// cycle and goes through `cpu_read`, so it sees the same bus a CPU read
-    /// would. During OAM DMA the units overlap: the common case costs 2 cycles.
+    /// would. During OAM DMA the units overlap: the common case costs 2 cycles,
+    /// the second-to-last OAM put costs 1 and the last put costs 3.
     ///
     /// ponytail: the CPU is atomic per instruction, so the halt is charged
     /// after the instruction retires. Controller reads get the extra clock;
     /// a halt retry on a write cycle is not modeled.
     fn dmc_cycle(&mut self) {
+        self.dmc_halt_started = false;
         if self.dmc_dma.is_none() {
             if let Some(req) = self.apu.take_dmc_fetch() {
                 let cost = if self.dma_stall > 0 {
-                    2
+                    // OAM DMA's last cycle is always a put. A remaining count
+                    // of 1 is that last put (the whole DMC sequence follows);
+                    // 3 is the second-to-last put, whose following get/put
+                    // cover all but one DMC cycle. Every other overlap costs 2.
+                    match self.dma_stall {
+                        1 => 3,
+                        3 => 1,
+                        _ => 2,
+                    }
                 } else {
                     match req.kind {
                         DmcFetchKind::Load => 3,
@@ -336,6 +356,7 @@ impl Bus {
                     cycles_left: cost,
                 });
                 self.dmc_stall += cost as u16;
+                self.dmc_halt_started = true;
             }
         }
         if let Some(mut dma) = self.dmc_dma {
@@ -1253,14 +1274,15 @@ mod tests {
     }
 
     /// The real path: `read_controller` pre-advances the APU, sees the load DMA
-    /// still in its halt cycles on the instruction's last cycle, and clocks the
-    /// controller one extra time.
+    /// halt start on the instruction's last cycle, and clocks the controller one
+    /// extra time.
     #[test]
     fn the_bus_finds_a_dmc_dma_that_lands_on_a_controller_read() {
         let mut b = Bus::new(blank_cart());
         b.controllers[0].set_buttons(0x02); // only B held
         b.cpu_write(0x4016, 1);
         b.cpu_write(0x4016, 0);
+        b.apu.tick(); // make the $4015 write land on a get cycle: 4-cycle load delay
         b.apu.cpu_write(0x4010, 0x0F); // rate $F, no IRQ
         b.apu.cpu_write(0x4012, 0x00);
         b.apu.cpu_write(0x4013, 0x00); // one byte
@@ -1274,6 +1296,51 @@ mod tests {
             "one extra clock consumed A, so B is now in bit 0"
         );
         assert_eq!(b.dmc_stall, 3, "the load DMA still owes its three cycles");
+        b.instruction_cycles(0);
+    }
+
+    /// A DMC DMA that is already in its dummy cycle on the instruction's last
+    /// cycle does not repeat the controller read. Only the cycle the halt
+    /// starts causes the DPCM/joypad conflict.
+    #[test]
+    fn a_dmc_dma_in_its_dummy_cycle_does_not_clock_the_controller() {
+        let mut b = Bus::new(blank_cart());
+        b.controllers[0].set_buttons(0x02); // only B held
+        b.cpu_write(0x4016, 1);
+        b.cpu_write(0x4016, 0);
+        b.apu.cpu_write(0x4010, 0x0F); // rate $F, no IRQ
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00); // one byte
+        b.apu.cpu_write(0x4015, 0x10); // put-cycle write: halt starts on cycle 2
+        b.instruction_cycles(4);
+
+        let got = b.cpu_read(0x4016);
+        assert_eq!(
+            got & 1,
+            0,
+            "the dummy cycle does not repeat the read; A is still in bit 0"
+        );
+        assert_eq!(b.dmc_stall, 3, "the load DMA still owes its three cycles");
+        b.instruction_cycles(0);
+    }
+
+    /// The 2A07 has no DPCM/joypad conflict, so PAL never adds the extra
+    /// controller clock.
+    #[test]
+    fn pal_does_not_repeat_a_controller_read_for_dmc() {
+        let mut b = Bus::new(cart_running_in(Region::Pal, &[]));
+        b.controllers[0].set_buttons(0x02); // only B held
+        b.cpu_write(0x4016, 1);
+        b.cpu_write(0x4016, 0);
+        b.instruction_cycles(4);
+        b.dmc_controller_extra = 1;
+
+        let got = b.cpu_read(0x4016);
+        assert_eq!(
+            got & 1,
+            0,
+            "PAL has no DMC/controller conflict; A is still in bit 0"
+        );
         b.instruction_cycles(0);
     }
 
@@ -1380,5 +1447,51 @@ mod tests {
         b.tick();
         b.tick();
         assert_eq!(b.dmc_stall, 0, "the CPU resumes after the get");
+    }
+
+    /// A DMC fetch landing on OAM DMA's second-to-last put costs one extra
+    /// cycle, because the OAM fetch's own dummy/alignment cycles cover the DMC
+    /// halt.
+    #[test]
+    fn a_dmc_fetch_on_the_second_to_last_oam_put_costs_one_cycle() {
+        let mut b = Bus::new(blank_cart());
+        b.apu.cpu_write(0x4010, 0x0F);
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00);
+        b.apu.cpu_write(0x4015, 0x10);
+        b.dma_stall = 5; // after the 3-cycle load delay, 3 OAM cycles remain
+        b.instruction_cycles(0);
+
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(
+            b.dmc_stall, 1,
+            "the second-to-last put overlaps all but one"
+        );
+        assert_eq!(b.dma_stall, 2);
+    }
+
+    /// A DMC fetch landing on OAM DMA's last put costs three extra cycles: the
+    /// DMC still needs its dummy, alignment and get cycles after OAM finishes.
+    #[test]
+    fn a_dmc_fetch_on_the_last_oam_put_costs_three_cycles() {
+        let mut b = Bus::new(blank_cart());
+        b.apu.cpu_write(0x4010, 0x0F);
+        b.apu.cpu_write(0x4012, 0x00);
+        b.apu.cpu_write(0x4013, 0x00);
+        b.apu.cpu_write(0x4015, 0x10);
+        b.dma_stall = 3; // after the 3-cycle load delay, 1 OAM cycle remains
+        b.instruction_cycles(0);
+
+        for _ in 0..3 {
+            b.tick();
+            b.tick();
+            b.tick();
+        }
+        assert_eq!(b.dmc_stall, 3, "the last put leaves the whole DMC sequence");
+        assert_eq!(b.dma_stall, 0);
     }
 }
