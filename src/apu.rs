@@ -11,6 +11,8 @@
 //! DMC is cut: `$4010-$4013` writes are dropped and `$4015` bits 4 and 7
 //! always read 0.
 
+use crate::region::Region;
+
 /// The length counter table: `$4003` bits 7-3 index it directly (all 32
 /// entries; NESdev "APU Length Counter").
 const LENGTH_TABLE: [u8; 32] = [
@@ -35,8 +37,19 @@ const NOISE_PERIODS: [u16; 16] = [
     4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068,
 ];
 
-/// The NTSC CPU clock, the mixer's time base.
-const CPU_HZ: u32 = 1_789_773;
+/// The same table for the 2A07 (NESdev "APU Noise", PAL column). The 2A07's
+/// CPU clock is slower, but the shift-register periods are shorter, not just
+/// divided: $2 is 14 cycles against NTSC's 16, and $F is 3778 against 4068.
+const PAL_NOISE_PERIODS: [u16; 16] = [
+    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778,
+];
+
+fn noise_periods(region: Region) -> &'static [u16; 16] {
+    match region {
+        Region::Ntsc => &NOISE_PERIODS,
+        Region::Pal => &PAL_NOISE_PERIODS,
+    }
+}
 
 /// One second of stereo samples at 48 kHz: 96,000 `i16`, which is 48,000
 /// stereo pairs. When the queue is full the newest pair is dropped, which
@@ -83,10 +96,12 @@ struct Frame {
     half: bool,
     /// The interrupt flag is still being re-raised for this many CPU cycles.
     pulse: u8,
+    /// Which step schedule and APU-cycle count this frame counter uses.
+    region: Region,
 }
 
 impl Frame {
-    fn new() -> Frame {
+    fn new(region: Region) -> Frame {
         Frame {
             mode: 0,
             inhibit: false,
@@ -99,6 +114,7 @@ impl Frame {
             quarter: false,
             half: false,
             pulse: 0,
+            region,
         }
     }
 
@@ -148,6 +164,15 @@ impl Frame {
         self.reset_in = delay;
     }
 
+    /// Quarter, second (quarter+half), third quarter, interrupt, and the
+    /// 5-step mode's last quarter+half, in APU cycles.
+    fn steps(&self) -> (u32, u32, u32, u32, u32) {
+        match self.region {
+            Region::Ntsc => (3728, 7456, 11185, 14914, 18640),
+            Region::Pal => (4156, 8313, 12469, 16626, 20782),
+        }
+    }
+
     /// One CPU cycle: toggles the APU clock phase, advances the counter on
     /// GET halves, fires the step clocks on PUT halves.
     fn tick(&mut self) -> Clocks {
@@ -177,9 +202,14 @@ impl Frame {
             // "with an additional delay of one CPU cycle for the quarter and
             // half frame signals": the step raises them, the next CPU cycle
             // delivers them. The interrupt flag below is NOT delayed.
+            let (first, second, third, interrupt, fifth) = self.steps();
             match (self.mode, self.cycle) {
-                (_, 3728) | (_, 11185) => self.quarter = true,
-                (_, 7456) | (0, 14914) | (1, 18640) => {
+                (_, c) if c == first || c == third => self.quarter = true,
+                (_, c)
+                    if c == second
+                        || (self.mode == 0 && c == interrupt)
+                        || (self.mode == 1 && c == fifth) =>
+                {
                     self.quarter = true;
                     self.half = true;
                 }
@@ -187,17 +217,22 @@ impl Frame {
             }
             // The frame IRQ flag is NOT delayed with them: the wiki's table
             // sets it on three consecutive CPU cycles, 14914 GET through
-            // 14915 GET, which is what `apu_2005`'s `07.irq_flag_timing`
-            // measures.
-            if self.mode == 0 && self.cycle == 14914 {
+            // 14915 GET (16626 through 16627 on PAL), which is what
+            // `apu_2005`'s `07.irq_flag_timing` measures.
+            if self.mode == 0 && self.cycle == interrupt {
                 self.set_flag();
                 self.pulse = 2;
             }
         } else {
             self.cycle += 1;
-            match (self.mode, self.cycle) {
-                (0, 14915) | (1, 18641) => self.cycle = 0,
-                _ => {}
+            let (_, _, _, interrupt, fifth) = self.steps();
+            let end = if self.mode == 0 {
+                interrupt + 1
+            } else {
+                fifth + 1
+            };
+            if self.cycle == end {
+                self.cycle = 0;
             }
         }
         clocks
@@ -555,14 +590,23 @@ struct Noise {
     /// 15 bits of shift register, "loaded with the value 1" at power-up.
     lfsr: u16,
     envelope: Envelope,
+    /// Which CPU's period table `$400E` indexes.
+    region: Region,
 }
 
 impl Noise {
+    #[cfg(test)]
     fn new() -> Noise {
+        Noise::for_region(Region::Ntsc)
+    }
+
+    fn for_region(region: Region) -> Noise {
+        let period = noise_periods(region)[0];
         Noise {
-            period: NOISE_PERIODS[0],
-            divider: NOISE_PERIODS[0],
+            period,
+            divider: period,
             lfsr: 1,
+            region,
             ..Noise::default()
         }
     }
@@ -574,7 +618,7 @@ impl Noise {
 
     fn write_period(&mut self, val: u8) {
         self.mode = val & 0x80 != 0;
-        self.period = NOISE_PERIODS[(val & 0x0F) as usize];
+        self.period = noise_periods(self.region)[(val & 0x0F) as usize];
     }
 
     fn write_length(&mut self, val: u8) {
@@ -631,20 +675,29 @@ pub struct Apu {
     /// Power-on and reset do not clear it, so it is a monotonic measure of how
     /// far the APU has been advanced, for tests and debugging.
     ticks: u64,
+    /// Which CPU's clock and period tables this APU is.
+    region: Region,
 }
 
 impl Apu {
+    #[cfg(test)]
     pub fn new() -> Apu {
+        Apu::for_region(Region::Ntsc)
+    }
+
+    /// A 2A03 for NTSC or a 2A07 for PAL.
+    pub fn for_region(region: Region) -> Apu {
         let mut apu = Apu {
             pulses: [Pulse::new(true), Pulse::new(false)],
             triangle: Triangle::default(),
-            noise: Noise::new(),
-            frame: Frame::new(),
+            noise: Noise::for_region(region),
+            frame: Frame::new(region),
             apu_phase: false,
             rate: 48_000,
             acc: 0,
             samples: Vec::new(),
             ticks: 0,
+            region,
         };
         apu.power_on();
         apu
@@ -656,8 +709,8 @@ impl Apu {
     pub fn power_on(&mut self) {
         self.pulses = [Pulse::new(true), Pulse::new(false)];
         self.triangle = Triangle::default();
-        self.noise = Noise::new();
-        self.frame = Frame::new();
+        self.noise = Noise::for_region(self.region);
+        self.frame = Frame::new(self.region);
         self.frame.start(0x00, RESET_PRE);
     }
 
@@ -683,7 +736,7 @@ impl Apu {
         }
         self.triangle.len.clear();
         self.noise.len.clear();
-        self.frame = Frame::new();
+        self.frame = Frame::new(self.region);
         self.frame.start(last, RESET_PRE);
     }
 
@@ -747,8 +800,8 @@ impl Apu {
         }
 
         self.acc += self.rate;
-        while self.acc >= CPU_HZ {
-            self.acc -= CPU_HZ;
+        while self.acc >= self.region.cpu_hz() {
+            self.acc -= self.region.cpu_hz();
             self.emit();
         }
     }
@@ -1330,6 +1383,52 @@ mod tests {
         assert!(
             gaps.iter().all(|&g| g == 4),
             "P = 0 is 4 CPU cycles: {gaps:?}"
+        );
+    }
+
+    /// The PAL period table, and the same "P = 2" register selecting 14 CPU
+    /// cycles instead of the NTSC 16.
+    #[test]
+    fn the_period_table_matches_the_pal_values() {
+        assert_eq!(
+            PAL_NOISE_PERIODS,
+            [4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778]
+        );
+
+        let mut apu = Apu::for_region(Region::Pal);
+        apu.cpu_write(0x400E, 0x02);
+        assert_eq!(apu.noise.period, 14);
+    }
+
+    /// The 2A07's frame counter runs at 50 Hz: quarter at APU cycle 4156, half
+    /// at 8313, quarter at 12469, and the mode-0 interrupt at 16626, wrapping
+    /// at 16627 (NESdev "APU Frame Counter", PAL column).
+    #[test]
+    fn the_pal_frame_counter_steps_at_the_2a07_period() {
+        let mut f = Frame::new(Region::Pal);
+        f.start(0x00, 0);
+        for _ in 0..33_252 {
+            f.tick();
+        }
+        assert!(!f.flag, "no interrupt one CPU cycle early");
+        f.tick();
+        assert!(f.flag, "the flag rises at APU cycle 16626");
+        f.tick();
+        assert_eq!(f.cycle, 0, "the sequence wraps at 16627");
+    }
+
+    /// The mixer's accumulator is the CPU clock's: half a 2A07 second must be
+    /// 24,000 stereo frames, not the 22,304 an NTSC clock would emit.
+    #[test]
+    fn the_pal_mixer_runs_on_the_2a07_clock() {
+        let mut apu = Apu::for_region(Region::Pal);
+        for _ in 0..831_303 {
+            apu.tick();
+        }
+        let pairs = apu.take_samples().len() / 2;
+        assert!(
+            (23_900..=24_100).contains(&pairs),
+            "half a PAL second emitted {pairs} stereo frames"
         );
     }
 

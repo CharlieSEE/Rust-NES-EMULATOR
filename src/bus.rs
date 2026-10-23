@@ -30,6 +30,7 @@ use crate::apu::Apu;
 use crate::controller::Controller;
 use crate::cpu::{BusLike, Cpu};
 use crate::ppu::Ppu;
+use crate::region::Region;
 use crate::rom::Cartridge;
 
 /// CPU cycles an OAM DMA costs on an even cycle: one dummy read/write cycle,
@@ -53,6 +54,12 @@ pub struct Bus {
     /// Dots into the current CPU cycle, 0..3. `tick` is one dot and the DMA
     /// stall is counted in whole cycles, so the conversion lives here.
     dot: u8,
+    /// Which console timing the cartridge asked for.
+    region: Region,
+    /// Tick calls since the last extra PPU dot. PAL runs 16 PPU dots per 5 CPU
+    /// cycles, so one of every 15 calls (3 calls per cycle) advances the PPU
+    /// twice.
+    pal_extra: u8,
     /// CPU cycles the last OAM DMA cost on hardware. Counted, drained by `tick`,
     /// and now ENFORCED: `main`'s run loop gates the CPU on `dma_busy()` and
     /// spends these cycles ticking the PPU, which keeps clocking during the
@@ -78,15 +85,18 @@ pub struct Bus {
 
 impl Bus {
     pub fn new(cart: Cartridge) -> Bus {
+        let region = cart.region();
         let mut bus = Bus {
             cart,
             cpu_ram: [0; 2048],
             prg_ram: [0; 8192],
-            ppu: Ppu::new(),
-            apu: Apu::new(),
+            ppu: Ppu::for_region(region),
+            apu: Apu::for_region(region),
             controllers: [Controller::new(), Controller::new()],
             cycles: 0,
             dot: 0,
+            region,
+            pal_extra: 0,
             dma_stall: 0,
             apu_skip: 0,
             instr_cycles: 0,
@@ -121,6 +131,7 @@ impl Bus {
     fn clear_clock(&mut self) {
         self.cycles = 0;
         self.dot = 0;
+        self.pal_extra = 0;
         self.dma_stall = 0;
         self.apu_skip = 0;
         self.instr_cycles = 0;
@@ -250,9 +261,17 @@ impl Bus {
     /// Advance the PPU by **one dot** (and the APU once the dots make a whole
     /// CPU cycle). `Cpu::step` calls `tick` three times per cycle it consumes
     /// (see `BusLike`), and SMB's sprite-0 hit depends on that ratio, so
-    /// nothing here may add a factor of three.
+    /// nothing here may add a factor of three. On PAL the CPU:PPU ratio is
+    /// 5:16, so one call in fifteen adds a second dot.
     pub fn tick(&mut self) {
         self.ppu.tick();
+        if self.region == Region::Pal {
+            self.pal_extra += 1;
+            if self.pal_extra == 15 {
+                self.pal_extra = 0;
+                self.ppu.tick();
+            }
+        }
         self.dot += 1;
         if self.dot < 3 {
             return;
@@ -381,6 +400,25 @@ mod tests {
 
     fn blank_cart() -> Cartridge {
         cart_running(&[])
+    }
+
+    /// `cart_running`, but with `region` selected through a NES 2.0 byte 12
+    /// (1 = RP2C07).
+    fn cart_running_in(region: Region, code: &[u8]) -> Cartridge {
+        let mut h = ines_header();
+        if region == Region::Pal {
+            h[7] |= 0x08; // NES 2.0 signature
+            h[12] = 0x01; // licensed PAL
+        }
+        let mut bytes = h.to_vec();
+        for fill in 0..2u8 {
+            bytes.extend(std::iter::repeat_n(fill, BANK));
+        }
+        let at = 16 + POWER_ON_BANK * BANK;
+        bytes[at..at + code.len()].copy_from_slice(code);
+        let vectors = 16 + POWER_ON_BANK * BANK + (0xFFFC - 0x8000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        Cartridge::load(&bytes).expect("synthetic image must load")
     }
 
     /// A 16 KiB NROM image with no CHR bytes at all, like blargg's 2005 suite:
@@ -574,6 +612,25 @@ mod tests {
             "one tick per cycle puts the flag up at 29831 cycles"
         );
         assert!(cycles <= 29_840, "and not much later: {cycles}");
+    }
+
+    /// The PAL PPU runs 16 dots for every 5 CPU cycles (3.2), not 3. A full
+    /// 312-line frame is 106,392 dots = 33,247.5 CPU cycles; keeping the NTSC
+    /// 3-dot ratio would finish it in 29,780 and run the CPU 6.7% slow.
+    #[test]
+    fn pal_advances_sixteen_ppu_dots_per_five_cpu_cycles() {
+        let mut b = Bus::new(cart_running_in(Region::Pal, &[0xEA, 0x4C, 0x00, 0x80]));
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut b);
+        b.run_frame(&mut cpu);
+        b.ppu.take_frame();
+        let start = b.cycles;
+        b.run_frame(&mut cpu);
+        let frame = b.cycles - start;
+        assert!(
+            (33_247..=33_253).contains(&frame),
+            "a PAL frame used {frame} CPU cycles"
+        );
     }
 
     /// The APU's frame IRQ is maskable: with `I` clear it is taken through

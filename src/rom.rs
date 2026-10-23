@@ -44,6 +44,7 @@
 //!    the game's own `JSR $E5C1`.
 
 use crate::ppu::Mirroring;
+use crate::region::Region;
 
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
 /// PRG ROM bank" -- ONE 32 KiB block over the whole window. There is no
@@ -100,6 +101,8 @@ pub struct Cartridge {
     /// Whether the header marks PRG RAM as battery-backed, so it should be
     /// written to a `.sav` file next to the ROM.
     battery: bool,
+    /// Which console timing the header asks for.
+    region: Region,
 }
 
 /// The four boards this emulator knows how to read.
@@ -135,6 +138,31 @@ impl Cartridge {
             return Err(format!("truncated CHR: header claims {chr_len} bytes"));
         }
         let mapper = bytes[7] & 0xF0 | bytes[6] >> 4;
+        // NES 2.0 marks itself in flags 7 bits 2-3 and puts the CPU/PPU timing
+        // in byte 12: 0 NTSC, 1 licensed PAL, 2 multiple-region, 3 Dendy. A
+        // plain iNES header only has flags 9 bit 0 and flags 10 bits 0-1, and
+        // those bytes are padding in every other header variant -- including
+        // the "DiskDude!" corruption, whose 's' in flags 9 would otherwise
+        // claim PAL. NESdev's detection requires flags 7 bits 2-3 clear AND
+        // bytes 12-15 zero before iNES fields are trusted; a ripper signature
+        // in the tail can leave anything in flags 9/10.
+        //
+        // ponytail: Dendy and multiple-region fall back to NTSC. Both are a
+        // mixed clock this emulator has no model for; add a Region variant
+        // when a Dendy game turns up.
+        let flags7 = bytes[7];
+        let nes20 = flags7 & 0x0C == 0x08;
+        let plain_ines = flags7 & 0x0C == 0x00 && bytes[12..16] == [0; 4];
+        let region = if nes20 {
+            match bytes[12] & 0x03 {
+                1 => Region::Pal,
+                _ => Region::Ntsc,
+            }
+        } else if plain_ines && (bytes[9] & 0x01 != 0 || bytes[10] & 0x03 == 0x02) {
+            Region::Pal
+        } else {
+            Region::Ntsc
+        };
         let board = match mapper {
             0 => Board::Nrom,
             1 => Board::Mmc1,
@@ -170,6 +198,7 @@ impl Cartridge {
             prg_ram_enabled: true,
             mirroring,
             battery: flags6 & 0x02 != 0,
+            region,
         })
     }
 
@@ -185,6 +214,11 @@ impl Cartridge {
     /// Whether the cartridge has battery-backed PRG RAM to persist.
     pub fn has_battery(&self) -> bool {
         self.battery
+    }
+
+    /// The console timing the header selected.
+    pub fn region(&self) -> Region {
+        self.region
     }
 
     /// The CHR ROM image, for the PPU to hold. Borrowed, not copied.
@@ -781,6 +815,67 @@ mod tests {
         assert!(c.prg_ram_enabled(), "clearing bit 4 enables it again");
     }
 
+    /// Region comes from the header. NES 2.0's byte 12 is the authority when
+    /// its signature is present; otherwise iNES flags 9 bit 0 and flags 10
+    /// bits 0-1 are the only region fields iNES has.
+    #[test]
+    fn the_header_selects_the_region() {
+        let load = |h: [u8; 16]| {
+            let mut bytes = h.to_vec();
+            bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+            Cartridge::load(&bytes).expect("synthetic region image must load")
+        };
+
+        let mut flags9 = ines_header(1, 0, 0);
+        flags9[9] = 1;
+        assert_eq!(load(flags9).region(), Region::Pal, "iNES flags 9 bit 0");
+
+        let mut flags10 = ines_header(1, 0, 0);
+        flags10[10] = 0x02;
+        assert_eq!(
+            load(flags10).region(),
+            Region::Pal,
+            "iNES flags 10 says PAL"
+        );
+
+        // NES 2.0: byte 7 bits 2-3 are the signature, byte 12 bits 0-1 the
+        // timing mode (1 = RP2C07, licensed PAL).
+        let mut nes20 = ines_header(1, 0, 0);
+        nes20[7] |= 0x08;
+        nes20[12] = 0x01;
+        assert_eq!(load(nes20).region(), Region::Pal, "NES 2.0 byte 12");
+
+        assert_eq!(
+            load(ines_header(1, 0, 0)).region(),
+            Region::Ntsc,
+            "a plain header still boots NTSC"
+        );
+
+        // flags 9's PAL bit is only meaningful in an otherwise valid iNES
+        // header. "DiskDude!"-corrupted headers put 's' (0x73) there; flags 7
+        // bits 2-3 are the tell.
+        let mut junk = ines_header(1, 0, 0);
+        junk[7] = 0x04;
+        junk[9] = 0x01;
+        assert_eq!(
+            load(junk).region(),
+            Region::Ntsc,
+            "reserved flags 7 bits do not claim PAL"
+        );
+
+        // NESdev's iNES detection also requires bytes 12-15 to be zero. A
+        // ripper signature there can leave garbage in flags 9/10, so those
+        // bytes must not select the region.
+        let mut signature = ines_header(1, 0, 0);
+        signature[9] = 0x01;
+        signature[12..].copy_from_slice(b"JUNK");
+        assert_eq!(
+            load(signature).region(),
+            Region::Ntsc,
+            "a signed header is not plain iNES"
+        );
+    }
+
     #[test]
     fn the_real_zelda_cartridge_loads_as_mmc1_with_a_battery() {
         let Some(bytes) = test_rom("Legend of Zelda, The (Europe) (Rev 1).nes") else {
@@ -788,6 +883,11 @@ mod tests {
         };
         let c = Cartridge::load(&bytes).expect("Zelda must load");
         assert!(matches!(c.board, Board::Mmc1), "mapper 1 is MMC1");
+        assert_eq!(
+            c.region(),
+            Region::Pal,
+            "the European ROM marks RP2C07 in NES 2.0 byte 12"
+        );
         assert!(c.has_battery(), "Zelda saves to battery-backed PRG RAM");
         assert!(c.chr_rom().is_empty(), "Zelda uploads its own tiles");
         assert_eq!(
