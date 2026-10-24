@@ -34,6 +34,10 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 - [x] **Save states** — serialize CPU, PPU, APU, bus, cartridge/mapper and PRG RAM. Version the format and refuse incompatible states cleanly. *Done; format version 1, quicksave slots build on it.*
 - [x] **Quicksave/quickload slots** — hotkeys for 1–9 save slots plus load-latest. *Done; `1`–`9` save, `Shift`+`1`–`9` load, `F8` loads the newest slot.*
+- [ ] **Save-state slot picker** — in-game list of slots 1–9 with timestamps and a compatibility check, then load or cancel. Needs a text overlay over the frame. *Effort: M.*
+- [ ] **Save-state status messages** — brief confirmation of the saved slot and on-screen text for load and write failures; today only stderr and `nes-errors.log` record them. *Effort: S, after the overlay from the slot picker.*
+- [ ] **Auto-save state on quit** — write a reserved slot on a clean exit so a session can resume without pressing a digit. *Effort: S.*
+- [ ] **Unpause after quickload** — loading while paused leaves the pre-load frame on screen until the next frame runs. *Effort: S.*
 - [ ] **Rewind** — ring buffer of compressed save states sampled every N frames. *Effort: M, after save states.*
 - [ ] **Fast-forward** — hold-to-turbo, with audio muted or pitch-shifted. *Effort: S.*
 - [ ] **Frame advance** — pause plus single-frame stepping. *Effort: S.*
