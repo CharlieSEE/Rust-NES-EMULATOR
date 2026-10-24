@@ -99,9 +99,11 @@ the cartridge runs but cannot be aimed.
   not boot and will exit with a mapper error.
 - Save states live beside the ROM as `.state1`–`.state9` files, with a small
   `.state` index naming the newest: a bare digit saves, `Left Shift`+digit
-  loads, `F8` loads the most recently saved slot. A state is tied to the exact
-  ROM and state format version, and a bad or foreign file is refused without
-  disturbing the running game. Rewind and cheats are not implemented yet.
+  loads, `F8` loads the most recently saved slot. A brief message on the frame
+  confirms a save; failed save-state loads and writes are shown there too, as
+  well as in `nes-errors.log`. A state is tied to the exact ROM and state
+  format version, and a bad or foreign file is refused without disturbing the
+  running game. Rewind and cheats are not implemented yet.
 
 ## For tinkerers
 

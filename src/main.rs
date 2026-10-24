@@ -18,6 +18,7 @@ mod region;
 mod report;
 mod rom;
 mod state;
+mod text;
 
 use bus::Bus;
 use cpu::Cpu;
@@ -208,6 +209,137 @@ fn load_latest_state(
         )
     })?;
     load_state_slot(rom_path, slot, bus, cpu)
+}
+
+/// A save writes no pixel, so a short confirmation is the only sign it
+/// happened. Long enough to read, short enough to get out of the way.
+const SAVE_TOAST: ::std::time::Duration = ::std::time::Duration::from_secs(2);
+
+/// Failures carry a path and a reason; they stay up longer, and the full text
+/// is still in stderr and `nes-errors.log`.
+const ERROR_TOAST: ::std::time::Duration = ::std::time::Duration::from_secs(6);
+
+/// The overlay uses the same 8x8 bitmap font as the launcher, 28 characters
+/// wide inside the 256-pixel screen, with a dark box behind the text so it
+/// stays readable over a bright game.
+const TOAST_COLS: usize = 28;
+const TOAST_PAD: usize = 4;
+const TOAST_MARGIN: usize = 8;
+/// Errors from a deep path can wrap to many lines. The first screenful is
+/// shown; the last line points at the log that kept the whole message.
+const TOAST_MAX_LINES: usize = 10;
+const TOAST_BG: u32 = 0x0010_1418;
+const TOAST_FG: u32 = 0x00E8_E8E8;
+
+/// A short message drawn over the frame. Held in the main loop rather than in
+/// the emulator, so showing it can never disturb a save state.
+struct Toast {
+    lines: Vec<String>,
+    until: ::std::time::Instant,
+}
+
+impl Toast {
+    fn new(message: &str, ttl: ::std::time::Duration) -> Toast {
+        let mut lines = wrap_text(message, TOAST_COLS);
+        if lines.len() > TOAST_MAX_LINES {
+            lines.truncate(TOAST_MAX_LINES - 1);
+            lines.push("... see nes-errors.log".to_string());
+        }
+        Toast {
+            lines,
+            until: ::std::time::Instant::now() + ttl,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        ::std::time::Instant::now() < self.until
+    }
+}
+
+/// Greedy word wrap at `width` characters. A word longer than a whole line --
+/// a path or a filename -- is cut at the edge rather than dropped, so the
+/// start of it still reaches the player.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if width == 0 {
+        return lines;
+    }
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        loop {
+            let used = line.chars().count();
+            let room = width.saturating_sub(used + usize::from(used > 0));
+            if room == 0 {
+                lines.push(::std::mem::take(&mut line));
+                continue;
+            }
+            let word_len = word.chars().count();
+            if word_len <= room {
+                if used > 0 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                break;
+            }
+            // A word that does not fit moves to a fresh line whole; only a
+            // word longer than the screen is cut, and only after it starts a
+            // line.
+            if used > 0 {
+                lines.push(::std::mem::take(&mut line));
+                continue;
+            }
+            let cut = word
+                .char_indices()
+                .nth(room)
+                .map_or(word.len(), |(index, _)| index);
+            let (head, tail) = word.split_at(cut);
+            line.push_str(head);
+            word = tail;
+            if word.is_empty() {
+                break;
+            }
+            lines.push(::std::mem::take(&mut line));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Paint a centered box holding the toast's lines near the bottom of the
+/// frame. `Toast::new` bounds the width and line count, so the box always
+/// fits.
+fn draw_toast(fb: &mut [u32], toast: &Toast) {
+    let Some(text_width) = toast.lines.iter().map(|line| line.chars().count()).max() else {
+        return;
+    };
+    let box_width = text_width * text::CELL + 2 * TOAST_PAD;
+    let box_height = toast.lines.len() * text::CELL + 2 * TOAST_PAD;
+    let x = (W - box_width) / 2;
+    let y = H - TOAST_MARGIN - box_height;
+    for row in y..y + box_height {
+        fb[row * W + x..row * W + x + box_width].fill(TOAST_BG);
+    }
+    for (index, line) in toast.lines.iter().enumerate() {
+        text::put_text(
+            fb,
+            W,
+            H,
+            x + TOAST_PAD,
+            y + TOAST_PAD + index * text::CELL,
+            line,
+            TOAST_FG,
+        );
+    }
+}
+
+/// Record a failed save or load and put the same text on screen. The log line
+/// stays the durable half; the toast is what a fullscreen player can see.
+fn toast_error(toast: &mut Option<Toast>, message: &str) {
+    report::log_error(message);
+    *toast = Some(Toast::new(message, ERROR_TOAST));
 }
 
 /// Which button a held key presses, or `None` for a key that is not on the pad.
@@ -604,6 +736,8 @@ fn run() -> Result<(), String> {
     let mut muted = false;
     let mut fullscreen = false;
     let mut running = true;
+    let mut toast: Option<Toast> = None;
+    let mut overlay = vec![0u32; W * H];
     let mut frames = 0u32;
     while running {
         // Started before anything else in the frame so the emulation, the
@@ -690,12 +824,15 @@ fn run() -> Result<(), String> {
                                     queue.clear();
                                 }
                             }
-                            Err(e) => report::log_error(&e),
+                            Err(e) => toast_error(&mut toast, &e),
                         }
-                    } else if let Err(e) =
-                        save_state_slot(::std::path::Path::new(&rom_path), slot, &bus, &cpu)
-                    {
-                        report::log_error(&e);
+                    } else {
+                        match save_state_slot(::std::path::Path::new(&rom_path), slot, &bus, &cpu) {
+                            Ok(()) => {
+                                toast = Some(Toast::new(&format!("Saved slot {slot}"), SAVE_TOAST))
+                            }
+                            Err(e) => toast_error(&mut toast, &e),
+                        }
                     }
                 }
                 Event::KeyDown {
@@ -709,7 +846,7 @@ fn run() -> Result<(), String> {
                             queue.clear();
                         }
                     }
-                    Err(e) => report::log_error(&e),
+                    Err(e) => toast_error(&mut toast, &e),
                 },
                 Event::ControllerDeviceAdded { which, .. } => {
                     if let Some(controllers) = &controller_subsystem {
@@ -789,7 +926,17 @@ fn run() -> Result<(), String> {
                 break;
             }
         }
-        let frame = bus.ppu.framebuffer();
+        if toast.as_ref().is_some_and(|toast| !toast.visible()) {
+            toast = None;
+        }
+        let frame = match toast.as_ref() {
+            Some(toast) => {
+                overlay.copy_from_slice(bus.ppu.framebuffer());
+                draw_toast(&mut overlay, toast);
+                &overlay[..]
+            }
+            None => bus.ppu.framebuffer(),
+        };
         // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
         // all len*4 bytes of the frame are valid to read as u8.
         let frame_bytes =
@@ -869,10 +1016,11 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_event, audio_sleep, button_for, dump_list_ends_run, frame_budget, frame_sleep,
-        latest_state_path, load_state_slot, mask_for_name, missed_dumps, parse_script,
-        read_latest_slot, save_state_slot, slot_for, state_slot_path, write_atomic, Bus, Cartridge,
-        Cpu, Play, Region, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET,
+        apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run, frame_budget,
+        frame_sleep, latest_state_path, load_state_slot, mask_for_name, missed_dumps, parse_script,
+        read_latest_slot, save_state_slot, slot_for, state_slot_path, wrap_text, write_atomic, Bus,
+        Cartridge, Cpu, Play, Region, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
+        FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -1417,5 +1565,68 @@ mod tests {
             "the later one only"
         );
         assert_eq!(missed_dumps(&[9, 3, 5], 7), [9], "order does not matter");
+    }
+
+    /// A status message must fit the 256-pixel screen, so it wraps before it
+    /// is drawn. A long unbroken word -- a path or a filename -- is cut at the
+    /// edge instead of running off it.
+    #[test]
+    fn a_status_message_wraps_to_the_screen_width() {
+        assert_eq!(wrap_text("Saved slot 3", 28), ["Saved slot 3"]);
+        assert_eq!(
+            wrap_text("state slot 9 is empty: /roms/Legend of Zelda.state9", 28),
+            ["state slot 9 is empty:", "/roms/Legend of Zelda.state9"]
+        );
+        let long = "x".repeat(60);
+        let lines = wrap_text(&long, 28);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.chars().count())
+                .collect::<Vec<_>>(),
+            [28, 28, 4],
+            "a word longer than the screen is cut, not dropped"
+        );
+        assert_eq!(lines.concat(), long, "cutting loses no characters");
+    }
+
+    /// The confirmation is brief: a zero lifetime is already over, a real one
+    /// is still on screen.
+    #[test]
+    fn a_status_message_expires() {
+        assert!(!Toast::new("Saved slot 3", Duration::ZERO).visible());
+        assert!(Toast::new("Saved slot 3", Duration::from_secs(2)).visible());
+    }
+
+    /// The box has a fixed height. A cut-off message must say so rather than
+    /// looking complete, and point at the log that kept the rest.
+    #[test]
+    fn a_long_status_message_says_where_the_rest_is() {
+        let message = "word ".repeat(80);
+        let toast = Toast::new(&message, Duration::from_secs(6));
+        assert_eq!(toast.lines.len(), 10);
+        assert_eq!(toast.lines.last().unwrap(), "... see nes-errors.log");
+    }
+
+    /// A path longer than the screen still starts on a fresh line instead of
+    /// filling whatever room the preceding words left.
+    #[test]
+    fn a_word_too_long_for_the_line_starts_a_fresh_one() {
+        let long = "x".repeat(40);
+        assert_eq!(
+            wrap_text(&format!("load {long}"), 28),
+            ["load".to_string(), "x".repeat(28), "x".repeat(12)]
+        );
+    }
+
+    /// The overlay owns its box and leaves the rest of the frame alone.
+    #[test]
+    fn a_status_message_paints_a_box_over_the_frame() {
+        let mut fb = vec![0u32; W * H];
+        let toast = Toast::new("Saved slot 3", Duration::from_secs(2));
+        draw_toast(&mut fb, &toast);
+        assert_eq!(fb[0], 0, "the top-left corner is untouched");
+        assert!(fb.contains(&TOAST_BG), "the box background is drawn");
+        assert!(fb.contains(&TOAST_FG), "the message text is drawn");
     }
 }
