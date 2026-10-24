@@ -387,9 +387,7 @@ impl Bus {
     /// bytes are the versioned file format described in `state.rs`; the ROM
     /// itself is identified by fingerprint, not copied.
     ///
-    /// Nothing in the player loop calls this yet: quicksave slots are their own
-    /// issue, and this is the engine they build on.
-    #[allow(dead_code)]
+    /// The player's quicksave slots call this from the run loop.
     pub fn save_state(&self, cpu: &Cpu) -> Vec<u8> {
         let mut payload = StateWriter::new();
         cpu.save_state(&mut payload);
@@ -428,7 +426,6 @@ impl Bus {
     /// whole payload is applied to a clone and only swapped in when every byte
     /// and every check has succeeded, so a bad file cannot leave half a machine
     /// behind.
-    #[allow(dead_code)]
     pub fn load_state(&mut self, cpu: &mut Cpu, data: &[u8]) -> Result<(), String> {
         let mut reader = crate::state::unwrap(
             data,

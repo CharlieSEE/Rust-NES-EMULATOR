@@ -1,6 +1,6 @@
 use sdl2::controller::Button;
 use sdl2::event::{Event, WindowEvent};
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Mod, Scancode};
 
 mod apu;
 #[cfg(test)]
@@ -94,6 +94,103 @@ const BUTTONS: [(Keycode, &str, u8); 8] = [
 /// Words a script may use for a bit it does not spell out. A is jump and B is
 /// run/fire in both SMB and Duck Hunt, so a script can say what it means.
 const ALIASES: [(&str, &str); 3] = [("JUMP", "A"), ("RUN", "B"), ("FIRE", "B")];
+
+/// Quick save slots, in key order. A bare digit writes the slot under the key;
+/// Shift plus the same digit loads it, because loading throws away the run in
+/// progress and should take a deliberate press. `F8` loads whichever slot was
+/// written most recently.
+const SLOT_KEYS: [Scancode; 9] = [
+    Scancode::Num1,
+    Scancode::Num2,
+    Scancode::Num3,
+    Scancode::Num4,
+    Scancode::Num5,
+    Scancode::Num6,
+    Scancode::Num7,
+    Scancode::Num8,
+    Scancode::Num9,
+];
+
+/// Which quick save slot a key names, one-based, or `None` for any other key.
+/// Matched by scancode, so the digit key is the same one under any layout and
+/// with Shift held.
+fn slot_for(key: Scancode) -> Option<usize> {
+    SLOT_KEYS
+        .iter()
+        .position(|&slot_key| slot_key == key)
+        .map(|index| index + 1)
+}
+
+/// Where slot `slot` lives: beside the ROM, next to its battery save, so a
+/// folder of ROMs takes its states with it. `Zelda.nes` becomes
+/// `Zelda.state3`.
+fn state_slot_path(rom_path: &::std::path::Path, slot: usize) -> ::std::path::PathBuf {
+    rom_path.with_extension(format!("state{slot}"))
+}
+
+/// The saved slot with the newest file, ties going to the higher slot. Takes
+/// the times rather than reading them so the choice is testable without
+/// touching a clock.
+fn newest_state(
+    saved: impl IntoIterator<Item = (::std::time::SystemTime, usize)>,
+) -> Option<usize> {
+    saved.into_iter().max().map(|(_, slot)| slot)
+}
+
+/// The slot `F8` loads: the one written most recently, whatever its number.
+fn latest_state_slot(rom_path: &::std::path::Path) -> Option<usize> {
+    newest_state((1..=SLOT_KEYS.len()).filter_map(|slot| {
+        let modified = ::std::fs::metadata(state_slot_path(rom_path, slot))
+            .ok()?
+            .modified()
+            .ok()?;
+        Some((modified, slot))
+    }))
+}
+
+/// Write a state to a slot with the same temp-then-rename dance as the battery
+/// save, so a crash mid-write leaves the previous state intact.
+fn save_state_slot(
+    rom_path: &::std::path::Path,
+    slot: usize,
+    bus: &Bus,
+    cpu: &Cpu,
+) -> Result<(), String> {
+    let path = state_slot_path(rom_path, slot);
+    write_atomic(&path, &bus.save_state(cpu))
+        .map_err(|e| format!("cannot save state slot {slot}: {e}"))
+}
+
+/// Apply a slot to a running machine. `Bus::load_state` validates and swaps the
+/// whole machine, so a missing, corrupt or foreign state leaves play untouched.
+fn load_state_slot(
+    rom_path: &::std::path::Path,
+    slot: usize,
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+) -> Result<(), String> {
+    let path = state_slot_path(rom_path, slot);
+    let data = ::std::fs::read(&path).map_err(|e| match e.kind() {
+        ::std::io::ErrorKind::NotFound => format!("state slot {slot} is empty: {}", path.display()),
+        _ => format!("cannot read {}: {e}", path.display()),
+    })?;
+    bus.load_state(cpu, &data)
+        .map_err(|e| format!("cannot load {}: {e}", path.display()))
+}
+
+fn load_latest_state(
+    rom_path: &::std::path::Path,
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+) -> Result<(), String> {
+    let slot = latest_state_slot(rom_path).ok_or_else(|| {
+        format!(
+            "no save states for {}: press 1-9 to make one",
+            rom_path.display()
+        )
+    })?;
+    load_state_slot(rom_path, slot, bus, cpu)
+}
 
 /// Which button a held key presses, or `None` for a key that is not on the pad.
 fn button_for(key: Keycode) -> Option<u8> {
@@ -554,6 +651,48 @@ fn run() -> Result<(), String> {
                         }
                     }
                 }
+                Event::KeyDown {
+                    scancode: Some(key),
+                    keymod,
+                    repeat: false,
+                    ..
+                } if slot_for(key).is_some() => {
+                    let slot = slot_for(key).expect("the guard just matched a slot key");
+                    if keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) {
+                        match load_state_slot(
+                            ::std::path::Path::new(&rom_path),
+                            slot,
+                            &mut bus,
+                            &mut cpu,
+                        ) {
+                            Ok(()) => {
+                                // The old timeline's samples would play over the
+                                // loaded one; drop them the way Reset does.
+                                if let Some(queue) = &audio {
+                                    queue.clear();
+                                }
+                            }
+                            Err(e) => report::log_error(&e),
+                        }
+                    } else if let Err(e) =
+                        save_state_slot(::std::path::Path::new(&rom_path), slot, &bus, &cpu)
+                    {
+                        report::log_error(&e);
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F8),
+                    repeat: false,
+                    ..
+                } => match load_latest_state(::std::path::Path::new(&rom_path), &mut bus, &mut cpu)
+                {
+                    Ok(()) => {
+                        if let Some(queue) = &audio {
+                            queue.clear();
+                        }
+                    }
+                    Err(e) => report::log_error(&e),
+                },
                 Event::ControllerDeviceAdded { which, .. } => {
                     if let Some(controllers) = &controller_subsystem {
                         if let Ok(gamepad) = controllers.open(which) {
@@ -617,7 +756,7 @@ fn run() -> Result<(), String> {
             frames += 1;
             if let Some(path) = &save_path {
                 if last_save.elapsed() >= SAVE_INTERVAL {
-                    if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+                    if let Err(e) = write_atomic(path, bus.prg_ram()) {
                         report::log_error(&e);
                     }
                     last_save = ::std::time::Instant::now();
@@ -661,7 +800,7 @@ fn run() -> Result<(), String> {
     // A battery save is only useful if the process gets to exit normally, so
     // write it before the dump report can return an error.
     if let Some(path) = &save_path {
-        if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+        if let Err(e) = write_atomic(path, bus.prg_ram()) {
             report::log_error(&e);
         }
     }
@@ -678,15 +817,16 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Flush battery-backed PRG RAM without ever leaving a half-written `.sav` in
-/// place. The bytes go to a sibling temp file, are synced, and only then replace
-/// the save by rename; a crash or a kill during the write leaves the previous
-/// save intact.
-fn write_battery_save(path: &::std::path::Path, ram: &[u8]) -> Result<(), String> {
-    let temp = path.with_extension("sav.tmp");
+/// Replace a file without ever leaving a half-written one in place. The bytes
+/// go to a sibling temp file, are synced, and only then replace the target by
+/// rename; a crash or a kill during the write leaves the previous file intact.
+fn write_atomic(path: &::std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = ::std::path::PathBuf::from(temp);
     let write = (|| {
         let mut file = ::std::fs::File::create(&temp)?;
-        ::std::io::Write::write_all(&mut file, ram)?;
+        ::std::io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
         ::std::fs::rename(&temp, path)
     })();
@@ -712,11 +852,12 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         apply_event, audio_sleep, button_for, dump_list_ends_run, frame_budget, frame_sleep,
-        mask_for_name, missed_dumps, parse_script, write_battery_save, Play, Region,
-        AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET,
+        mask_for_name, missed_dumps, newest_state, parse_script, slot_for, state_slot_path,
+        write_atomic, Play, Region, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
+        FRAME_BUDGET,
     };
     use sdl2::event::{Event, WindowEvent};
-    use sdl2::keyboard::Keycode;
+    use sdl2::keyboard::{Keycode, Scancode};
     use std::time::Duration;
 
     #[test]
@@ -727,7 +868,7 @@ mod tests {
         std::fs::write(&path, b"old save").expect("seed save");
 
         let ram = [0x5Au8; 8192];
-        write_battery_save(&path, &ram).expect("save must be written");
+        write_atomic(&path, &ram).expect("save must be written");
 
         assert_eq!(std::fs::read(&path).unwrap(), ram, "the new save landed");
         assert!(
@@ -735,6 +876,50 @@ mod tests {
             "the temp file must be renamed away, not left behind"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn quick_save_keys_are_the_nine_digits_and_nothing_else() {
+        assert_eq!(slot_for(Scancode::Num1), Some(1));
+        assert_eq!(slot_for(Scancode::Num9), Some(9));
+        assert_eq!(slot_for(Scancode::Num0), None);
+        assert_eq!(
+            slot_for(Scancode::F8),
+            None,
+            "F8 is load-latest, not a slot"
+        );
+        assert_eq!(slot_for(Scancode::Z), None, "a game button is not a slot");
+    }
+
+    #[test]
+    fn a_state_slot_is_a_sibling_of_the_rom() {
+        assert_eq!(
+            state_slot_path(std::path::Path::new("/roms/Zelda.nes"), 3),
+            std::path::PathBuf::from("/roms/Zelda.state3")
+        );
+    }
+
+    #[test]
+    fn the_newest_state_wins_and_a_tie_goes_to_the_higher_slot() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let older = (UNIX_EPOCH + Duration::from_secs(10), 2);
+        let newer = (UNIX_EPOCH + Duration::from_secs(20), 1);
+        assert_eq!(
+            newest_state([older, newer]),
+            Some(1),
+            "mtime, not slot number"
+        );
+        assert_eq!(
+            newest_state([newer, older]),
+            Some(1),
+            "input order must not matter"
+        );
+        assert_eq!(
+            newest_state([(UNIX_EPOCH, 4), (UNIX_EPOCH, 7)]),
+            Some(7),
+            "equal times answer the same way every run"
+        );
+        assert_eq!(newest_state([]), None, "no slots, nothing to load");
     }
 
     #[test]
