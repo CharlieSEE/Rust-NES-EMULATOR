@@ -77,7 +77,7 @@ repository.
 | Pause | `P` |
 | Reset | `R` |
 | Quicksave slot 1–9 | `1`–`9` |
-| Quickload slot 1–9 | `Shift`+`1`–`9` |
+| Quickload slot 1–9 | `Left Shift`+`1`–`9` |
 | Quickload latest slot | `F8` |
 | Fullscreen | `F11` |
 | Mute | `M` |
@@ -97,11 +97,11 @@ the cartridge runs but cannot be aimed.
 - iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)** and
   **mapper 66** (the SMB/Duck Hunt board) are supported. Most other games will
   not boot and will exit with a mapper error.
-- Save states live beside the ROM as `.state1`–`.state9` files: a bare digit
-  saves, `Shift`+digit loads, `F8` loads the most recently saved slot. A state
-  is tied to the exact ROM and state format version, and a bad or foreign file
-  is refused without disturbing the running game. Rewind and cheats are not
-  implemented yet.
+- Save states live beside the ROM as `.state1`–`.state9` files, with a small
+  `.state` index naming the newest: a bare digit saves, `Left Shift`+digit
+  loads, `F8` loads the most recently saved slot. A state is tied to the exact
+  ROM and state format version, and a bad or foreign file is refused without
+  disturbing the running game. Rewind and cheats are not implemented yet.
 
 ## For tinkerers
 

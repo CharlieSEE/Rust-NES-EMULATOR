@@ -96,9 +96,10 @@ const BUTTONS: [(Keycode, &str, u8); 8] = [
 const ALIASES: [(&str, &str); 3] = [("JUMP", "A"), ("RUN", "B"), ("FIRE", "B")];
 
 /// Quick save slots, in key order. A bare digit writes the slot under the key;
-/// Shift plus the same digit loads it, because loading throws away the run in
-/// progress and should take a deliberate press. `F8` loads whichever slot was
-/// written most recently.
+/// left Shift plus the same digit loads it, because loading throws away the run
+/// in progress and should take a deliberate press. Right Shift is Select, so it
+/// must not double as the load modifier. `F8` loads whichever slot was written
+/// most recently.
 const SLOT_KEYS: [Scancode; 9] = [
     Scancode::Num1,
     Scancode::Num2,
@@ -128,28 +129,43 @@ fn state_slot_path(rom_path: &::std::path::Path, slot: usize) -> ::std::path::Pa
     rom_path.with_extension(format!("state{slot}"))
 }
 
-/// The saved slot with the newest file, ties going to the higher slot. Takes
-/// the times rather than reading them so the choice is testable without
-/// touching a clock.
-fn newest_state(
-    saved: impl IntoIterator<Item = (::std::time::SystemTime, usize)>,
-) -> Option<usize> {
-    saved.into_iter().max().map(|(_, slot)| slot)
+/// The one-byte index naming the slot `F8` loads. Kept beside the states, and
+/// written after every successful save, so "latest" does not depend on file
+/// times -- a copied or restored save folder would otherwise reorder itself.
+fn latest_state_path(rom_path: &::std::path::Path) -> ::std::path::PathBuf {
+    rom_path.with_extension("state")
 }
 
-/// The slot `F8` loads: the one written most recently, whatever its number.
-fn latest_state_slot(rom_path: &::std::path::Path) -> Option<usize> {
-    newest_state((1..=SLOT_KEYS.len()).filter_map(|slot| {
-        let modified = ::std::fs::metadata(state_slot_path(rom_path, slot))
-            .ok()?
-            .modified()
-            .ok()?;
-        Some((modified, slot))
-    }))
+/// The slot named by the index file. Missing is `None` (nothing saved yet);
+/// an unreadable, unparsable or out-of-range index is an error, because guessing
+/// would load a state the player did not ask for.
+fn read_latest_slot(rom_path: &::std::path::Path) -> Result<Option<usize>, String> {
+    let path = latest_state_path(rom_path);
+    let text = match ::std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let text = text.trim();
+    let slot: usize = text.parse().map_err(|_| {
+        format!(
+            "{}: expected a save slot number, found {text:?}",
+            path.display()
+        )
+    })?;
+    if !(1..=SLOT_KEYS.len()).contains(&slot) {
+        return Err(format!(
+            "{}: names slot {slot}, but slots are 1-{}",
+            path.display(),
+            SLOT_KEYS.len()
+        ));
+    }
+    Ok(Some(slot))
 }
 
 /// Write a state to a slot with the same temp-then-rename dance as the battery
-/// save, so a crash mid-write leaves the previous state intact.
+/// save, so a crash mid-write leaves the previous state intact. The index is
+/// updated only after the state itself is safely on disk.
 fn save_state_slot(
     rom_path: &::std::path::Path,
     slot: usize,
@@ -158,7 +174,9 @@ fn save_state_slot(
 ) -> Result<(), String> {
     let path = state_slot_path(rom_path, slot);
     write_atomic(&path, &bus.save_state(cpu))
-        .map_err(|e| format!("cannot save state slot {slot}: {e}"))
+        .map_err(|e| format!("cannot save state slot {slot}: {e}"))?;
+    write_atomic(&latest_state_path(rom_path), format!("{slot}\n").as_bytes())
+        .map_err(|e| format!("slot {slot} saved, but cannot record it for F8: {e}"))
 }
 
 /// Apply a slot to a running machine. `Bus::load_state` validates and swaps the
@@ -183,7 +201,7 @@ fn load_latest_state(
     bus: &mut Bus,
     cpu: &mut Cpu,
 ) -> Result<(), String> {
-    let slot = latest_state_slot(rom_path).ok_or_else(|| {
+    let slot = read_latest_slot(rom_path)?.ok_or_else(|| {
         format!(
             "no save states for {}: press 1-9 to make one",
             rom_path.display()
@@ -658,7 +676,7 @@ fn run() -> Result<(), String> {
                     ..
                 } if slot_for(key).is_some() => {
                     let slot = slot_for(key).expect("the guard just matched a slot key");
-                    if keymod.intersects(Mod::LSHIFTMOD | Mod::RSHIFTMOD) {
+                    if keymod.contains(Mod::LSHIFTMOD) {
                         match load_state_slot(
                             ::std::path::Path::new(&rom_path),
                             slot,
@@ -852,9 +870,9 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         apply_event, audio_sleep, button_for, dump_list_ends_run, frame_budget, frame_sleep,
-        mask_for_name, missed_dumps, newest_state, parse_script, slot_for, state_slot_path,
-        write_atomic, Play, Region, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
-        FRAME_BUDGET,
+        latest_state_path, load_state_slot, mask_for_name, missed_dumps, parse_script,
+        read_latest_slot, save_state_slot, slot_for, state_slot_path, write_atomic, Bus, Cartridge,
+        Cpu, Play, Region, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -897,29 +915,79 @@ mod tests {
             state_slot_path(std::path::Path::new("/roms/Zelda.nes"), 3),
             std::path::PathBuf::from("/roms/Zelda.state3")
         );
+        assert_eq!(
+            latest_state_path(std::path::Path::new("/roms/Zelda.nes")),
+            std::path::PathBuf::from("/roms/Zelda.state")
+        );
+    }
+
+    /// A 16 KiB NROM image whose CPU sits in a jump-to-self loop, enough to
+    /// own a real machine without a game file.
+    fn test_cartridge() -> Cartridge {
+        let mut bytes = crate::rom::ines_header(1, 1, 0).to_vec();
+        let mut prg = vec![0u8; 0x4000];
+        prg[..3].copy_from_slice(&[0x4C, 0x00, 0x80]); // JMP $8000
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0x81, 0x00, 0x80, 0x00, 0x80]);
+        bytes.extend(prg);
+        bytes.extend((0..0x2000).map(|i| i as u8));
+        Cartridge::load(&bytes).expect("synthetic NROM image")
     }
 
     #[test]
-    fn the_newest_state_wins_and_a_tie_goes_to_the_higher_slot() {
-        use std::time::{Duration, UNIX_EPOCH};
-        let older = (UNIX_EPOCH + Duration::from_secs(10), 2);
-        let newer = (UNIX_EPOCH + Duration::from_secs(20), 1);
+    fn a_saved_slot_reloads_into_the_running_machine() {
+        let dir = std::env::temp_dir().join(format!("nes-state-slot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rom_path = dir.join("game.nes");
+        let mut bus = Bus::new(test_cartridge());
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+
+        let saved = bus.save_state(&cpu);
+        save_state_slot(&rom_path, 3, &bus, &cpu).expect("state must be written");
         assert_eq!(
-            newest_state([older, newer]),
-            Some(1),
-            "mtime, not slot number"
+            read_latest_slot(&rom_path).expect("index readable"),
+            Some(3),
+            "a save records itself for F8"
         );
+
+        bus.run_frame(&mut cpu);
+        bus.ppu.take_frame();
+        assert_ne!(bus.save_state(&cpu), saved, "the machine must move on");
+
+        load_state_slot(&rom_path, 3, &mut bus, &mut cpu).expect("state must load");
         assert_eq!(
-            newest_state([newer, older]),
-            Some(1),
-            "input order must not matter"
+            bus.save_state(&cpu),
+            saved,
+            "the loaded machine differs from the saved one"
         );
-        assert_eq!(
-            newest_state([(UNIX_EPOCH, 4), (UNIX_EPOCH, 7)]),
-            Some(7),
-            "equal times answer the same way every run"
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_latest_slot_comes_from_the_index_not_file_times() {
+        let dir = std::env::temp_dir().join(format!("nes-latest-slot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rom_path = dir.join("game.nes");
+        let index = latest_state_path(&rom_path);
+
+        assert_eq!(read_latest_slot(&rom_path), Ok(None), "nothing saved yet");
+
+        std::fs::write(&index, b"2\n").expect("index written");
+        assert_eq!(read_latest_slot(&rom_path), Ok(Some(2)));
+
+        std::fs::write(&index, b"0\n").expect("index written");
+        assert!(
+            read_latest_slot(&rom_path).unwrap_err().contains("1-9"),
+            "an out-of-range slot names the valid range"
         );
-        assert_eq!(newest_state([]), None, "no slots, nothing to load");
+
+        std::fs::write(&index, b"nine\n").expect("index written");
+        assert!(
+            read_latest_slot(&rom_path).unwrap_err().contains("nine"),
+            "unreadable text is quoted back"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]
