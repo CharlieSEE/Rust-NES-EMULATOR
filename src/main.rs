@@ -1,6 +1,6 @@
 use sdl2::controller::Button;
 use sdl2::event::{Event, WindowEvent};
-use sdl2::keyboard::Keycode;
+use sdl2::keyboard::{Keycode, Mod, Scancode};
 
 mod apu;
 #[cfg(test)]
@@ -17,6 +17,8 @@ mod ppu_rom_test;
 mod region;
 mod report;
 mod rom;
+mod state;
+mod text;
 
 use bus::Bus;
 use cpu::Cpu;
@@ -93,6 +95,252 @@ const BUTTONS: [(Keycode, &str, u8); 8] = [
 /// Words a script may use for a bit it does not spell out. A is jump and B is
 /// run/fire in both SMB and Duck Hunt, so a script can say what it means.
 const ALIASES: [(&str, &str); 3] = [("JUMP", "A"), ("RUN", "B"), ("FIRE", "B")];
+
+/// Quick save slots, in key order. A bare digit writes the slot under the key;
+/// left Shift plus the same digit loads it, because loading throws away the run
+/// in progress and should take a deliberate press. Right Shift is Select, so it
+/// must not double as the load modifier. `F8` loads whichever slot was written
+/// most recently.
+const SLOT_KEYS: [Scancode; 9] = [
+    Scancode::Num1,
+    Scancode::Num2,
+    Scancode::Num3,
+    Scancode::Num4,
+    Scancode::Num5,
+    Scancode::Num6,
+    Scancode::Num7,
+    Scancode::Num8,
+    Scancode::Num9,
+];
+
+/// Which quick save slot a key names, one-based, or `None` for any other key.
+/// Matched by scancode, so the digit key is the same one under any layout and
+/// with Shift held.
+fn slot_for(key: Scancode) -> Option<usize> {
+    SLOT_KEYS
+        .iter()
+        .position(|&slot_key| slot_key == key)
+        .map(|index| index + 1)
+}
+
+/// Where slot `slot` lives: beside the ROM, next to its battery save, so a
+/// folder of ROMs takes its states with it. `Zelda.nes` becomes
+/// `Zelda.state3`.
+fn state_slot_path(rom_path: &::std::path::Path, slot: usize) -> ::std::path::PathBuf {
+    rom_path.with_extension(format!("state{slot}"))
+}
+
+/// The one-byte index naming the slot `F8` loads. Kept beside the states, and
+/// written after every successful save, so "latest" does not depend on file
+/// times -- a copied or restored save folder would otherwise reorder itself.
+fn latest_state_path(rom_path: &::std::path::Path) -> ::std::path::PathBuf {
+    rom_path.with_extension("state")
+}
+
+/// The slot named by the index file. Missing is `None` (nothing saved yet);
+/// an unreadable, unparsable or out-of-range index is an error, because guessing
+/// would load a state the player did not ask for.
+fn read_latest_slot(rom_path: &::std::path::Path) -> Result<Option<usize>, String> {
+    let path = latest_state_path(rom_path);
+    let text = match ::std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let text = text.trim();
+    let slot: usize = text.parse().map_err(|_| {
+        format!(
+            "{}: expected a save slot number, found {text:?}",
+            path.display()
+        )
+    })?;
+    if !(1..=SLOT_KEYS.len()).contains(&slot) {
+        return Err(format!(
+            "{}: names slot {slot}, but slots are 1-{}",
+            path.display(),
+            SLOT_KEYS.len()
+        ));
+    }
+    Ok(Some(slot))
+}
+
+/// Write a state to a slot with the same temp-then-rename dance as the battery
+/// save, so a crash mid-write leaves the previous state intact. The index is
+/// updated only after the state itself is safely on disk.
+fn save_state_slot(
+    rom_path: &::std::path::Path,
+    slot: usize,
+    bus: &Bus,
+    cpu: &Cpu,
+) -> Result<(), String> {
+    let path = state_slot_path(rom_path, slot);
+    write_atomic(&path, &bus.save_state(cpu))
+        .map_err(|e| format!("cannot save state slot {slot}: {e}"))?;
+    write_atomic(&latest_state_path(rom_path), format!("{slot}\n").as_bytes())
+        .map_err(|e| format!("slot {slot} saved, but cannot record it for F8: {e}"))
+}
+
+/// Apply a slot to a running machine. `Bus::load_state` validates and swaps the
+/// whole machine, so a missing, corrupt or foreign state leaves play untouched.
+fn load_state_slot(
+    rom_path: &::std::path::Path,
+    slot: usize,
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+) -> Result<(), String> {
+    let path = state_slot_path(rom_path, slot);
+    let data = ::std::fs::read(&path).map_err(|e| match e.kind() {
+        ::std::io::ErrorKind::NotFound => format!("state slot {slot} is empty: {}", path.display()),
+        _ => format!("cannot read {}: {e}", path.display()),
+    })?;
+    bus.load_state(cpu, &data)
+        .map_err(|e| format!("cannot load {}: {e}", path.display()))
+}
+
+fn load_latest_state(
+    rom_path: &::std::path::Path,
+    bus: &mut Bus,
+    cpu: &mut Cpu,
+) -> Result<(), String> {
+    let slot = read_latest_slot(rom_path)?.ok_or_else(|| {
+        format!(
+            "no save states for {}: press 1-9 to make one",
+            rom_path.display()
+        )
+    })?;
+    load_state_slot(rom_path, slot, bus, cpu)
+}
+
+/// A save writes no pixel, so a short confirmation is the only sign it
+/// happened. Long enough to read, short enough to get out of the way.
+const SAVE_TOAST: ::std::time::Duration = ::std::time::Duration::from_secs(2);
+
+/// Failures carry a path and a reason; they stay up longer, and the full text
+/// is still in stderr and `nes-errors.log`.
+const ERROR_TOAST: ::std::time::Duration = ::std::time::Duration::from_secs(6);
+
+/// The overlay uses the same 8x8 bitmap font as the launcher, 28 characters
+/// wide inside the 256-pixel screen, with a dark box behind the text so it
+/// stays readable over a bright game.
+const TOAST_COLS: usize = 28;
+const TOAST_PAD: usize = 4;
+const TOAST_MARGIN: usize = 8;
+/// Errors from a deep path can wrap to many lines. The first screenful is
+/// shown; the last line points at the log that kept the whole message.
+const TOAST_MAX_LINES: usize = 10;
+const TOAST_BG: u32 = 0x0010_1418;
+const TOAST_FG: u32 = 0x00E8_E8E8;
+
+/// A short message drawn over the frame. Held in the main loop rather than in
+/// the emulator, so showing it can never disturb a save state.
+struct Toast {
+    lines: Vec<String>,
+    until: ::std::time::Instant,
+}
+
+impl Toast {
+    fn new(message: &str, ttl: ::std::time::Duration) -> Toast {
+        let mut lines = wrap_text(message, TOAST_COLS);
+        if lines.len() > TOAST_MAX_LINES {
+            lines.truncate(TOAST_MAX_LINES - 1);
+            lines.push("... see nes-errors.log".to_string());
+        }
+        Toast {
+            lines,
+            until: ::std::time::Instant::now() + ttl,
+        }
+    }
+
+    fn visible(&self) -> bool {
+        ::std::time::Instant::now() < self.until
+    }
+}
+
+/// Greedy word wrap at `width` characters. A word longer than a whole line --
+/// a path or a filename -- is cut at the edge rather than dropped, so the
+/// start of it still reaches the player.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if width == 0 {
+        return lines;
+    }
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        loop {
+            let used = line.chars().count();
+            let room = width.saturating_sub(used + usize::from(used > 0));
+            if room == 0 {
+                lines.push(::std::mem::take(&mut line));
+                continue;
+            }
+            let word_len = word.chars().count();
+            if word_len <= room {
+                if used > 0 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                break;
+            }
+            // A word that does not fit moves to a fresh line whole; only a
+            // word longer than the screen is cut, and only after it starts a
+            // line.
+            if used > 0 {
+                lines.push(::std::mem::take(&mut line));
+                continue;
+            }
+            let cut = word
+                .char_indices()
+                .nth(room)
+                .map_or(word.len(), |(index, _)| index);
+            let (head, tail) = word.split_at(cut);
+            line.push_str(head);
+            word = tail;
+            if word.is_empty() {
+                break;
+            }
+            lines.push(::std::mem::take(&mut line));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+/// Paint a centered box holding the toast's lines near the bottom of the
+/// frame. `Toast::new` bounds the width and line count, so the box always
+/// fits.
+fn draw_toast(fb: &mut [u32], toast: &Toast) {
+    let Some(text_width) = toast.lines.iter().map(|line| line.chars().count()).max() else {
+        return;
+    };
+    let box_width = text_width * text::CELL + 2 * TOAST_PAD;
+    let box_height = toast.lines.len() * text::CELL + 2 * TOAST_PAD;
+    let x = (W - box_width) / 2;
+    let y = H - TOAST_MARGIN - box_height;
+    for row in y..y + box_height {
+        fb[row * W + x..row * W + x + box_width].fill(TOAST_BG);
+    }
+    for (index, line) in toast.lines.iter().enumerate() {
+        text::put_text(
+            fb,
+            W,
+            H,
+            x + TOAST_PAD,
+            y + TOAST_PAD + index * text::CELL,
+            line,
+            TOAST_FG,
+        );
+    }
+}
+
+/// Record a failed save or load and put the same text on screen. The log line
+/// stays the durable half; the toast is what a fullscreen player can see.
+fn toast_error(toast: &mut Option<Toast>, message: &str) {
+    report::log_error(message);
+    *toast = Some(Toast::new(message, ERROR_TOAST));
+}
 
 /// Which button a held key presses, or `None` for a key that is not on the pad.
 fn button_for(key: Keycode) -> Option<u8> {
@@ -488,6 +736,8 @@ fn run() -> Result<(), String> {
     let mut muted = false;
     let mut fullscreen = false;
     let mut running = true;
+    let mut toast: Option<Toast> = None;
+    let mut overlay = vec![0u32; W * H];
     let mut frames = 0u32;
     while running {
         // Started before anything else in the frame so the emulation, the
@@ -553,6 +803,51 @@ fn run() -> Result<(), String> {
                         }
                     }
                 }
+                Event::KeyDown {
+                    scancode: Some(key),
+                    keymod,
+                    repeat: false,
+                    ..
+                } if slot_for(key).is_some() => {
+                    let slot = slot_for(key).expect("the guard just matched a slot key");
+                    if keymod.contains(Mod::LSHIFTMOD) {
+                        match load_state_slot(
+                            ::std::path::Path::new(&rom_path),
+                            slot,
+                            &mut bus,
+                            &mut cpu,
+                        ) {
+                            Ok(()) => {
+                                // The old timeline's samples would play over the
+                                // loaded one; drop them the way Reset does.
+                                if let Some(queue) = &audio {
+                                    queue.clear();
+                                }
+                            }
+                            Err(e) => toast_error(&mut toast, &e),
+                        }
+                    } else {
+                        match save_state_slot(::std::path::Path::new(&rom_path), slot, &bus, &cpu) {
+                            Ok(()) => {
+                                toast = Some(Toast::new(&format!("Saved slot {slot}"), SAVE_TOAST))
+                            }
+                            Err(e) => toast_error(&mut toast, &e),
+                        }
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F8),
+                    repeat: false,
+                    ..
+                } => match load_latest_state(::std::path::Path::new(&rom_path), &mut bus, &mut cpu)
+                {
+                    Ok(()) => {
+                        if let Some(queue) = &audio {
+                            queue.clear();
+                        }
+                    }
+                    Err(e) => toast_error(&mut toast, &e),
+                },
                 Event::ControllerDeviceAdded { which, .. } => {
                     if let Some(controllers) = &controller_subsystem {
                         if let Ok(gamepad) = controllers.open(which) {
@@ -616,7 +911,7 @@ fn run() -> Result<(), String> {
             frames += 1;
             if let Some(path) = &save_path {
                 if last_save.elapsed() >= SAVE_INTERVAL {
-                    if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+                    if let Err(e) = write_atomic(path, bus.prg_ram()) {
                         report::log_error(&e);
                     }
                     last_save = ::std::time::Instant::now();
@@ -631,7 +926,17 @@ fn run() -> Result<(), String> {
                 break;
             }
         }
-        let frame = bus.ppu.framebuffer();
+        if toast.as_ref().is_some_and(|toast| !toast.visible()) {
+            toast = None;
+        }
+        let frame = match toast.as_ref() {
+            Some(toast) => {
+                overlay.copy_from_slice(bus.ppu.framebuffer());
+                draw_toast(&mut overlay, toast);
+                &overlay[..]
+            }
+            None => bus.ppu.framebuffer(),
+        };
         // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
         // all len*4 bytes of the frame are valid to read as u8.
         let frame_bytes =
@@ -660,7 +965,7 @@ fn run() -> Result<(), String> {
     // A battery save is only useful if the process gets to exit normally, so
     // write it before the dump report can return an error.
     if let Some(path) = &save_path {
-        if let Err(e) = write_battery_save(path, bus.prg_ram()) {
+        if let Err(e) = write_atomic(path, bus.prg_ram()) {
             report::log_error(&e);
         }
     }
@@ -677,15 +982,16 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Flush battery-backed PRG RAM without ever leaving a half-written `.sav` in
-/// place. The bytes go to a sibling temp file, are synced, and only then replace
-/// the save by rename; a crash or a kill during the write leaves the previous
-/// save intact.
-fn write_battery_save(path: &::std::path::Path, ram: &[u8]) -> Result<(), String> {
-    let temp = path.with_extension("sav.tmp");
+/// Replace a file without ever leaving a half-written one in place. The bytes
+/// go to a sibling temp file, are synced, and only then replace the target by
+/// rename; a crash or a kill during the write leaves the previous file intact.
+fn write_atomic(path: &::std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = ::std::path::PathBuf::from(temp);
     let write = (|| {
         let mut file = ::std::fs::File::create(&temp)?;
-        ::std::io::Write::write_all(&mut file, ram)?;
+        ::std::io::Write::write_all(&mut file, bytes)?;
         file.sync_all()?;
         ::std::fs::rename(&temp, path)
     })();
@@ -710,12 +1016,14 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_event, audio_sleep, button_for, dump_list_ends_run, frame_budget, frame_sleep,
-        mask_for_name, missed_dumps, parse_script, write_battery_save, Play, Region,
-        AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET,
+        apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run, frame_budget,
+        frame_sleep, latest_state_path, load_state_slot, mask_for_name, missed_dumps, parse_script,
+        read_latest_slot, save_state_slot, slot_for, state_slot_path, wrap_text, write_atomic, Bus,
+        Cartridge, Cpu, Play, Region, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
+        FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
-    use sdl2::keyboard::Keycode;
+    use sdl2::keyboard::{Keycode, Scancode};
     use std::time::Duration;
 
     #[test]
@@ -726,12 +1034,106 @@ mod tests {
         std::fs::write(&path, b"old save").expect("seed save");
 
         let ram = [0x5Au8; 8192];
-        write_battery_save(&path, &ram).expect("save must be written");
+        write_atomic(&path, &ram).expect("save must be written");
 
         assert_eq!(std::fs::read(&path).unwrap(), ram, "the new save landed");
         assert!(
             !path.with_extension("sav.tmp").exists(),
             "the temp file must be renamed away, not left behind"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn quick_save_keys_are_the_nine_digits_and_nothing_else() {
+        assert_eq!(slot_for(Scancode::Num1), Some(1));
+        assert_eq!(slot_for(Scancode::Num9), Some(9));
+        assert_eq!(slot_for(Scancode::Num0), None);
+        assert_eq!(
+            slot_for(Scancode::F8),
+            None,
+            "F8 is load-latest, not a slot"
+        );
+        assert_eq!(slot_for(Scancode::Z), None, "a game button is not a slot");
+    }
+
+    #[test]
+    fn a_state_slot_is_a_sibling_of_the_rom() {
+        assert_eq!(
+            state_slot_path(std::path::Path::new("/roms/Zelda.nes"), 3),
+            std::path::PathBuf::from("/roms/Zelda.state3")
+        );
+        assert_eq!(
+            latest_state_path(std::path::Path::new("/roms/Zelda.nes")),
+            std::path::PathBuf::from("/roms/Zelda.state")
+        );
+    }
+
+    /// A 16 KiB NROM image whose CPU sits in a jump-to-self loop, enough to
+    /// own a real machine without a game file.
+    fn test_cartridge() -> Cartridge {
+        let mut bytes = crate::rom::ines_header(1, 1, 0).to_vec();
+        let mut prg = vec![0u8; 0x4000];
+        prg[..3].copy_from_slice(&[0x4C, 0x00, 0x80]); // JMP $8000
+        prg[0x3FFA..0x4000].copy_from_slice(&[0x00, 0x81, 0x00, 0x80, 0x00, 0x80]);
+        bytes.extend(prg);
+        bytes.extend((0..0x2000).map(|i| i as u8));
+        Cartridge::load(&bytes).expect("synthetic NROM image")
+    }
+
+    #[test]
+    fn a_saved_slot_reloads_into_the_running_machine() {
+        let dir = std::env::temp_dir().join(format!("nes-state-slot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rom_path = dir.join("game.nes");
+        let mut bus = Bus::new(test_cartridge());
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+
+        let saved = bus.save_state(&cpu);
+        save_state_slot(&rom_path, 3, &bus, &cpu).expect("state must be written");
+        assert_eq!(
+            read_latest_slot(&rom_path).expect("index readable"),
+            Some(3),
+            "a save records itself for F8"
+        );
+
+        bus.run_frame(&mut cpu);
+        bus.ppu.take_frame();
+        assert_ne!(bus.save_state(&cpu), saved, "the machine must move on");
+
+        load_state_slot(&rom_path, 3, &mut bus, &mut cpu).expect("state must load");
+        assert_eq!(
+            bus.save_state(&cpu),
+            saved,
+            "the loaded machine differs from the saved one"
+        );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_latest_slot_comes_from_the_index_not_file_times() {
+        let dir = std::env::temp_dir().join(format!("nes-latest-slot-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rom_path = dir.join("game.nes");
+        let index = latest_state_path(&rom_path);
+
+        assert_eq!(read_latest_slot(&rom_path), Ok(None), "nothing saved yet");
+
+        std::fs::write(&index, b"2\n").expect("index written");
+        assert_eq!(read_latest_slot(&rom_path), Ok(Some(2)));
+
+        std::fs::write(&index, b"0\n").expect("index written");
+        assert!(
+            read_latest_slot(&rom_path).unwrap_err().contains("1-9"),
+            "an out-of-range slot names the valid range"
+        );
+
+        std::fs::write(&index, b"nine\n").expect("index written");
+        assert!(
+            read_latest_slot(&rom_path).unwrap_err().contains("nine"),
+            "unreadable text is quoted back"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
@@ -1163,5 +1565,68 @@ mod tests {
             "the later one only"
         );
         assert_eq!(missed_dumps(&[9, 3, 5], 7), [9], "order does not matter");
+    }
+
+    /// A status message must fit the 256-pixel screen, so it wraps before it
+    /// is drawn. A long unbroken word -- a path or a filename -- is cut at the
+    /// edge instead of running off it.
+    #[test]
+    fn a_status_message_wraps_to_the_screen_width() {
+        assert_eq!(wrap_text("Saved slot 3", 28), ["Saved slot 3"]);
+        assert_eq!(
+            wrap_text("state slot 9 is empty: /roms/Legend of Zelda.state9", 28),
+            ["state slot 9 is empty:", "/roms/Legend of Zelda.state9"]
+        );
+        let long = "x".repeat(60);
+        let lines = wrap_text(&long, 28);
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.chars().count())
+                .collect::<Vec<_>>(),
+            [28, 28, 4],
+            "a word longer than the screen is cut, not dropped"
+        );
+        assert_eq!(lines.concat(), long, "cutting loses no characters");
+    }
+
+    /// The confirmation is brief: a zero lifetime is already over, a real one
+    /// is still on screen.
+    #[test]
+    fn a_status_message_expires() {
+        assert!(!Toast::new("Saved slot 3", Duration::ZERO).visible());
+        assert!(Toast::new("Saved slot 3", Duration::from_secs(2)).visible());
+    }
+
+    /// The box has a fixed height. A cut-off message must say so rather than
+    /// looking complete, and point at the log that kept the rest.
+    #[test]
+    fn a_long_status_message_says_where_the_rest_is() {
+        let message = "word ".repeat(80);
+        let toast = Toast::new(&message, Duration::from_secs(6));
+        assert_eq!(toast.lines.len(), 10);
+        assert_eq!(toast.lines.last().unwrap(), "... see nes-errors.log");
+    }
+
+    /// A path longer than the screen still starts on a fresh line instead of
+    /// filling whatever room the preceding words left.
+    #[test]
+    fn a_word_too_long_for_the_line_starts_a_fresh_one() {
+        let long = "x".repeat(40);
+        assert_eq!(
+            wrap_text(&format!("load {long}"), 28),
+            ["load".to_string(), "x".repeat(28), "x".repeat(12)]
+        );
+    }
+
+    /// The overlay owns its box and leaves the rest of the frame alone.
+    #[test]
+    fn a_status_message_paints_a_box_over_the_frame() {
+        let mut fb = vec![0u32; W * H];
+        let toast = Toast::new("Saved slot 3", Duration::from_secs(2));
+        draw_toast(&mut fb, &toast);
+        assert_eq!(fb[0], 0, "the top-left corner is untouched");
+        assert!(fb.contains(&TOAST_BG), "the box background is drawn");
+        assert!(fb.contains(&TOAST_FG), "the message text is drawn");
     }
 }

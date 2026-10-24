@@ -45,6 +45,7 @@
 
 use crate::ppu::Mirroring;
 use crate::region::Region;
+use crate::state::{rom_fingerprint, StateReader, StateWriter};
 
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
 /// PRG ROM bank" -- ONE 32 KiB block over the whole window. There is no
@@ -73,9 +74,13 @@ const CHR_BANK: usize = 0x2000;
 /// PRG ROM, CHR ROM, and the mapper registers. The CHR bytes stay here
 /// because the file owns them; the PPU holds the banks because it fetches
 /// pattern memory every dot, and the registers swap one in for the other.
+#[derive(Clone)]
 pub struct Cartridge {
     prg: Vec<u8>,
     chr: Vec<u8>,
+    /// The 16-byte iNES header. Kept so the save-state fingerprint covers
+    /// header-only differences such as the power-on mirroring and battery flag.
+    header: [u8; 16],
     /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
     board: Board,
     /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
@@ -106,6 +111,7 @@ pub struct Cartridge {
 }
 
 /// The four boards this emulator knows how to read.
+#[derive(Clone, Copy)]
 enum Board {
     /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
     /// both halves directly. Writes to the window go nowhere.
@@ -125,6 +131,8 @@ impl Cartridge {
         if bytes.len() < 16 || &bytes[..4] != b"NES\x1a" {
             return Err("not an iNES image: bad magic".to_string());
         }
+        let mut header = [0u8; 16];
+        header.copy_from_slice(&bytes[..16]);
         let flags6 = bytes[6];
         // A trainer is 512 bytes between the header and PRG. Rare, but reading
         // it as PRG puts every bank off by 32 KiB, which looks like a bad ROM.
@@ -189,6 +197,7 @@ impl Cartridge {
         Ok(Cartridge {
             prg: bytes[start..start + prg_len].to_vec(),
             chr: bytes[start + prg_len..start + prg_len + chr_len].to_vec(),
+            header,
             board,
             bank,
             chr_banks: [0, 1],
@@ -219,6 +228,80 @@ impl Cartridge {
     /// The console timing the header selected.
     pub fn region(&self) -> Region {
         self.region
+    }
+
+    /// iNES mapper number, used in the save-state header so a state is never
+    /// offered to a board that decodes the same writes differently.
+    pub(crate) fn mapper_id(&self) -> u8 {
+        match self.board {
+            Board::Nrom => 0,
+            Board::Mmc1 => 1,
+            Board::UxRom => 2,
+            Board::GxRom => 66,
+        }
+    }
+
+    /// Identity of the loaded image, not its mapper state. Covers the iNES
+    /// header as well as PRG/CHR, so header-only differences such as mirroring
+    /// and battery cannot share a save state. The state's header carries this
+    /// and refuses to restore an identical-looking file from a different dump.
+    pub(crate) fn fingerprint(&self) -> u64 {
+        rom_fingerprint(&self.header, &self.prg, &self.chr)
+    }
+
+    /// The mapper's own registers. PRG/CHR bytes, the board type, battery flag
+    /// and region are already implied by the ROM the state is checked against.
+    pub(crate) fn save_state(&self, writer: &mut StateWriter) {
+        writer.u32(self.bank as u32);
+        writer.u8(self.chr_banks[0] as u8);
+        writer.u8(self.chr_banks[1] as u8);
+        writer.u8(self.control);
+        writer.u8(self.shift);
+        writer.u8(self.shift_count);
+        writer.bool(self.prg_ram_enabled);
+        writer.u8(self.mirroring.id());
+    }
+
+    pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        let bank = reader.u32()? as usize;
+        let banks = match self.board {
+            // NROM has no register; the only legal state is bank 0.
+            Board::Nrom => 1,
+            // MMC1's PRG register is four bits, and a value past the ROM's
+            // count wraps in `mmc1_prg_banks`, exactly as on hardware.
+            Board::Mmc1 => 16,
+            Board::UxRom => (self.prg.len() / PRG_UNIT).max(1),
+            Board::GxRom => (self.prg.len() / BANK).max(1),
+        };
+        if bank >= banks {
+            return Err(format!(
+                "save state has PRG bank {bank}; this cartridge has {banks}"
+            ));
+        }
+        self.bank = bank;
+        let low = reader.u8()? as usize;
+        let high = reader.u8()? as usize;
+        self.chr_banks = [low, high];
+        if matches!(self.board, Board::Mmc1) && (low > 0x1F || high > 0x1F) {
+            return Err(format!(
+                "save state has MMC1 CHR banks {low} and {high}; the register holds five bits"
+            ));
+        }
+        self.control = reader.u8()?;
+        if self.control & !0x1F != 0 {
+            return Err(format!(
+                "save state has MMC1 control ${:02X}; the register holds five bits",
+                self.control
+            ));
+        }
+        self.shift = reader.u8()?;
+        self.shift_count = reader.u8()?;
+        if self.shift_count > 4 || self.shift >> self.shift_count != 0 {
+            return Err("save state has an invalid MMC1 shift register".to_string());
+        }
+        self.prg_ram_enabled = reader.bool()?;
+        self.mirroring = Mirroring::from_id(reader.u8()?)?;
+        Ok(())
     }
 
     /// The CHR ROM image, for the PPU to hold. Borrowed, not copied.
@@ -469,6 +552,16 @@ mod tests {
         }
         bytes.extend(std::iter::repeat_n(0u8, chr_banks as usize * CHR_BANK));
         Cartridge::load(&bytes).expect("synthetic NROM image must load")
+    }
+
+    #[test]
+    fn a_fingerprint_separates_header_only_differences() {
+        let mut bytes = ines_header(1, 1, 0).to_vec();
+        bytes.resize(16 + PRG_UNIT + CHR_BANK, 0);
+        let original = Cartridge::load(&bytes).expect("synthetic image must load");
+        bytes[6] ^= 0x01; // flip the NROM mirroring bit only
+        let flipped = Cartridge::load(&bytes).expect("synthetic image must load");
+        assert_ne!(original.fingerprint(), flipped.fingerprint());
     }
 
     // The conflict tests read at $8001, not $8000: $8000 holds the patched byte,
@@ -894,6 +987,49 @@ mod tests {
             c.mirroring(),
             Mirroring::SingleLower,
             "MMC1 powers up with control $0C"
+        );
+    }
+
+    /// MMC1's serial latch, PRG/CHR banks, mirroring and PRG-RAM enable are
+    /// part of the state; a load has to put every one of them back.
+    #[test]
+    fn a_saved_mmc1_state_restores_every_mapper_register() {
+        use crate::state::{StateReader, StateWriter};
+
+        let mut cart = mmc1_cart(8, 8);
+        mmc1_write(&mut cart, 0x8000, 0x0E); // PRG mode 3, 8 KiB CHR, vertical mirroring
+        mmc1_write(&mut cart, 0xA000, 3); // CHR bank 0
+        mmc1_write(&mut cart, 0xC000, 5); // CHR bank 1
+        mmc1_write(&mut cart, 0xE000, 0x13); // PRG bank 3, PRG RAM disabled
+        let before = (
+            cart.cpu_read(0x8000),
+            cart.cpu_read(0xE000),
+            cart.chr_map(),
+            cart.mirroring(),
+            cart.prg_ram_enabled(),
+        );
+        assert_eq!(before.0, 3, "PRG bank 3 at $8000");
+        assert_eq!(before.1, 7, "the fixed last bank at $C000 stays 7");
+        assert!(!before.4, "the PRG RAM disable bit was written");
+
+        let mut writer = StateWriter::new();
+        cart.save_state(&mut writer);
+        let bytes = writer.finish();
+
+        let mut restored = mmc1_cart(8, 8);
+        restored
+            .load_state(&mut StateReader::new(&bytes))
+            .expect("mapper state must load");
+        assert_eq!(
+            (
+                restored.cpu_read(0x8000),
+                restored.cpu_read(0xE000),
+                restored.chr_map(),
+                restored.mirroring(),
+                restored.prg_ram_enabled(),
+            ),
+            before,
+            "every MMC1 register must come back"
         );
     }
 }

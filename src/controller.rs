@@ -5,6 +5,9 @@
 //! controller", the bit order "A, B, Select, Start, Up, Down, Left, Right", and
 //! the $4016 strobe reloading the register while it is high.
 //!
+use crate::state::{StateReader, StateWriter};
+
+#[derive(Clone)]
 pub struct Controller {
     /// Latched button state, in `$4016` report order: A, B, Select, Start,
     /// Up, Down, Left, Right from bit 0 up.
@@ -68,6 +71,30 @@ impl Controller {
             self.shift = self.buttons;
             self.left = 8;
         }
+    }
+
+    /// The 4021's live state. The buttons are host input too, but the shift
+    /// register and remaining-bit counter are what a game polling at the wrong
+    /// moment has already half-consumed.
+    pub(crate) fn save_state(&self, writer: &mut StateWriter) {
+        writer.u8(self.buttons);
+        writer.u8(self.shift);
+        writer.u8(self.left);
+        writer.bool(self.strobe);
+    }
+
+    pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.buttons = reader.u8()?;
+        self.shift = reader.u8()?;
+        self.left = reader.u8()?;
+        if self.left > 8 {
+            return Err(format!(
+                "save state has {0} controller bits left; the register has 8",
+                self.left
+            ));
+        }
+        self.strobe = reader.bool()?;
+        Ok(())
     }
 }
 

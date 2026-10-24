@@ -5,7 +5,6 @@
 //! runs `nes <rom>` as a child, so the game's frame loop is untouched and the
 //! launcher is back when the game exits.
 
-use font8x8::{UnicodeFonts, BASIC_FONTS};
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
@@ -17,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use crate::report::{exe_dir, log_error, popup_for, NO_POPUP_ENV};
+use crate::text::{put_text, CELL};
 
 /// Logical size, the same as the NES frame: the window starts at 3x and SDL
 /// scales whatever the window manager makes of it.
@@ -25,7 +25,6 @@ const H: usize = 240;
 const SCALE: u32 = 3;
 
 const MARGIN: usize = 8;
-const CELL: usize = 8;
 const LIST_TOP: usize = 44;
 const LIST_BOTTOM: usize = H - 16;
 
@@ -193,35 +192,6 @@ impl List {
     }
 }
 
-/// Draw one glyph row of text. `px` and `py` are the top-left of the first
-/// character; text that runs past the right edge is cut, not wrapped.
-fn put_text(fb: &mut [u32], px: usize, py: usize, text: &str, colour: u32) {
-    let mut x = px;
-    for ch in text.chars() {
-        if x + CELL > W {
-            break;
-        }
-        let glyph = BASIC_FONTS.get(ch).or_else(|| BASIC_FONTS.get('?'));
-        if let Some(glyph) = glyph {
-            for (row, bits) in glyph.iter().enumerate() {
-                let y = py + row;
-                if y >= H {
-                    break;
-                }
-                for col in 0..CELL {
-                    if bits & (1 << col) != 0 {
-                        let x = x + col;
-                        if x < W {
-                            fb[y * W + x] = colour;
-                        }
-                    }
-                }
-            }
-        }
-        x += CELL;
-    }
-}
-
 fn fill_row(fb: &mut [u32], y: usize, height: usize, colour: u32) {
     let top = y.min(H);
     let bottom = (y + height).min(H);
@@ -233,9 +203,11 @@ fn fill_row(fb: &mut [u32], y: usize, height: usize, colour: u32) {
 /// Paint the whole launcher frame from `dir` and `list`.
 fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
     fb.fill(BG);
-    put_text(fb, MARGIN, 6, "NES LAUNCHER", FG);
+    put_text(fb, W, H, MARGIN, 6, "NES LAUNCHER", FG);
     put_text(
         fb,
+        W,
+        H,
         MARGIN,
         18,
         &elide(&dir.display().to_string(), (W - 2 * MARGIN) / CELL, true),
@@ -246,7 +218,7 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
         1 => "1 ROM".to_string(),
         n => format!("{n} ROMs"),
     };
-    put_text(fb, MARGIN, 30, &count, DIM);
+    put_text(fb, W, H, MARGIN, 30, &count, DIM);
 
     let visible = visible_rows();
     for row in 0..visible {
@@ -261,6 +233,8 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         put_text(
             fb,
+            W,
+            H,
             MARGIN,
             y,
             &elide(&name, (W - 2 * MARGIN) / CELL, false),
@@ -271,6 +245,8 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
     if list.roms.is_empty() {
         put_text(
             fb,
+            W,
+            H,
             MARGIN,
             LIST_TOP + CELL,
             "Press O to choose a folder",
@@ -283,7 +259,7 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
         1 => "GAME RUNNING   O folder   ESC quit".to_string(),
         n => format!("{n} GAMES RUNNING   O folder   ESC quit"),
     };
-    put_text(fb, MARGIN, LIST_BOTTOM + 4, &footer, DIM);
+    put_text(fb, W, H, MARGIN, LIST_BOTTOM + 4, &footer, DIM);
 }
 
 /// Upload the software frame and show it. Same streaming ARGB texture path the
