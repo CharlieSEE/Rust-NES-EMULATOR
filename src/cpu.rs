@@ -15,6 +15,8 @@
 //! * No NMI hijack. `BusLike` can only raise an NMI between instructions, so
 //!   the earliest sample point is the top of `step`; see the `nmi` comment.
 
+use crate::state::{StateReader, StateWriter};
+
 /// Everything an instruction needs from the rest of the machine.
 ///
 /// `tick` advances the PPU by **one dot**, not by one CPU cycle. The NES PPU
@@ -148,6 +150,7 @@ fn index(base: u16, reg: u8) -> (u16, bool) {
     (ea, ea & 0xFF00 != base & 0xFF00)
 }
 
+#[derive(Clone)]
 pub struct Cpu {
     a: u8,
     x: u8,
@@ -187,6 +190,28 @@ impl Cpu {
     #[cfg(test)]
     pub fn registers(&self) -> (u16, u8, u8, u8, u8, u8) {
         (self.pc, self.a, self.x, self.y, self.p, self.sp)
+    }
+
+    /// The whole CPU state: the six registers, nothing derived. A save taken
+    /// between instructions is an exact resume point; one taken mid-instruction
+    /// would not be, which is why callers save at a frame boundary.
+    pub(crate) fn save_state(&self, writer: &mut StateWriter) {
+        writer.u8(self.a);
+        writer.u8(self.x);
+        writer.u8(self.y);
+        writer.u8(self.sp);
+        writer.u16(self.pc);
+        writer.u8(self.p);
+    }
+
+    pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.a = reader.u8()?;
+        self.x = reader.u8()?;
+        self.y = reader.u8()?;
+        self.sp = reader.u8()?;
+        self.pc = reader.u16()?;
+        self.p = reader.u8()?;
+        Ok(())
     }
 
     /// Jump straight into a test ROM's automation entry point.

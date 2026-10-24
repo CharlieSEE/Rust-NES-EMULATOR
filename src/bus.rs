@@ -39,6 +39,7 @@ use crate::cpu::{BusLike, Cpu};
 use crate::ppu::Ppu;
 use crate::region::Region;
 use crate::rom::Cartridge;
+use crate::state::StateWriter;
 
 /// CPU cycles an OAM DMA costs on an even cycle: one dummy read/write cycle,
 /// 256 read cycles and 256 write cycles (NESdev "PPU programmer reference").
@@ -55,6 +56,7 @@ struct DmcDma {
     cycles_left: u8,
 }
 
+#[derive(Clone)]
 pub struct Bus {
     pub cart: Cartridge,
     pub cpu_ram: [u8; 2048],
@@ -379,6 +381,109 @@ impl Bus {
     pub fn load_prg_ram(&mut self, data: &[u8]) {
         let n = data.len().min(self.prg_ram.len());
         self.prg_ram[..n].copy_from_slice(&data[..n]);
+    }
+
+    /// Serialize the machine at an instruction/frame boundary. The returned
+    /// bytes are the versioned file format described in `state.rs`; the ROM
+    /// itself is identified by fingerprint, not copied.
+    ///
+    /// Nothing in the player loop calls this yet: quicksave slots are their own
+    /// issue, and this is the engine they build on.
+    #[allow(dead_code)]
+    pub fn save_state(&self, cpu: &Cpu) -> Vec<u8> {
+        let mut payload = StateWriter::new();
+        cpu.save_state(&mut payload);
+        self.cart.save_state(&mut payload);
+        payload.bytes(&self.cpu_ram);
+        payload.bytes(&self.prg_ram);
+        self.ppu.save_state(&mut payload);
+        self.apu.save_state(&mut payload);
+        for controller in &self.controllers {
+            controller.save_state(&mut payload);
+        }
+        payload.u64(self.cycles);
+        payload.u8(self.dot);
+        payload.u8(self.pal_extra);
+        payload.u16(self.dma_stall);
+        match self.dmc_dma {
+            Some(dma) => {
+                payload.bool(true);
+                payload.u16(dma.addr);
+                payload.u8(dma.cycles_left);
+            }
+            None => payload.bool(false),
+        }
+        payload.u16(self.dmc_stall);
+        payload.bool(self.irq_line);
+        payload.bool(self.irq_line_delayed);
+        crate::state::wrap(
+            &payload.finish(),
+            self.cart.mapper_id(),
+            self.region,
+            self.cart.fingerprint(),
+        )
+    }
+
+    /// Restore a state produced by `save_state` on this exact cartridge. The
+    /// whole payload is applied to a clone and only swapped in when every byte
+    /// and every check has succeeded, so a bad file cannot leave half a machine
+    /// behind.
+    #[allow(dead_code)]
+    pub fn load_state(&mut self, cpu: &mut Cpu, data: &[u8]) -> Result<(), String> {
+        let mut reader = crate::state::unwrap(
+            data,
+            self.cart.mapper_id(),
+            self.region,
+            self.cart.fingerprint(),
+        )?;
+        let mut next = self.clone();
+        let mut next_cpu = cpu.clone();
+
+        next_cpu.load_state(&mut reader)?;
+        next.cart.load_state(&mut reader)?;
+        next.cpu_ram = reader.array()?;
+        next.prg_ram = reader.array()?;
+        next.ppu.load_state(&mut reader)?;
+        next.apu.load_state(&mut reader)?;
+        for controller in &mut next.controllers {
+            controller.load_state(&mut reader)?;
+        }
+        next.cycles = reader.u64()?;
+        next.dot = reader.u8()?;
+        if next.dot >= 3 {
+            return Err(format!(
+                "save state has {} PPU dots into a CPU cycle; the bus counts 0..2",
+                next.dot
+            ));
+        }
+        next.pal_extra = reader.u8()?;
+        if next.pal_extra >= 15 {
+            return Err(format!(
+                "save state has PAL extra-dot counter {}; it runs 0..14",
+                next.pal_extra
+            ));
+        }
+        next.dma_stall = reader.u16()?;
+        next.dmc_dma = if reader.bool()? {
+            let dma = DmcDma {
+                addr: reader.u16()?,
+                cycles_left: reader.u8()?,
+            };
+            if dma.cycles_left == 0 {
+                return Err("save state has a DMC DMA with no cycles left".to_string());
+            }
+            Some(dma)
+        } else {
+            None
+        };
+        next.dmc_stall = reader.u16()?;
+        next.irq_line = reader.bool()?;
+        next.irq_line_delayed = reader.bool()?;
+        reader.expect_end()?;
+
+        *self = next;
+        *cpu = next_cpu;
+        Ok(())
     }
 
     /// Advance the PPU by **one dot** (and the APU once the dots make a whole
@@ -1484,5 +1589,271 @@ mod tests {
         }
         assert_eq!(b.dmc_stall, 3, "the last put leaves the whole DMC sequence");
         assert_eq!(b.dma_stall, 0);
+    }
+
+    /// A synthetic NROM image that makes save states do some work: it turns on
+    /// a pulse channel and the DMC loop, enables NMI and rendering, then
+    /// increments zero-page `$00` forever. The NMI/IRQ vectors land on an RTI
+    /// at `$8100`, so a frame's vblank does not run into the data below the
+    /// code. The DMC loops over 17 bytes at `$C040`, which keeps a bus DMA in
+    /// play and makes the test cover that state too.
+    fn state_cart_bytes() -> Vec<u8> {
+        const CODE: &[u8] = &[
+            0x78, // SEI
+            0xA2, 0xFF, // LDX #$FF
+            0x9A, // TXS
+            0xA9, 0x11, 0x8D, 0x15, 0x40, // enable pulse 1 and the DMC
+            0xA9, 0xBF, 0x8D, 0x00, 0x40, // $4000: duty 2, halt, constant volume
+            0xA9, 0x00, 0x8D, 0x02, 0x40, // timer low
+            0xA9, 0x08, 0x8D, 0x03, 0x40, // timer high and length
+            0xA9, 0x4F, 0x8D, 0x10, 0x40, // DMC: loop, rate $F, no IRQ
+            0xA9, 0x01, 0x8D, 0x12, 0x40, // sample address $C040
+            0xA9, 0x01, 0x8D, 0x13, 0x40, // 17-byte sample
+            0xA9, 0x80, 0x8D, 0x00, 0x20, // NMI on
+            0xA9, 0x1E, 0x8D, 0x01, 0x20, // background and sprites on
+            0xE6, 0x00, // loop: INC $00
+            0x4C, 0x31, 0x80, // JMP $8031
+        ];
+        let mut bytes = crate::rom::ines_header(1, 1, 0).to_vec(); // 16 KiB PRG, 8 KiB CHR ROM
+        let mut prg = vec![0u8; 0x4000];
+        prg[..CODE.len()].copy_from_slice(CODE);
+        prg[0x100] = 0x40; // RTI for NMI and IRQ
+        let vectors = 0x3FFA; // $FFFA in a 16 KiB mirrored image
+        prg[vectors..vectors + 6].copy_from_slice(&[
+            0x00, 0x81, // NMI
+            0x00, 0x80, // RESET
+            0x00, 0x81, // IRQ
+        ]);
+        bytes.extend(prg);
+        bytes.extend((0..0x2000).map(|i| i as u8));
+        bytes
+    }
+
+    fn state_cart() -> Cartridge {
+        Cartridge::load(&state_cart_bytes()).expect("synthetic state image must load")
+    }
+
+    fn running_state_machine() -> (Bus, Cpu) {
+        let mut bus = Bus::new(state_cart());
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+        (bus, cpu)
+    }
+
+    /// The input schedule is a function of the absolute frame number, so the
+    /// saved run and the restored run see exactly the same presses.
+    fn state_input(frame: u32) -> u8 {
+        ((frame.wrapping_mul(37) & 0xFF) as u8) | 0x08
+    }
+
+    fn run_state_frames(
+        bus: &mut Bus,
+        cpu: &mut Cpu,
+        from: u32,
+        to: u32,
+        buttons: impl Fn(u32) -> u8,
+    ) -> Vec<i16> {
+        let mut samples = Vec::new();
+        for frame in from..to {
+            bus.controllers[0].set_buttons(buttons(frame));
+            bus.run_frame(cpu);
+            bus.ppu.take_frame();
+            samples.extend(bus.apu.take_samples());
+        }
+        samples
+    }
+
+    /// The proof that the state is complete: run a while, save, run on as the
+    /// expected branch, restore the file into a fresh machine, run the same
+    /// frames, and require both branches to end byte-for-byte identical. Every
+    /// latch that affects execution (CPU, PPU pipeline, APU channels, bus
+    /// clock, mapper, RAM) is in the comparison through `save_state`.
+    #[test]
+    fn a_restored_state_resumes_exactly_where_it_was_saved() {
+        let (mut bus, mut cpu) = running_state_machine();
+        let _ = run_state_frames(&mut bus, &mut cpu, 0, 6, state_input);
+        let saved = bus.save_state(&cpu);
+
+        let (mut expected_bus, mut expected_cpu) = (bus.clone(), cpu.clone());
+        let expected_audio =
+            run_state_frames(&mut expected_bus, &mut expected_cpu, 6, 11, state_input);
+        let expected_state = expected_bus.save_state(&expected_cpu);
+        let expected_frame = expected_bus.ppu.framebuffer().to_vec();
+
+        let (mut restored_bus, mut restored_cpu) = running_state_machine();
+        restored_bus
+            .load_state(&mut restored_cpu, &saved)
+            .expect("state must load into the same cartridge");
+        let restored_audio =
+            run_state_frames(&mut restored_bus, &mut restored_cpu, 6, 11, state_input);
+
+        assert_eq!(
+            restored_bus.save_state(&restored_cpu),
+            expected_state,
+            "the restored machine diverged from the saved one"
+        );
+        assert_eq!(
+            restored_bus.ppu.framebuffer(),
+            expected_frame.as_slice(),
+            "the restored machine rendered a different frame"
+        );
+        assert_eq!(
+            restored_audio, expected_audio,
+            "the restored machine played different audio"
+        );
+    }
+
+    /// A real game is the strongest state-coverage check: SMB + Duck Hunt boots
+    /// into mapper 66, switches CHR banks for its own title screen, renders, and
+    /// runs its APU. Save mid-title, continue, restore, continue, and require
+    /// the two machines to agree exactly. Skips on a checkout without the ROM.
+    #[test]
+    fn a_real_game_resumes_exactly_from_a_saved_state() {
+        let Some(bytes) = crate::rom::test_rom("Super Mario Bros. + Duck Hunt (USA).nes") else {
+            return;
+        };
+        let machine = || {
+            let mut bus = Bus::new(Cartridge::load(&bytes).expect("real cartridge must load"));
+            let mut cpu = Cpu::new();
+            bus.power_on();
+            cpu.reset(&mut bus);
+            (bus, cpu)
+        };
+        let buttons = |frame: u32| match frame {
+            20..=21 => 0x08, // Start
+            22..=40 => 0x80, // Right
+            _ => 0,
+        };
+        let (mut bus, mut cpu) = machine();
+        let _ = run_state_frames(&mut bus, &mut cpu, 0, 40, buttons);
+        let saved = bus.save_state(&cpu);
+
+        let (mut expected_bus, mut expected_cpu) = (bus.clone(), cpu.clone());
+        let expected_audio =
+            run_state_frames(&mut expected_bus, &mut expected_cpu, 40, 70, buttons);
+        let expected_state = expected_bus.save_state(&expected_cpu);
+        let expected_frame = expected_bus.ppu.framebuffer().to_vec();
+
+        let (mut restored_bus, mut restored_cpu) = machine();
+        restored_bus
+            .load_state(&mut restored_cpu, &saved)
+            .expect("state must load");
+        let restored_audio =
+            run_state_frames(&mut restored_bus, &mut restored_cpu, 40, 70, buttons);
+
+        assert_eq!(
+            restored_bus.save_state(&restored_cpu),
+            expected_state,
+            "the real game diverged after restoring its state"
+        );
+        assert_eq!(
+            restored_bus.ppu.framebuffer(),
+            expected_frame.as_slice(),
+            "the real game rendered a different frame after restoring"
+        );
+        assert_eq!(
+            restored_audio, expected_audio,
+            "the real game played different audio after restoring"
+        );
+    }
+
+    /// Mapper registers are part of the state, not just RAM: a bank selected
+    /// before the save must still be selected after the load.
+    #[test]
+    fn a_restored_state_keeps_the_mapper_bank() {
+        let mut bus = Bus::new(cart_bankable_at_8000());
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+        bus.cpu_write(0x8000, 0x11); // matching write selects bank 1
+        assert_eq!(bus.cpu_read(0x8001), 1);
+        let saved = bus.save_state(&cpu);
+
+        let mut restored = Bus::new(cart_bankable_at_8000());
+        let mut restored_cpu = Cpu::new();
+        restored.power_on();
+        restored_cpu.reset(&mut restored);
+        assert_eq!(restored.cpu_read(0x8001), 0, "power-on bank is 0");
+        restored
+            .load_state(&mut restored_cpu, &saved)
+            .expect("state must load");
+        assert_eq!(restored.cpu_read(0x8001), 1, "the saved bank came back");
+    }
+
+    /// CHR RAM is mutable pattern memory, unlike CHR ROM: a tile uploaded
+    /// through `$2007` must be in the state.
+    #[test]
+    fn a_restored_state_keeps_chr_ram_written_through_the_ppu() {
+        let mut bus = Bus::new(nrom_cart_no_chr());
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+        bus.cpu_write(0x2006, 0x00);
+        bus.cpu_write(0x2006, 0x00);
+        bus.cpu_write(0x2007, 0xA5);
+        let saved = bus.save_state(&cpu);
+
+        // Overwrite the byte, then prove the load puts the saved tile back.
+        bus.cpu_write(0x2006, 0x00);
+        bus.cpu_write(0x2006, 0x00);
+        bus.cpu_write(0x2007, 0x5A);
+        bus.load_state(&mut cpu, &saved).expect("state must load");
+        bus.cpu_write(0x2006, 0x00);
+        bus.cpu_write(0x2006, 0x00);
+        let _ = bus.cpu_read(0x2007); // prime the one-byte-late buffer
+        assert_eq!(bus.cpu_read(0x2007), 0xA5, "CHR RAM must survive a load");
+    }
+
+    /// A state that names another ROM, another format version, or bytes that do
+    /// not match its checksum is refused, and the live machine is untouched.
+    #[test]
+    fn an_incompatible_or_corrupt_state_is_refused_without_changing_the_machine() {
+        let (mut bus, mut cpu) = running_state_machine();
+        let _ = run_state_frames(&mut bus, &mut cpu, 0, 2, state_input);
+        let saved = bus.save_state(&cpu);
+        let before = bus.save_state(&cpu);
+
+        let mut wrong_rom = state_cart_bytes();
+        wrong_rom[16] ^= 0xFF; // one PRG byte differs from the saved image
+        let mut other_bus = Bus::new(Cartridge::load(&wrong_rom).expect("synthetic image"));
+        let mut other_cpu = Cpu::new();
+        other_bus.power_on();
+        other_cpu.reset(&mut other_bus);
+        let other_before = other_bus.save_state(&other_cpu);
+        let err = other_bus
+            .load_state(&mut other_cpu, &saved)
+            .expect_err("a state from another ROM must not load");
+        assert!(err.contains("different cartridge"), "{err}");
+        assert_eq!(
+            other_bus.save_state(&other_cpu),
+            other_before,
+            "a refused state must not touch the machine"
+        );
+
+        let mut wrong_version = saved.clone();
+        wrong_version[8..10].copy_from_slice(&99u16.to_le_bytes());
+        let err = bus
+            .load_state(&mut cpu, &wrong_version)
+            .expect_err("an unknown version must not load");
+        assert!(err.contains("version 99"), "{err}");
+
+        let mut corrupt = saved.clone();
+        corrupt[40] ^= 0xFF;
+        let err = bus
+            .load_state(&mut cpu, &corrupt)
+            .expect_err("a corrupt payload must not load");
+        assert!(err.contains("checksum"), "{err}");
+
+        let err = bus
+            .load_state(&mut cpu, &saved[..saved.len() - 2])
+            .expect_err("a truncated state must not load");
+        assert!(err.contains("truncated"), "{err}");
+
+        assert_eq!(
+            bus.save_state(&cpu),
+            before,
+            "every refused load must leave the machine exactly as it was"
+        );
     }
 }

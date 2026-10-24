@@ -94,7 +94,8 @@ the cartridge runs but cannot be aimed.
 - iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)** and
   **mapper 66** (the SMB/Duck Hunt board) are supported. Most other games will
   not boot and will exit with a mapper error.
-- No save states, rewind, or cheats.
+- No save-state hotkeys, rewind, or cheats yet; the versioned state format is
+  in place for the quicksave/rewind work to build on.
 
 ## For tinkerers
 

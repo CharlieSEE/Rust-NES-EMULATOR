@@ -16,6 +16,7 @@
 //! shifter, level and IRQ flag.
 
 use crate::region::Region;
+use crate::state::{StateReader, StateWriter};
 
 /// The length counter table: `$4003` bits 7-3 index it directly (all 32
 /// entries; NESdev "APU Length Counter").
@@ -103,6 +104,7 @@ struct Clocks {
 }
 
 /// The frame counter: mode, the interrupt flag, and the step schedule.
+#[derive(Clone, Copy)]
 struct Frame {
     /// 0 = 4-step freerun, 1 = 5-step (bit 7 of `$4017`).
     mode: u8,
@@ -269,6 +271,44 @@ impl Frame {
         }
         clocks
     }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.u8(self.mode);
+        writer.bool(self.inhibit);
+        writer.bool(self.flag);
+        writer.u32(self.cycle);
+        writer.bool(self.phase);
+        writer.u8(self.reset_in);
+        writer.u8(self.pending_mode);
+        writer.u8(self.last_write);
+        writer.bool(self.quarter);
+        writer.bool(self.half);
+        writer.u8(self.pulse);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.mode = reader.u8()?;
+        if self.mode > 1 {
+            return Err(format!("save state has frame-counter mode {}", self.mode));
+        }
+        self.inhibit = reader.bool()?;
+        self.flag = reader.bool()?;
+        self.cycle = reader.u32()?;
+        self.phase = reader.bool()?;
+        self.reset_in = reader.u8()?;
+        self.pending_mode = reader.u8()?;
+        if self.pending_mode > 1 {
+            return Err(format!(
+                "save state has pending frame-counter mode {}",
+                self.pending_mode
+            ));
+        }
+        self.last_write = reader.u8()?;
+        self.quarter = reader.bool()?;
+        self.half = reader.bool()?;
+        self.pulse = reader.u8()?;
+        Ok(())
+    }
 }
 
 /// The length counter every channel owns.
@@ -354,6 +394,39 @@ impl LengthCounter {
         self.halt_staged = self.halt;
         self.halt_delayed = self.halt;
     }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.bool(self.enabled);
+        writer.bool(self.halt);
+        writer.bool(self.halt_staged);
+        writer.bool(self.halt_delayed);
+        writer.u8(self.length);
+        writer.u8(self.reload_value);
+        writer.bool(self.load_pending);
+        writer.bool(self.load_staged);
+        writer.bool(self.load_suppressed);
+        writer.bool(self.load_ignored);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.enabled = reader.bool()?;
+        self.halt = reader.bool()?;
+        self.halt_staged = reader.bool()?;
+        self.halt_delayed = reader.bool()?;
+        self.length = reader.u8()?;
+        self.reload_value = reader.u8()?;
+        if self.reload_value > 31 {
+            return Err(format!(
+                "save state has length-table index {}; the table has 32 entries",
+                self.reload_value
+            ));
+        }
+        self.load_pending = reader.bool()?;
+        self.load_staged = reader.bool()?;
+        self.load_suppressed = reader.bool()?;
+        self.load_ignored = reader.bool()?;
+        Ok(())
+    }
 }
 
 /// The envelope every pulse and noise channel owns (NESdev "APU Envelope").
@@ -403,6 +476,25 @@ impl Envelope {
         } else {
             self.decay
         }
+    }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.bool(self.start);
+        writer.bool(self.looping);
+        writer.bool(self.constant);
+        writer.u8(self.volume);
+        writer.u8(self.divider);
+        writer.u8(self.decay);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.start = reader.bool()?;
+        self.looping = reader.bool()?;
+        self.constant = reader.bool()?;
+        self.volume = reader.u8()?;
+        self.divider = reader.u8()?;
+        self.decay = reader.u8()?;
+        Ok(())
     }
 }
 
@@ -460,6 +552,33 @@ impl Sweep {
         } else {
             self.divider -= 1;
         }
+    }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.bool(self.enable);
+        writer.u8(self.period);
+        writer.bool(self.negate);
+        writer.u8(self.shift);
+        writer.u8(self.divider);
+        writer.bool(self.reload);
+        writer.bool(self.ones_complement);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.enable = reader.bool()?;
+        self.period = reader.u8()?;
+        if self.period > 7 {
+            return Err(format!("save state has sweep period {}", self.period));
+        }
+        self.negate = reader.bool()?;
+        self.shift = reader.u8()?;
+        if self.shift > 7 {
+            return Err(format!("save state has sweep shift {}", self.shift));
+        }
+        self.divider = reader.u8()?;
+        self.reload = reader.bool()?;
+        self.ones_complement = reader.bool()?;
+        Ok(())
     }
 }
 
@@ -531,6 +650,38 @@ impl Pulse {
         } else {
             self.envelope.output()
         }
+    }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        self.len.save_state(writer);
+        writer.u8(self.duty);
+        writer.bool(self.duty_bit);
+        writer.u8(self.sequence);
+        writer.u16(self.timer);
+        writer.u16(self.divider);
+        self.envelope.save_state(writer);
+        self.sweep.save_state(writer);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.len.load_state(reader)?;
+        self.duty = reader.u8()?;
+        if self.duty > 3 {
+            return Err(format!("save state has pulse duty {}", self.duty));
+        }
+        self.duty_bit = reader.bool()?;
+        self.sequence = reader.u8()?;
+        if self.sequence > 7 {
+            return Err(format!(
+                "save state has pulse sequence step {}",
+                self.sequence
+            ));
+        }
+        self.timer = reader.u16()?;
+        self.divider = reader.u16()?;
+        self.envelope.load_state(reader)?;
+        self.sweep.load_state(reader)?;
+        Ok(())
     }
 }
 
@@ -607,6 +758,46 @@ impl Triangle {
     /// feeding its last value to the mixer, which is the audible "pop".
     fn output(&self) -> u8 {
         self.value
+    }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        self.len.save_state(writer);
+        writer.bool(self.control);
+        writer.u8(self.reload_value);
+        writer.bool(self.linear_reload);
+        writer.u8(self.linear);
+        writer.u16(self.timer);
+        writer.u16(self.divider);
+        writer.u8(self.sequence);
+        writer.u8(self.value);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.len.load_state(reader)?;
+        self.control = reader.bool()?;
+        self.reload_value = reader.u8()?;
+        if self.reload_value > 0x7F {
+            return Err(format!(
+                "save state has triangle reload value ${:02X}; the register holds seven bits",
+                self.reload_value
+            ));
+        }
+        self.linear_reload = reader.bool()?;
+        self.linear = reader.u8()?;
+        self.timer = reader.u16()?;
+        self.divider = reader.u16()?;
+        self.sequence = reader.u8()?;
+        if self.sequence > 31 {
+            return Err(format!(
+                "save state has triangle sequence step {}; the table has 32",
+                self.sequence
+            ));
+        }
+        self.value = reader.u8()?;
+        if self.value > 15 {
+            return Err(format!("save state has triangle output {}", self.value));
+        }
+        Ok(())
     }
 }
 
@@ -688,6 +879,31 @@ impl Noise {
             self.envelope.output()
         }
     }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        self.len.save_state(writer);
+        writer.bool(self.mode);
+        writer.u16(self.period);
+        writer.u16(self.divider);
+        writer.u16(self.lfsr);
+        self.envelope.save_state(writer);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.len.load_state(reader)?;
+        self.mode = reader.bool()?;
+        self.period = reader.u16()?;
+        self.divider = reader.u16()?;
+        self.lfsr = reader.u16()?;
+        if self.lfsr > 0x7FFF {
+            return Err(format!(
+                "save state has a 16-bit noise shift register ${:04X}; it holds 15 bits",
+                self.lfsr
+            ));
+        }
+        self.envelope.load_state(reader)?;
+        Ok(())
+    }
 }
 
 /// Which of the DMC's two DMA kinds a fetch is. Loads schedule on a get cycle
@@ -700,6 +916,23 @@ pub enum DmcFetchKind {
     #[default]
     Load,
     Reload,
+}
+
+impl DmcFetchKind {
+    fn id(self) -> u8 {
+        match self {
+            DmcFetchKind::Load => 0,
+            DmcFetchKind::Reload => 1,
+        }
+    }
+
+    fn from_id(id: u8) -> Result<DmcFetchKind, String> {
+        match id {
+            0 => Ok(DmcFetchKind::Load),
+            1 => Ok(DmcFetchKind::Reload),
+            other => Err(format!("save state has unknown DMC fetch kind {other}")),
+        }
+    }
 }
 
 /// A memory-reader request: the CPU address to read and which DMA kind it is.
@@ -946,8 +1179,93 @@ impl Dmc {
     fn output(&self) -> u8 {
         self.level
     }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.bool(self.irq_enable);
+        writer.bool(self.looping);
+        writer.u8(self.rate);
+        writer.u16(self.timer);
+        writer.u16(self.divider);
+        writer.u8(self.level);
+        writer.u16(self.sample_addr);
+        writer.u16(self.sample_len);
+        writer.u16(self.addr);
+        writer.u16(self.remaining);
+        match self.buffer {
+            Some(byte) => {
+                writer.bool(true);
+                writer.u8(byte);
+            }
+            None => writer.bool(false),
+        }
+        writer.u8(self.shift);
+        writer.u8(self.bits);
+        writer.bool(self.irq);
+        writer.bool(self.enabled);
+        writer.u8(self.fetch_wait);
+        writer.u8(self.fetch_kind.id());
+        match self.request {
+            Some(request) => {
+                writer.bool(true);
+                writer.u16(request.addr);
+                writer.u8(request.kind.id());
+            }
+            None => writer.bool(false),
+        }
+        writer.bool(self.in_flight);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.irq_enable = reader.bool()?;
+        self.looping = reader.bool()?;
+        self.rate = reader.u8()?;
+        if self.rate > 15 {
+            return Err(format!("save state has DMC rate {}", self.rate));
+        }
+        self.timer = reader.u16()?;
+        self.divider = reader.u16()?;
+        self.level = reader.u8()?;
+        if self.level > 0x7F {
+            return Err(format!(
+                "save state has DMC level {}; the register holds seven bits",
+                self.level
+            ));
+        }
+        self.sample_addr = reader.u16()?;
+        self.sample_len = reader.u16()?;
+        self.addr = reader.u16()?;
+        self.remaining = reader.u16()?;
+        self.buffer = if reader.bool()? {
+            Some(reader.u8()?)
+        } else {
+            None
+        };
+        self.shift = reader.u8()?;
+        self.bits = reader.u8()?;
+        if self.bits > 8 {
+            return Err(format!(
+                "save state has {0} DMC bits left; the shifter holds 8",
+                self.bits
+            ));
+        }
+        self.irq = reader.bool()?;
+        self.enabled = reader.bool()?;
+        self.fetch_wait = reader.u8()?;
+        self.fetch_kind = DmcFetchKind::from_id(reader.u8()?)?;
+        self.request = if reader.bool()? {
+            Some(DmcFetch {
+                addr: reader.u16()?,
+                kind: DmcFetchKind::from_id(reader.u8()?)?,
+            })
+        } else {
+            None
+        };
+        self.in_flight = reader.bool()?;
+        Ok(())
+    }
 }
 
+#[derive(Clone)]
 pub struct Apu {
     pulses: [Pulse; 2],
     triangle: Triangle,
@@ -1256,6 +1574,37 @@ impl Apu {
 
     pub fn take_samples(&mut self) -> Vec<i16> {
         std::mem::take(&mut self.samples)
+    }
+
+    /// Every latch the next `tick` can observe. The queued `i16` samples are
+    /// already-computed output and are deliberately not in the state: a load
+    /// starts with an empty queue, and the device's own queue is cleared by
+    /// whoever applies the state. The output rate is host audio configuration,
+    /// not machine state, so the current rate is kept on load.
+    pub(crate) fn save_state(&self, writer: &mut StateWriter) {
+        for pulse in &self.pulses {
+            pulse.save_state(writer);
+        }
+        self.triangle.save_state(writer);
+        self.noise.save_state(writer);
+        self.dmc.save_state(writer);
+        self.frame.save_state(writer);
+        writer.bool(self.apu_phase);
+        writer.u32(self.acc);
+    }
+
+    pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        for pulse in &mut self.pulses {
+            pulse.load_state(reader)?;
+        }
+        self.triangle.load_state(reader)?;
+        self.noise.load_state(reader)?;
+        self.dmc.load_state(reader)?;
+        self.frame.load_state(reader)?;
+        self.apu_phase = reader.bool()?;
+        self.acc = reader.u32()?;
+        self.samples.clear();
+        Ok(())
     }
 }
 

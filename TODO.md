@@ -1,15 +1,16 @@
 # Feature backlog
 
 Current state: mappers 0/1/2/66, cycle-based PPU with scanline IRQ support in the
-cartridge, APU with DMC, NTSC and PAL timing, battery saves, launcher,
-scripted input and frame dumps. Everything unchecked below is not implemented.
+cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
+serialization, launcher, scripted input and frame dumps. Everything unchecked
+below is not implemented.
 
 Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Suggested order
 
 1. Mapper 4 (MMC3) — largest library gain.
-2. Save states — unlocks rewind, frame advance and better debugging.
+2. ~~Save states~~ — done; quicksave slots, rewind and frame advance build on it.
 3. Unofficial CPU opcodes — removes hard crashes.
 4. Zapper — makes the bundled Duck Hunt fully playable.
 
@@ -31,7 +32,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Player quality of life
 
-- [ ] **Save states** — serialize CPU, PPU, APU, bus, cartridge/mapper and PRG RAM. Version the format and refuse incompatible states cleanly. *Effort: L. Prerequisite for rewind, frame advance and TAS work.*
+- [x] **Save states** — serialize CPU, PPU, APU, bus, cartridge/mapper and PRG RAM. Version the format and refuse incompatible states cleanly. *Done; format version 1, quicksave slots build on it.*
 - [ ] **Quicksave/quickload slots** — hotkeys for 1–9 save slots plus load-latest. *Effort: S, after save states.*
 - [ ] **Rewind** — ring buffer of compressed save states sampled every N frames. *Effort: M, after save states.*
 - [ ] **Fast-forward** — hold-to-turbo, with audio muted or pitch-shifted. *Effort: S.*

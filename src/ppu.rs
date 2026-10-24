@@ -19,6 +19,7 @@
 //!   and the down-counter that serialises a sprite's eight pixels.
 
 use crate::region::Region;
+use crate::state::{StateReader, StateWriter};
 
 const DOTS_PER_LINE: u32 = 341;
 const VISIBLE_LINES: u32 = 240;
@@ -188,6 +189,27 @@ pub enum Mirroring {
     SingleUpper,
 }
 
+impl Mirroring {
+    pub(crate) fn id(self) -> u8 {
+        match self {
+            Mirroring::Vertical => 0,
+            Mirroring::Horizontal => 1,
+            Mirroring::SingleLower => 2,
+            Mirroring::SingleUpper => 3,
+        }
+    }
+
+    pub(crate) fn from_id(id: u8) -> Result<Mirroring, String> {
+        match id {
+            0 => Ok(Mirroring::Vertical),
+            1 => Ok(Mirroring::Horizontal),
+            2 => Ok(Mirroring::SingleLower),
+            3 => Ok(Mirroring::SingleUpper),
+            other => Err(format!("save state has an unknown mirroring mode {other}")),
+        }
+    }
+}
+
 /// Nametable RAM: 2 KiB of physical RAM. The offset inside it depends on the
 /// board's mirroring: vertical folds `$2800` onto `$2000`, horizontal folds
 /// `$2400` onto `$2000`, and the single-screen modes make all four logical
@@ -217,6 +239,7 @@ fn palette_index(addr: u16) -> usize {
     }
 }
 
+#[derive(Clone)]
 pub struct Ppu {
     vram: [u8; 2048],
     palette: [u8; 32],
@@ -324,6 +347,23 @@ impl Sprite {
         let bit = 7 - col;
         ((self.hi >> bit) & 1) << 1 | ((self.lo >> bit) & 1)
     }
+
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.u8(self.x);
+        writer.u8(self.lo);
+        writer.u8(self.hi);
+        writer.u8(self.attr);
+        writer.bool(self.is_sprite0);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.x = reader.u8()?;
+        self.lo = reader.u8()?;
+        self.hi = reader.u8()?;
+        self.attr = reader.u8()?;
+        self.is_sprite0 = reader.bool()?;
+        Ok(())
+    }
 }
 
 /// One fetched background tile: its two pattern bytes, its nametable index, and
@@ -334,6 +374,23 @@ struct Tile {
     hi: u8,
     tile: u8,
     attr: u8,
+}
+
+impl Tile {
+    fn save_state(&self, writer: &mut StateWriter) {
+        writer.u8(self.lo);
+        writer.u8(self.hi);
+        writer.u8(self.tile);
+        writer.u8(self.attr);
+    }
+
+    fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.lo = reader.u8()?;
+        self.hi = reader.u8()?;
+        self.tile = reader.u8()?;
+        self.attr = reader.u8()?;
+        Ok(())
+    }
 }
 
 impl Ppu {
@@ -1031,6 +1088,117 @@ impl Ppu {
         self.chr = vec![0; data.len().max(8192)];
         self.chr[..data.len()].copy_from_slice(data);
         self.chr_ram = data.is_empty();
+    }
+
+    /// Everything the PPU will still be using when the next dot arrives: the
+    /// two RAMs, the CHR bank map and RAM image, the register file, the three
+    /// pipeline tiles, the two background shifters and their attributes, and
+    /// the eight sprite output units. The framebuffer is output and is not
+    /// saved; the next frame redraws it.
+    pub(crate) fn save_state(&self, writer: &mut StateWriter) {
+        writer.bytes(&self.vram);
+        writer.bytes(&self.palette);
+        // CHR ROM is in the cartridge, not in the state. Only the mutable RAM
+        // image needs saving, and then its length keeps the read bounded.
+        writer.bool(self.chr_ram);
+        if self.chr_ram {
+            writer.u32(self.chr.len() as u32);
+            writer.bytes(&self.chr);
+        }
+        for bank in self.chr_map {
+            writer.u32(bank as u32);
+        }
+        writer.u8(self.mirroring.id());
+        writer.bytes(&self.oam);
+        writer.bytes(&self.secondary_oam);
+        for &sprite0 in &self.secondary_sprite0 {
+            writer.bool(sprite0);
+        }
+        writer.u8(self.ctrl);
+        writer.u8(self.mask);
+        writer.u8(self.status);
+        writer.u8(self.oam_addr);
+        writer.u16(self.v);
+        writer.u16(self.t);
+        writer.u8(self.fine_x);
+        writer.bool(self.write_latch);
+        writer.u8(self.read_buffer);
+        writer.u32(self.scanline);
+        writer.u32(self.dot);
+        writer.bool(self.odd_frame);
+        writer.bool(self.frame_done);
+        writer.bool(self.nmi);
+        self.fetch.save_state(writer);
+        self.prev.save_state(writer);
+        self.cur.save_state(writer);
+        writer.u16(self.bg_lo);
+        writer.u16(self.bg_hi);
+        writer.u8(self.attr_prev);
+        writer.u8(self.attr_cur);
+        for sprite in &self.sprites {
+            sprite.save_state(writer);
+        }
+    }
+
+    pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
+        self.vram = reader.array()?;
+        self.palette = reader.array()?;
+        let chr_ram = reader.bool()?;
+        if chr_ram != self.chr_ram {
+            return Err(
+                "save state's CHR type does not match this cartridge (ROM vs RAM)".to_string(),
+            );
+        }
+        if chr_ram {
+            let len = reader.u32()? as usize;
+            if len != self.chr.len() {
+                return Err(format!(
+                    "save state has {len} bytes of CHR RAM; this cartridge has {}",
+                    self.chr.len()
+                ));
+            }
+            self.chr.copy_from_slice(reader.bytes(len)?);
+        }
+        for bank in &mut self.chr_map {
+            *bank = reader.u32()? as usize;
+        }
+        self.mirroring = Mirroring::from_id(reader.u8()?)?;
+        self.oam = reader.array()?;
+        self.secondary_oam = reader.array()?;
+        for sprite0 in &mut self.secondary_sprite0 {
+            *sprite0 = reader.bool()?;
+        }
+        self.ctrl = reader.u8()?;
+        self.mask = reader.u8()?;
+        self.status = reader.u8()?;
+        self.oam_addr = reader.u8()?;
+        self.v = reader.u16()?;
+        self.t = reader.u16()?;
+        self.fine_x = reader.u8()?;
+        self.write_latch = reader.bool()?;
+        self.read_buffer = reader.u8()?;
+        self.scanline = reader.u32()?;
+        self.dot = reader.u32()?;
+        if self.scanline >= self.region.scanlines() || self.dot >= DOTS_PER_LINE {
+            return Err(format!(
+                "save state has an impossible PPU position {}.{}",
+                self.scanline, self.dot
+            ));
+        }
+        self.odd_frame = reader.bool()?;
+        self.frame_done = reader.bool()?;
+        self.nmi = reader.bool()?;
+        self.fetch.load_state(reader)?;
+        self.prev.load_state(reader)?;
+        self.cur.load_state(reader)?;
+        self.bg_lo = reader.u16()?;
+        self.bg_hi = reader.u16()?;
+        self.attr_prev = reader.u8()?;
+        self.attr_cur = reader.u8()?;
+        for sprite in &mut self.sprites {
+            sprite.load_state(reader)?;
+        }
+        Ok(())
     }
 }
 

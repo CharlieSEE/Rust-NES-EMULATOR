@@ -17,6 +17,7 @@ mod ppu_rom_test;
 mod region;
 mod report;
 mod rom;
+mod state;
 
 use bus::Bus;
 use cpu::Cpu;
