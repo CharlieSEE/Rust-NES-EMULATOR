@@ -1,15 +1,16 @@
 # Feature backlog
 
 Current state: mappers 0/1/2/66, cycle-based PPU with scanline IRQ support in the
-cartridge, APU with DMC, NTSC and PAL timing, battery saves, launcher,
-scripted input and frame dumps. Everything unchecked below is not implemented.
+cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
+serialization with quicksave slots, launcher, scripted input and frame dumps.
+Everything unchecked below is not implemented.
 
 Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Suggested order
 
 1. Mapper 4 (MMC3) — largest library gain.
-2. Save states — unlocks rewind, frame advance and better debugging.
+2. ~~Save states~~ — done; rewind and frame advance build on it.
 3. Unofficial CPU opcodes — removes hard crashes.
 4. Zapper — makes the bundled Duck Hunt fully playable.
 
@@ -31,8 +32,12 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Player quality of life
 
-- [ ] **Save states** — serialize CPU, PPU, APU, bus, cartridge/mapper and PRG RAM. Version the format and refuse incompatible states cleanly. *Effort: L. Prerequisite for rewind, frame advance and TAS work.*
-- [ ] **Quicksave/quickload slots** — hotkeys for 1–9 save slots plus load-latest. *Effort: S, after save states.*
+- [x] **Save states** — serialize CPU, PPU, APU, bus, cartridge/mapper and PRG RAM. Version the format and refuse incompatible states cleanly. *Done; format version 1, quicksave slots build on it.*
+- [x] **Quicksave/quickload slots** — hotkeys for 1–9 save slots plus load-latest. *Done; `1`–`9` save, `Left Shift`+`1`–`9` load, `F8` loads the newest slot.*
+- [ ] **Save-state slot picker** — in-game list of slots 1–9 with timestamps and a compatibility check, then load or cancel. Needs a text overlay over the frame. *Effort: M.*
+- [x] **Save-state status messages** — brief confirmation of the saved slot and on-screen text for load and write failures; the same failures stay in stderr and `nes-errors.log`. *Done; the overlay is reusable by the slot picker.*
+- [ ] **Auto-save state on quit** — write a reserved slot on a clean exit so a session can resume without pressing a digit. *Effort: S.*
+- [ ] **Unpause after quickload** — loading while paused leaves the pre-load frame on screen until the next frame runs. *Effort: S.*
 - [ ] **Rewind** — ring buffer of compressed save states sampled every N frames. *Effort: M, after save states.*
 - [ ] **Fast-forward** — hold-to-turbo, with audio muted or pitch-shifted. *Effort: S.*
 - [ ] **Frame advance** — pause plus single-frame stepping. *Effort: S.*
