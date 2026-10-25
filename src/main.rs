@@ -201,19 +201,20 @@ fn load_latest_state(
     rom_path: &::std::path::Path,
     bus: &mut Bus,
     cpu: &mut Cpu,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let slot = read_latest_slot(rom_path)?.ok_or_else(|| {
         format!(
             "no save states for {}: press 1-9 to make one",
             rom_path.display()
         )
     })?;
-    load_state_slot(rom_path, slot, bus, cpu)
+    load_state_slot(rom_path, slot, bus, cpu).map(|()| slot)
 }
 
-/// A save writes no pixel, so a short confirmation is the only sign it
-/// happened. Long enough to read, short enough to get out of the way.
-const SAVE_TOAST: ::std::time::Duration = ::std::time::Duration::from_secs(2);
+/// A save or load writes no message of its own, so a short confirmation is
+/// the only sign it happened. Long enough to read, short enough to get out of
+/// the way.
+const CONFIRM_TOAST: ::std::time::Duration = ::std::time::Duration::from_secs(2);
 
 /// Failures carry a path and a reason; they stay up longer, and the full text
 /// is still in stderr and `nes-errors.log`.
@@ -823,13 +824,16 @@ fn run() -> Result<(), String> {
                                 if let Some(queue) = &audio {
                                     queue.clear();
                                 }
+                                toast =
+                                    Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
                             Err(e) => toast_error(&mut toast, &e),
                         }
                     } else {
                         match save_state_slot(::std::path::Path::new(&rom_path), slot, &bus, &cpu) {
                             Ok(()) => {
-                                toast = Some(Toast::new(&format!("Saved slot {slot}"), SAVE_TOAST))
+                                toast =
+                                    Some(Toast::new(&format!("Saved slot {slot}"), CONFIRM_TOAST))
                             }
                             Err(e) => toast_error(&mut toast, &e),
                         }
@@ -841,10 +845,11 @@ fn run() -> Result<(), String> {
                     ..
                 } => match load_latest_state(::std::path::Path::new(&rom_path), &mut bus, &mut cpu)
                 {
-                    Ok(()) => {
+                    Ok(slot) => {
                         if let Some(queue) = &audio {
                             queue.clear();
                         }
+                        toast = Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                     }
                     Err(e) => toast_error(&mut toast, &e),
                 },
@@ -1017,10 +1022,10 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run, frame_budget,
-        frame_sleep, latest_state_path, load_state_slot, mask_for_name, missed_dumps, parse_script,
-        read_latest_slot, save_state_slot, slot_for, state_slot_path, wrap_text, write_atomic, Bus,
-        Cartridge, Cpu, Play, Region, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET,
-        FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
+        frame_sleep, latest_state_path, load_latest_state, load_state_slot, mask_for_name,
+        missed_dumps, parse_script, read_latest_slot, save_state_slot, slot_for, state_slot_path,
+        wrap_text, write_atomic, Bus, Cartridge, Cpu, Play, Region, Toast, AUDIO_FRAME_BYTES,
+        AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -1108,6 +1113,11 @@ mod tests {
             bus.save_state(&cpu),
             saved,
             "the loaded machine differs from the saved one"
+        );
+        assert_eq!(
+            load_latest_state(&rom_path, &mut bus, &mut cpu),
+            Ok(3),
+            "the confirmation must name the slot F8 chose"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
