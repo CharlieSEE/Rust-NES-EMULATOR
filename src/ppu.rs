@@ -924,6 +924,21 @@ impl Ppu {
         self.frame_done
     }
 
+    /// The dot where MMC3-class mappers see the one filtered PPU A12 rise per
+    /// scanline. Hardware clocks it during the sprite pattern fetches on every
+    /// rendering line, visible or pre-render; this PPU stands in for that with
+    /// dot 260, just after the visible pixels. It is 241 clocks a frame on
+    /// NTSC, as NESdev counts them.
+    ///
+    /// ponytail: pattern-table selection is not consulted, so a board whose
+    /// background and sprites share `$1000` still clocks once a line. Add real
+    /// A12 edge tracking if a game's raster split drifts.
+    pub fn a12_rise(&self) -> bool {
+        self.dot == 260
+            && self.rendering_enabled()
+            && (self.scanline < VISIBLE_LINES || self.scanline == self.pre_render())
+    }
+
     pub fn framebuffer(&self) -> &[u32] {
         &self.framebuffer
     }
@@ -1334,6 +1349,22 @@ impl Ppu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MMC3 counts 241 A12 rises a frame: the pre-render line plus 240 visible
+    /// lines. Vblank fetches nothing, so it must not add clocks.
+    #[test]
+    fn rendering_produces_241_mapper_clocks_per_frame() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2001, 0x18);
+        let mut clocks = 0;
+        for _ in 0..89342 {
+            if p.a12_rise() {
+                clocks += 1;
+            }
+            p.tick();
+        }
+        assert_eq!(clocks, 241);
+    }
 
     #[test]
     fn reading_2002_clears_vblank_and_resets_the_2006_latch() {

@@ -1,7 +1,7 @@
 # Feature backlog
 
-Current state: mappers 0/1/2/66, cycle-based PPU with scanline IRQ support in the
-cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
+Current state: mappers 0/1/2/4/66, cycle-based PPU with scanline IRQ support in
+the cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
 serialization with quicksave slots and an in-game slot picker, launcher,
 scripted input and frame dumps.
 Everything unchecked below is not implemented.
@@ -19,7 +19,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Unlock more games
 
-- [ ] **Mapper 4 (MMC3)** — SMB3, Kirby, Mega Man 3–6, TMNT, Batman. Bank registers, 8 KiB CHR banking, PRG/CHR modes, scanline IRQ counter, mirroring control. *Effort: L. Highest compatibility payoff.*
+- [x] **Mapper 4 (MMC3)** — SMB3, Kirby, Mega Man 3–6, TMNT, Batman. Bank registers, 8 KiB CHR banking, PRG/CHR modes, scanline IRQ counter, mirroring control. *Done; one A12 pulse per rendering scanline, PRG RAM and battery saves, mapper state in save states.*
 - [ ] **Mapper 3 (CNROM)** — CHR bank register with bus conflicts. *Effort: S.*
 - [ ] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Effort: S.*
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*

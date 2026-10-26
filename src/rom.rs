@@ -1,9 +1,18 @@
 //! iNES loader for the boards this emulator knows: mapper 1 (MMC1) for
 //! "Legend of Zelda", mapper 2 (UxROM) for "Contra", mapper 66 (UxROM variant
-//! with bus conflicts) for "Super Mario Bros. + Duck Hunt", and mapper 0 (NROM)
-//! for blargg's APU test ROMs -- NROM-128 and NROM-256, both with the
-//! `$6000-$7FFF` PRG RAM the tests need, and the 2005 suite with no CHR at all
-//! (the PPU gets RAM instead).
+//! with bus conflicts) for "Super Mario Bros. + Duck Hunt", mapper 4 (MMC3) for
+//! the TxROM library, and mapper 0 (NROM) for blargg's APU test ROMs --
+//! NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM the tests need,
+//! and the 2005 suite with no CHR at all (the PPU gets RAM instead).
+//!
+//! Mapper 4 is MMC3: four 8 KiB PRG windows (two switchable, the second-last
+//! and last fixed, with bit 6 of `$8000` swapping the switchable pair), 2 KiB
+//! and 1 KiB CHR windows selected by R0-R5, runtime mirroring at `$A000`, and
+//! an 8 KiB PRG RAM window enabled by `$A001` bit 7. Its scanline counter is
+//! clocked by PPU A12; the bus supplies one filtered pulse per rendering
+//! scanline (including the pre-render line, 241 a frame on NTSC) at dot 260.
+//! The `$A001` write-protect bit is recorded but not enforced, as many emulators
+//! omit it to stay compatible with the MMC6 boards that share mapper 4.
 //!
 //! Mapper 1 is MMC1: a five-write serial register controlling PRG mode, CHR
 //! banking and nametable mirroring. Zelda carries CHR RAM and an 8 KiB
@@ -99,8 +108,11 @@ pub struct Cartridge {
     shift: u8,
     shift_count: u8,
     /// MMC1B PRG register bit 4: false disables `$6000-$7FFF` until the game
-    /// writes a value with the bit clear. Power-on is enabled.
+    /// writes a value with the bit clear. Power-on is enabled. MMC3's `$A001`
+    /// bit 7 has the same effect.
     prg_ram_enabled: bool,
+    /// MMC3's register file. Defaults for every other board.
+    mmc3: Mmc3,
     /// How the board wires the four logical nametables onto 2 KiB of VRAM.
     mirroring: Mirroring,
     /// Whether the header marks PRG RAM as battery-backed, so it should be
@@ -124,6 +136,29 @@ enum Board {
     /// UxROM, the Contra board: 16 KiB switchable low window, last 16 KiB
     /// fixed high window, and no CHR banking.
     UxRom,
+    /// MMC3, the TxROM board: 8 KiB PRG windows, 1-2 KiB CHR windows,
+    /// switchable mirroring and a scanline IRQ counter.
+    Mmc3,
+}
+
+/// MMC3's write-only register file. Kept apart from the boards that do not use
+/// it so their state stays exactly as it was.
+#[derive(Clone, Default)]
+struct Mmc3 {
+    /// `$8000`: low three bits pick the next bank register, bit 6 swaps the PRG
+    /// windows at `$8000`/`$C000`, bit 7 swaps the CHR 2 KiB/1 KiB halves.
+    bank_select: u8,
+    /// R0-R7, written through `$8001`.
+    regs: [u8; 8],
+    irq_latch: u8,
+    irq_counter: u8,
+    /// `$C001` asked for a reload on the next A12 rise.
+    irq_reload: bool,
+    irq_enabled: bool,
+    irq_pending: bool,
+    /// `$A001` bit 6, kept so a state round-trips even though writes are not
+    /// blocked: iNES mapper 4 also covers MMC6 boards with a different meaning.
+    prg_ram_protected: bool,
 }
 
 impl Cartridge {
@@ -175,24 +210,30 @@ impl Cartridge {
             0 => Board::Nrom,
             1 => Board::Mmc1,
             2 => Board::UxRom,
+            4 => Board::Mmc3,
             66 => Board::GxRom,
-            other => return Err(format!("mapper {other}, only 0, 1, 2 and 66 are supported")),
+            other => {
+                return Err(format!(
+                    "mapper {other}, only 0, 1, 2, 4 and 66 are supported"
+                ));
+            }
         };
-        // NROM, MMC1 and UxROM start with bank 0. GxROM's power-on bank is
-        // measured, and `POWER_ON_BANK % (prg_len / BANK)` would divide by
+        // NROM, MMC1, MMC3 and UxROM start with bank 0. GxROM's power-on bank
+        // is measured, and `POWER_ON_BANK % (prg_len / BANK)` would divide by
         // zero for a 16 KiB image.
         let bank = match board {
-            Board::Nrom | Board::Mmc1 | Board::UxRom => 0,
+            Board::Nrom | Board::Mmc1 | Board::Mmc3 | Board::UxRom => 0,
             Board::GxRom => POWER_ON_BANK % (prg_len / BANK).max(1),
         };
         // MMC1's control register powers up at $0C: PRG mode 3, 8 KiB CHR
         // mode, and one-screen lower nametable arrangement. GxROM is hardwired
-        // vertical. NROM and UxROM follow the header bit.
+        // vertical. The rest follow the header bit; MMC3's `$A000` overrides it
+        // as soon as the game writes the register.
         let mirroring = match board {
             Board::Mmc1 => Mirroring::SingleLower,
             Board::GxRom => Mirroring::Vertical,
-            Board::Nrom | Board::UxRom if flags6 & 0x01 != 0 => Mirroring::Vertical,
-            Board::Nrom | Board::UxRom => Mirroring::Horizontal,
+            Board::Nrom | Board::Mmc3 | Board::UxRom if flags6 & 0x01 != 0 => Mirroring::Vertical,
+            Board::Nrom | Board::Mmc3 | Board::UxRom => Mirroring::Horizontal,
         };
         Ok(Cartridge {
             prg: bytes[start..start + prg_len].to_vec(),
@@ -205,6 +246,7 @@ impl Cartridge {
             shift: 0,
             shift_count: 0,
             prg_ram_enabled: true,
+            mmc3: Mmc3::default(),
             mirroring,
             battery: flags6 & 0x02 != 0,
             region,
@@ -217,7 +259,7 @@ impl Cartridge {
     /// disable bit: writes with it set make `$6000-$7FFF` open bus until the
     /// game clears it again.
     pub fn prg_ram_enabled(&self) -> bool {
-        matches!(self.board, Board::Nrom | Board::Mmc1) && self.prg_ram_enabled
+        matches!(self.board, Board::Nrom | Board::Mmc1 | Board::Mmc3) && self.prg_ram_enabled
     }
 
     /// Whether the cartridge has battery-backed PRG RAM to persist.
@@ -237,6 +279,7 @@ impl Cartridge {
             Board::Nrom => 0,
             Board::Mmc1 => 1,
             Board::UxRom => 2,
+            Board::Mmc3 => 4,
             Board::GxRom => 66,
         }
     }
@@ -260,6 +303,18 @@ impl Cartridge {
         writer.u8(self.shift_count);
         writer.bool(self.prg_ram_enabled);
         writer.u8(self.mirroring.id());
+        // MMC3 has more registers than the other boards, and none of its states
+        // predate the appended fields, so the common layout stays unchanged.
+        if matches!(self.board, Board::Mmc3) {
+            writer.u8(self.mmc3.bank_select);
+            writer.bytes(&self.mmc3.regs);
+            writer.u8(self.mmc3.irq_latch);
+            writer.u8(self.mmc3.irq_counter);
+            writer.bool(self.mmc3.irq_reload);
+            writer.bool(self.mmc3.irq_enabled);
+            writer.bool(self.mmc3.irq_pending);
+            writer.bool(self.mmc3.prg_ram_protected);
+        }
     }
 
     pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
@@ -271,6 +326,7 @@ impl Cartridge {
             // count wraps in `mmc1_prg_banks`, exactly as on hardware.
             Board::Mmc1 => 16,
             Board::UxRom => (self.prg.len() / PRG_UNIT).max(1),
+            Board::Mmc3 => 1,
             Board::GxRom => (self.prg.len() / BANK).max(1),
         };
         if bank >= banks {
@@ -301,6 +357,22 @@ impl Cartridge {
         }
         self.prg_ram_enabled = reader.bool()?;
         self.mirroring = Mirroring::from_id(reader.u8()?)?;
+        if matches!(self.board, Board::Mmc3) {
+            let bank_select = reader.u8()?;
+            if bank_select & !0xC7 != 0 {
+                return Err(format!(
+                    "save state has MMC3 bank select ${bank_select:02X}; only bits 7, 6 and 2-0 are used"
+                ));
+            }
+            self.mmc3.bank_select = bank_select;
+            self.mmc3.regs = reader.array()?;
+            self.mmc3.irq_latch = reader.u8()?;
+            self.mmc3.irq_counter = reader.u8()?;
+            self.mmc3.irq_reload = reader.bool()?;
+            self.mmc3.irq_enabled = reader.bool()?;
+            self.mmc3.irq_pending = reader.bool()?;
+            self.mmc3.prg_ram_protected = reader.bool()?;
+        }
         Ok(())
     }
 
@@ -313,6 +385,9 @@ impl Cartridge {
     /// 4 KiB bank and slots 4-7 the second; MMC1's 8 KiB mode points both
     /// halves at one aligned pair.
     pub fn chr_map(&self) -> [usize; 8] {
+        if matches!(self.board, Board::Mmc3) {
+            return self.mmc3_chr_map();
+        }
         let banks = self.chr_bank_count();
         let (first, second) = match self.board {
             Board::Mmc1 if self.control & 0x10 == 0 => {
@@ -339,9 +414,55 @@ impl Cartridge {
         (self.chr.len() / CHR_UNIT).max(2)
     }
 
+    /// MMC3's eight 1 KiB CHR slots. R0/R1 are 2 KiB banks (their low bit is
+    /// ignored); bit 7 of `$8000` swaps the 2 KiB and 1 KiB halves.
+    fn mmc3_chr_map(&self) -> [usize; 8] {
+        let count = (self.chr.len() / 0x400).max(8);
+        let one = |bank: u8| bank as usize % count;
+        let pair = |bank: u8| {
+            let base = bank as usize & !1;
+            [base % count, (base + 1) % count]
+        };
+        let [r0a, r0b] = pair(self.mmc3.regs[0]);
+        let [r1a, r1b] = pair(self.mmc3.regs[1]);
+        let [r2, r3, r4, r5] = [
+            one(self.mmc3.regs[2]),
+            one(self.mmc3.regs[3]),
+            one(self.mmc3.regs[4]),
+            one(self.mmc3.regs[5]),
+        ];
+        if self.mmc3.bank_select & 0x80 == 0 {
+            [r0a, r0b, r1a, r1b, r2, r3, r4, r5]
+        } else {
+            [r2, r3, r4, r5, r0a, r0b, r1a, r1b]
+        }
+    }
+
     /// How the board currently wires the nametables.
     pub fn mirroring(&self) -> Mirroring {
         self.mirroring
+    }
+
+    /// One MMC3 scanline-counter clock, the rising edge of PPU A12. The bus
+    /// calls this once per rendering scanline; other boards ignore it.
+    pub fn clock_irq(&mut self) {
+        if !matches!(self.board, Board::Mmc3) {
+            return;
+        }
+        if self.mmc3.irq_counter == 0 || self.mmc3.irq_reload {
+            self.mmc3.irq_counter = self.mmc3.irq_latch;
+            self.mmc3.irq_reload = false;
+        } else {
+            self.mmc3.irq_counter -= 1;
+        }
+        if self.mmc3.irq_counter == 0 && self.mmc3.irq_enabled {
+            self.mmc3.irq_pending = true;
+        }
+    }
+
+    /// Whether the cartridge is holding `/IRQ` low. Only MMC3 has a mapper IRQ.
+    pub fn irq_pending(&self) -> bool {
+        matches!(self.board, Board::Mmc3) && self.mmc3.irq_pending
     }
 
     /// The CPU's `$8000-$FFFF` window. NROM has no register: 16 KiB images
@@ -362,6 +483,11 @@ impl Cartridge {
                 let bank = if addr < 0xC000 { low } else { high };
                 self.prg[bank * PRG_UNIT + (addr as usize & 0x3FFF)]
             }
+            Board::Mmc3 => {
+                let window = (addr as usize - 0x8000) / 0x2000;
+                let bank = self.mmc3_prg_banks()[window];
+                self.prg[bank * 0x2000 + (addr as usize & 0x1FFF)]
+            }
         }
     }
 
@@ -378,6 +504,22 @@ impl Cartridge {
                 let base = bank & !1;
                 (base % count, (base + 1) % count)
             }
+        }
+    }
+
+    /// The four 8 KiB PRG banks MMC3 maps at `$8000`, `$A000`, `$C000` and
+    /// `$E000`. Bit 6 of `$8000` swaps the two switchable windows; `$E000`
+    /// always holds the last bank.
+    fn mmc3_prg_banks(&self) -> [usize; 4] {
+        let count = (self.prg.len() / 0x2000).max(1);
+        let r6 = self.mmc3.regs[6] as usize % count;
+        let r7 = self.mmc3.regs[7] as usize % count;
+        let last = count - 1;
+        let second_last = count.saturating_sub(2);
+        if self.mmc3.bank_select & 0x40 == 0 {
+            [r6, r7, second_last, last]
+        } else {
+            [second_last, r7, r6, last]
         }
     }
 
@@ -424,6 +566,42 @@ impl Cartridge {
                     self.bank = (val as usize) % (self.prg.len() / PRG_UNIT);
                 }
             }
+            Board::Mmc3 => self.mmc3_write(addr, val),
+        }
+    }
+
+    fn mmc3_write(&mut self, addr: u16, val: u8) {
+        let odd = addr & 1 != 0;
+        match addr & 0xE000 {
+            0x8000 if odd => {
+                let register = (self.mmc3.bank_select & 0x07) as usize;
+                self.mmc3.regs[register] = val;
+            }
+            0x8000 => self.mmc3.bank_select = val & 0xC7,
+            0xA000 if odd => {
+                self.prg_ram_enabled = val & 0x80 != 0;
+                self.mmc3.prg_ram_protected = val & 0x40 != 0;
+            }
+            0xA000 => {
+                self.mirroring = if val & 1 == 0 {
+                    Mirroring::Vertical
+                } else {
+                    Mirroring::Horizontal
+                };
+            }
+            0xC000 if odd => {
+                // The counter is cleared at once and reloaded from the latch on
+                // the next clock.
+                self.mmc3.irq_counter = 0;
+                self.mmc3.irq_reload = true;
+            }
+            0xC000 => self.mmc3.irq_latch = val,
+            0xE000 if odd => self.mmc3.irq_enabled = true,
+            0xE000 => {
+                self.mmc3.irq_enabled = false;
+                self.mmc3.irq_pending = false;
+            }
+            _ => {}
         }
     }
 
@@ -613,14 +791,14 @@ mod tests {
     fn a_bad_image_is_rejected() {
         assert!(Cartridge::load(b"nope").is_err(), "bad magic");
         assert!(Cartridge::load(b"NES\x1a").is_err(), "truncated");
-        let mut other_mapper = ines_header(4, 2, 4).to_vec();
+        let mut other_mapper = ines_header(4, 2, 5).to_vec();
         other_mapper.resize(16 + 4 * PRG_UNIT + 2 * CHR_BANK, 0);
         let err = match Cartridge::load(&other_mapper) {
-            Ok(_) => panic!("mapper 4 is not supported"),
+            Ok(_) => panic!("mapper 5 is not supported"),
             Err(e) => e,
         };
         assert!(
-            err.contains("mapper 4"),
+            err.contains("mapper 5"),
             "error must name the mapper: {err}"
         );
     }
@@ -792,6 +970,23 @@ mod tests {
         }
     }
 
+    /// An MMC3 image: `prg_16k` 16 KiB PRG units, each 8 KiB half filled with
+    /// its own index, and `chr_8k` 8 KiB CHR banks whose 1 KiB quarters are
+    /// filled with 0x80+index.
+    fn mmc3_cart(prg_16k: u8, chr_8k: u8) -> Cartridge {
+        let mut bytes = ines_header(prg_16k, chr_8k, 4).to_vec();
+        for bank in 0..prg_16k * 2 {
+            bytes.extend(std::iter::repeat_n(bank, 0x2000));
+        }
+        for bank in 0..chr_8k * 8 {
+            bytes.extend(std::iter::repeat_n(0x80 + bank, 0x400));
+        }
+        let last = 16 + prg_16k as usize * 0x4000 - 0x2000;
+        let vectors = last + (0xFFFC - 0xE000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0xE000u16.to_le_bytes());
+        Cartridge::load(&bytes).expect("synthetic MMC3 image must load")
+    }
+
     /// Four 16 KiB PRG banks, each filled with its own index, plus `chr_banks`
     /// 8 KiB CHR banks whose 4 KiB halves are filled with 0x80+index.
     fn mmc1_cart(prg_banks: u8, chr_banks: u8) -> Cartridge {
@@ -906,6 +1101,242 @@ mod tests {
         assert_eq!(c.cpu_read(0x8000), 0, "and the PRG bank is still bank 0");
         mmc1_write(&mut c, 0xE000, 0x01);
         assert!(c.prg_ram_enabled(), "clearing bit 4 enables it again");
+    }
+
+    /// Power-on has no meaningful bank registers, so the reset vector must live
+    /// in the fixed last 8 KiB bank at `$E000`. The second-last bank is fixed at
+    /// `$C000` in PRG mode 0; R6 and R7 power up as bank 0.
+    #[test]
+    fn mmc3_powers_up_with_the_last_two_banks_fixed() {
+        let c = mmc3_cart(2, 0); // 32 KiB PRG = four 8 KiB banks
+        assert_eq!(c.mapper_id(), 4, "mmc3_cart must load as mapper 4");
+        assert!(c.prg_ram_enabled(), "MMC3 powers up with PRG RAM enabled");
+        assert_eq!(c.cpu_read(0x8000), 0, "R6 powers up as bank 0");
+        assert_eq!(c.cpu_read(0xA000), 0, "R7 powers up as bank 0");
+        assert_eq!(c.cpu_read(0xC000), 2, "the second-last bank is fixed");
+        assert_eq!(c.cpu_read(0xE000), 3, "the last bank holds the vectors");
+        assert_eq!(
+            u16::from_le_bytes([c.cpu_read(0xFFFC), c.cpu_read(0xFFFD)]),
+            0xE000,
+            "the synthetic reset vector is in the fixed bank"
+        );
+    }
+
+    /// `$8000` selects which register `$8001` writes. R6 and R7 are the two 8
+    /// KiB switchable windows; bit 6 swaps which of `$8000`/`$C000` gets R6.
+    #[test]
+    fn mmc3_bank_registers_and_prg_mode_choose_the_8k_windows() {
+        // Four 8 KiB banks. R6 = 1 at $8000, R7 = 2 at $A000.
+        let mut c = mmc3_cart(2, 0);
+        c.cpu_write(0x8000, 6);
+        c.cpu_write(0x8001, 1);
+        c.cpu_write(0x8000, 7);
+        c.cpu_write(0x8001, 2);
+        assert_eq!(c.cpu_read(0x8000), 1);
+        assert_eq!(c.cpu_read(0xA000), 2);
+
+        // PRG mode 1: R6 moves to $C000 and $8000 is pinned to the second-last
+        // bank; R7 and the last bank do not move.
+        c.cpu_write(0x8000, 0x46);
+        c.cpu_write(0x8001, 1);
+        assert_eq!(c.cpu_read(0x8000), 2, "second-last bank is fixed at $8000");
+        assert_eq!(c.cpu_read(0xA000), 2, "R7 stays at $A000");
+        assert_eq!(c.cpu_read(0xC000), 1, "R6 now lives at $C000");
+        assert_eq!(c.cpu_read(0xE000), 3, "the last bank never moves");
+
+        // A register past the end wraps like the bank counter it drives.
+        c.cpu_write(0x8000, 0x06);
+        c.cpu_write(0x8001, 0x1A);
+        assert_eq!(c.cpu_read(0xC000), 0x1A % 4);
+    }
+
+    /// CHR mode 0: R0/R1 are 2 KiB banks at `$0000`/`$0800`, R2-R5 are 1 KiB
+    /// banks at `$1000-$1C00`. Bit 7 of `$8000` swaps the two halves.
+    #[test]
+    fn mmc3_chr_registers_map_2k_and_1k_windows_in_both_modes() {
+        let mut c = mmc3_cart(2, 2); // 16 KiB CHR = sixteen 1 KiB banks
+        c.cpu_write(0x8000, 0); // R0
+        c.cpu_write(0x8001, 2); // 2 KiB at $0000
+        c.cpu_write(0x8000, 1); // R1
+        c.cpu_write(0x8001, 6); // 2 KiB at $0800
+        assert_eq!(
+            c.chr_map(),
+            [2, 3, 6, 7, 0, 0, 0, 0],
+            "R2-R5 power up as bank 0"
+        );
+
+        // Inverted: R2-R5 fill $0000-$0FFF and R0/R1 move to $1000.
+        c.cpu_write(0x8000, 0x82); // R2, inverted
+        c.cpu_write(0x8001, 7);
+        c.cpu_write(0x8000, 0x83); // R3
+        c.cpu_write(0x8001, 8);
+        c.cpu_write(0x8000, 0x84); // R4
+        c.cpu_write(0x8001, 9);
+        c.cpu_write(0x8000, 0x85); // R5
+        c.cpu_write(0x8001, 10);
+        c.cpu_write(0x8000, 0x80); // R0
+        c.cpu_write(0x8001, 12);
+        c.cpu_write(0x8000, 0x81); // R1
+        c.cpu_write(0x8001, 14);
+        assert_eq!(c.chr_map(), [7, 8, 9, 10, 12, 13, 14, 15]);
+
+        // 2 KiB registers ignore their low bit.
+        c.cpu_write(0x8000, 0x00);
+        c.cpu_write(0x8001, 3);
+        assert_eq!(
+            (c.chr_map()[0], c.chr_map()[1]),
+            (2, 3),
+            "R0 bit 0 is ignored"
+        );
+    }
+
+    /// `$A000` bit 0 picks the nametable arrangement, and `$A001` bit 7
+    /// enables the 8 KiB PRG RAM window.
+    #[test]
+    fn mmc3_mirroring_and_prg_ram_enable_are_register_controlled() {
+        let mut c = mmc3_cart(2, 0);
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::Horizontal,
+            "the synthetic header asks for horizontal"
+        );
+        c.cpu_write(0xA000, 0);
+        assert_eq!(c.mirroring(), Mirroring::Vertical);
+        c.cpu_write(0xA000, 1);
+        assert_eq!(c.mirroring(), Mirroring::Horizontal);
+
+        assert!(c.prg_ram_enabled(), "power-on PRG RAM is enabled");
+        c.cpu_write(0xA001, 0x00);
+        assert!(!c.prg_ram_enabled(), "$A001 bit 7 clear disables it");
+        c.cpu_write(0xA001, 0x80);
+        assert!(c.prg_ram_enabled());
+        // Bit 6 write protection is deliberately not enforced: iNES mapper 4
+        // also covers MMC6, whose $A001 means something else, and the write
+        // protect exists only to guard save RAM during power-off.
+        c.cpu_write(0xA001, 0xC0);
+        assert!(c.prg_ram_enabled(), "bit 6 does not disable the window");
+    }
+
+    /// A `$C001` write arms a reload for the next clock. The counter then
+    /// counts down once per clock and raises the IRQ as it reaches zero; the
+    /// gap between reload and IRQ is always latch+1 clocks.
+    #[test]
+    fn mmc3_irq_counter_fires_after_the_latch_plus_one_clocks() {
+        let mut c = mmc3_cart(2, 0);
+        c.cpu_write(0xC000, 3); // latch
+        c.cpu_write(0xC001, 0); // reload on the next clock
+        c.cpu_write(0xE001, 0); // enable
+
+        for _ in 0..3 {
+            c.clock_irq();
+            assert!(!c.irq_pending(), "no IRQ before the counter reaches 0");
+        }
+        c.clock_irq();
+        assert!(c.irq_pending(), "IRQ on the fourth clock");
+
+        // $E000 acknowledges and disables. The counter keeps running while
+        // disabled, and $E001 re-enables without acknowledging.
+        c.cpu_write(0xE000, 0);
+        assert!(!c.irq_pending(), "$E000 acknowledges the IRQ");
+        c.clock_irq();
+        assert!(!c.irq_pending(), "a disabled counter raises no IRQ");
+        c.cpu_write(0xE001, 0);
+        for _ in 0..2 {
+            c.clock_irq();
+            assert!(!c.irq_pending());
+        }
+        c.clock_irq();
+        assert!(c.irq_pending(), "the reloaded counter still counts down");
+    }
+
+    /// A latch of 0 is the MMC3B/C behaviour: the IRQ stays asserted on every
+    /// clock. Games that want a per-scanline split rely on this.
+    #[test]
+    fn mmc3_zero_latch_fires_an_irq_on_every_clock() {
+        let mut c = mmc3_cart(2, 0);
+        c.cpu_write(0xC000, 0);
+        c.cpu_write(0xC001, 0);
+        c.cpu_write(0xE001, 0);
+        c.clock_irq();
+        assert!(c.irq_pending());
+    }
+
+    /// MMC3's bank select, register file, IRQ counter and mirroring are part of
+    /// the state. A state saved mid-countdown must resume the same countdown.
+    #[test]
+    fn a_saved_mmc3_state_restores_every_mapper_register() {
+        use crate::state::{StateReader, StateWriter};
+
+        let mut cart = mmc3_cart(4, 4); // eight 8 KiB PRG banks, 32 KiB CHR
+        cart.cpu_write(0x8000, 0x46); // PRG mode 1, R6 selected
+        cart.cpu_write(0x8001, 3);
+        cart.cpu_write(0x8000, 0x07); // R7
+        cart.cpu_write(0x8001, 5);
+        cart.cpu_write(0x8000, 0x80); // R0, inverted CHR
+        cart.cpu_write(0x8001, 4);
+        cart.cpu_write(0x8000, 0x81); // R1
+        cart.cpu_write(0x8001, 12);
+        cart.cpu_write(0x8000, 0x82); // R2
+        cart.cpu_write(0x8001, 9);
+        cart.cpu_write(0xA000, 1); // horizontal
+        cart.cpu_write(0xA001, 0x00); // PRG RAM off
+        cart.cpu_write(0xC000, 10); // IRQ latch
+        cart.cpu_write(0xC001, 0); // reload
+        cart.cpu_write(0xE001, 0); // enable
+        for _ in 0..4 {
+            cart.clock_irq(); // reload 10, then 9, 8, 7
+        }
+        assert!(!cart.irq_pending(), "the countdown is still running");
+        let before = (
+            cart.cpu_read(0x8000),
+            cart.cpu_read(0xA000),
+            cart.cpu_read(0xC000),
+            cart.cpu_read(0xE000),
+            cart.chr_map(),
+            cart.mirroring(),
+            cart.prg_ram_enabled(),
+        );
+        assert_eq!(before.0, 3, "mode 1 puts R6 at $C000");
+        assert_eq!(before.1, 5);
+        assert!(!before.6);
+
+        let mut writer = StateWriter::new();
+        cart.save_state(&mut writer);
+        let bytes = writer.finish();
+
+        let mut restored = mmc3_cart(4, 4);
+        restored
+            .load_state(&mut StateReader::new(&bytes))
+            .expect("mapper state must load");
+        assert_eq!(
+            (
+                restored.cpu_read(0x8000),
+                restored.cpu_read(0xA000),
+                restored.cpu_read(0xC000),
+                restored.cpu_read(0xE000),
+                restored.chr_map(),
+                restored.mirroring(),
+                restored.prg_ram_enabled(),
+            ),
+            before,
+            "every MMC3 register must come back"
+        );
+
+        let mut original = cart.clone();
+        let clocks_to_irq = |c: &mut Cartridge| {
+            let mut clocks = 0;
+            while !c.irq_pending() && clocks < 300 {
+                c.clock_irq();
+                clocks += 1;
+            }
+            clocks
+        };
+        let expected = clocks_to_irq(&mut original);
+        assert_eq!(
+            clocks_to_irq(&mut restored),
+            expected,
+            "the saved counter must resume at the same value"
+        );
     }
 
     /// Region comes from the header. NES 2.0's byte 12 is the authority when

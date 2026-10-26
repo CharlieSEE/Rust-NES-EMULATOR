@@ -95,9 +95,10 @@ the cartridge runs but cannot be aimed.
 - **Contra** — playable on mapper 2 (UxROM).
 - **The Legend of Zelda** — playable on mapper 1 (MMC1); progress is saved to
   a `.sav` file beside the ROM periodically while playing and on exit.
-- iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)** and
-  **mapper 66** (the SMB/Duck Hunt board) are supported. Most other games will
-  not boot and will exit with a mapper error.
+- iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)**,
+  **mapper 4 (MMC3/TxROM)** and **mapper 66** (the SMB/Duck Hunt board) are
+  supported. Mapper 4 covers SMB3, Kirby's Adventure, Mega Man 3–6 and most of
+  the TxROM library. Games on other mappers still exit with a mapper error.
 - Save states live beside the ROM as `.state1`–`.state9` files, with a small
   `.state` index naming the newest: a bare digit saves, `Left Shift`+digit
   loads, `F8` loads the most recently saved slot. `F7` opens the slot list,
