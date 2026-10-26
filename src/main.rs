@@ -230,10 +230,15 @@ struct Picker {
 
 impl Picker {
     fn open(rom_path: &::std::path::Path, cart: &Cartridge) -> Picker {
-        Picker {
-            slots: ::std::array::from_fn(|index| slot_state(rom_path, index + 1, cart)),
-            selected: 0,
-        }
+        let slots = ::std::array::from_fn(|index| slot_state(rom_path, index + 1, cart));
+        // The slot the player saved last is the one they are most likely to
+        // want; an index naming a broken or foreign file falls back to slot 1.
+        let selected = read_latest_slot(rom_path)
+            .ok()
+            .flatten()
+            .filter(|&slot| matches!(&slots[slot - 1], Slot::Ready(_)))
+            .map_or(0, |slot| slot - 1);
+        Picker { slots, selected }
     }
 
     fn lines(&self) -> Vec<String> {
@@ -248,10 +253,6 @@ impl Picker {
 
     fn select(&mut self, delta: isize) {
         self.selected = move_selection(self.selected, delta);
-    }
-
-    fn selected_slot(&self) -> usize {
-        self.selected + 1
     }
 }
 
@@ -304,6 +305,55 @@ fn slot_line(slot: usize, selected: bool, state: &Slot) -> String {
 fn move_selection(selected: usize, delta: isize) -> usize {
     let count = SLOT_KEYS.len() as isize;
     (selected as isize + delta).rem_euclid(count) as usize
+}
+
+/// What the modal slot list does with an event. Kept apart from the SDL and
+/// audio side effects so the key map can be checked without a window.
+#[derive(Debug, PartialEq, Eq)]
+enum PickerCommand {
+    Cancel,
+    Move(isize),
+    Load,
+    ForgetInput,
+    Quit,
+    Ignore,
+}
+
+fn picker_command(event: &Event) -> PickerCommand {
+    match event {
+        Event::Quit { .. } => PickerCommand::Quit,
+        Event::KeyDown {
+            keycode: Some(Keycode::Escape),
+            repeat: false,
+            ..
+        } => PickerCommand::Cancel,
+        Event::KeyDown {
+            keycode: Some(Keycode::Up),
+            repeat: false,
+            ..
+        } => PickerCommand::Move(-1),
+        Event::KeyDown {
+            keycode: Some(Keycode::Down),
+            repeat: false,
+            ..
+        } => PickerCommand::Move(1),
+        Event::KeyDown {
+            keycode: Some(Keycode::Return),
+            repeat: false,
+            ..
+        } => PickerCommand::Load,
+        Event::Window {
+            win_event: WindowEvent::FocusLost,
+            ..
+        } => PickerCommand::ForgetInput,
+        _ => PickerCommand::Ignore,
+    }
+}
+
+/// The picker pauses the game while it is open; audio follows the game, and a
+/// muted game stays silent even when play resumes.
+fn resume_audio(paused: bool, muted: bool) -> bool {
+    !paused && !muted
 }
 
 /// A save or load writes no message of its own, so a short confirmation is
@@ -852,51 +902,40 @@ fn run() -> Result<(), String> {
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
         for event in events.poll_iter() {
+            // A controller can arrive at any time, including while the modal
+            // list owns the keys; hotplug must not be lost to the picker.
+            if let Event::ControllerDeviceAdded { which, .. } = &event {
+                if let Some(controllers) = &controller_subsystem {
+                    if let Ok(gamepad) = controllers.open(*which) {
+                        pads.push(gamepad);
+                    }
+                }
+                continue;
+            }
             // The picker is modal: it owns the keys while it is open, so a
             // digit cannot save over a slot the player is choosing and Escape
             // cancels the list instead of quitting the game.
             if picker.is_some() {
-                match event {
-                    Event::Quit { .. } => running = false,
-                    Event::KeyDown {
-                        keycode: Some(Keycode::Escape),
-                        repeat: false,
-                        ..
-                    } => {
+                match picker_command(&event) {
+                    PickerCommand::Quit => running = false,
+                    PickerCommand::Cancel => {
                         picker = None;
                         paused = picker_was_paused;
                         keys = 0;
                         pad = 0;
-                        if !paused && !muted {
-                            if let Some(queue) = &audio {
+                        if let Some(queue) = &audio {
+                            if resume_audio(paused, muted) {
                                 queue.resume();
                             }
                         }
                     }
-                    Event::KeyDown {
-                        keycode: Some(Keycode::Up),
-                        repeat: false,
-                        ..
-                    } => {
+                    PickerCommand::Move(delta) => {
                         if let Some(open) = picker.as_mut() {
-                            open.select(-1);
+                            open.select(delta);
                         }
                     }
-                    Event::KeyDown {
-                        keycode: Some(Keycode::Down),
-                        repeat: false,
-                        ..
-                    } => {
-                        if let Some(open) = picker.as_mut() {
-                            open.select(1);
-                        }
-                    }
-                    Event::KeyDown {
-                        keycode: Some(Keycode::Return),
-                        repeat: false,
-                        ..
-                    } => {
-                        let slot = picker.as_ref().expect("the guard checked").selected_slot();
+                    PickerCommand::Load => {
+                        let slot = picker.as_ref().expect("the guard checked").selected + 1;
                         match load_state_slot(
                             ::std::path::Path::new(&rom_path),
                             slot,
@@ -905,12 +944,15 @@ fn run() -> Result<(), String> {
                         ) {
                             Ok(()) => {
                                 picker = None;
-                                paused = false;
+                                // Loading returns to play only if the list was
+                                // opened during play; opening it from a pause
+                                // keeps the game paused, like Escape does.
+                                paused = picker_was_paused;
                                 keys = 0;
                                 pad = 0;
                                 if let Some(queue) = &audio {
                                     queue.clear();
-                                    if !muted {
+                                    if resume_audio(paused, muted) {
                                         queue.resume();
                                     }
                                 }
@@ -920,14 +962,11 @@ fn run() -> Result<(), String> {
                             Err(e) => toast_error(&mut toast, &e),
                         }
                     }
-                    Event::Window {
-                        win_event: WindowEvent::FocusLost,
-                        ..
-                    } => {
+                    PickerCommand::ForgetInput => {
                         keys = 0;
                         pad = 0;
                     }
-                    _ => {}
+                    PickerCommand::Ignore => {}
                 }
                 continue;
             }
@@ -1055,13 +1094,6 @@ fn run() -> Result<(), String> {
                     }
                     Err(e) => toast_error(&mut toast, &e),
                 },
-                Event::ControllerDeviceAdded { which, .. } => {
-                    if let Some(controllers) = &controller_subsystem {
-                        if let Ok(gamepad) = controllers.open(which) {
-                            pads.push(gamepad);
-                        }
-                    }
-                }
                 other => {
                     if !apply_event(other, &mut keys, &mut pad) {
                         running = false;
@@ -1229,10 +1261,11 @@ mod tests {
     use super::{
         age_label, apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run,
         frame_budget, frame_sleep, latest_state_path, load_latest_state, load_state_slot,
-        mask_for_name, missed_dumps, move_selection, parse_script, read_latest_slot,
-        save_state_slot, slot_for, slot_line, state_slot_path, wrap_text, write_atomic, Bus,
-        Cartridge, Cpu, Picker, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
-        AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
+        mask_for_name, missed_dumps, move_selection, parse_script, picker_command,
+        read_latest_slot, resume_audio, save_state_slot, slot_for, slot_line, state_slot_path,
+        wrap_text, write_atomic, Bus, Cartridge, Cpu, Picker, PickerCommand, Play, Region, Slot,
+        Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG,
+        TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -1345,7 +1378,7 @@ mod tests {
     /// each slot is: a save with its age, empty, or incompatible.
     #[test]
     fn the_slot_list_marks_the_selection_and_its_state() {
-        let picker = Picker {
+        let mut picker = Picker {
             slots: std::array::from_fn(|index| match index {
                 0 => Slot::Ready("2m ago".to_string()),
                 1 => Slot::Empty,
@@ -1363,6 +1396,73 @@ mod tests {
         assert_eq!(lines[10], "UP/DOWN choose");
         assert_eq!(lines[11], "ENTER load  ESC cancel");
         assert_eq!(slot_line(9, true, &Slot::Empty), ">9  empty");
+        picker.select(1);
+        assert_eq!(
+            picker.lines()[2],
+            ">2  empty",
+            "the marker follows the selection"
+        );
+    }
+
+    /// The picker owns the keyboard while it is open; every key that is not a
+    /// list command is ignored, so a digit cannot save over the slot being
+    /// chosen and F7 cannot close the list it opened.
+    #[test]
+    fn the_picker_key_map_is_modal() {
+        let key = |keycode, repeat| Event::KeyDown {
+            timestamp: 0,
+            window_id: 0,
+            keycode: Some(keycode),
+            scancode: None,
+            keymod: sdl2::keyboard::Mod::empty(),
+            repeat,
+        };
+        assert_eq!(
+            picker_command(&key(Keycode::Escape, false)),
+            PickerCommand::Cancel
+        );
+        assert_eq!(
+            picker_command(&key(Keycode::Up, false)),
+            PickerCommand::Move(-1)
+        );
+        assert_eq!(
+            picker_command(&key(Keycode::Down, false)),
+            PickerCommand::Move(1)
+        );
+        assert_eq!(
+            picker_command(&key(Keycode::Return, false)),
+            PickerCommand::Load
+        );
+        assert_eq!(
+            picker_command(&key(Keycode::F7, false)),
+            PickerCommand::Ignore,
+            "F7 must not close the list it opened"
+        );
+        assert_eq!(
+            picker_command(&key(Keycode::Escape, true)),
+            PickerCommand::Ignore,
+            "key repeat must not act twice"
+        );
+        assert_eq!(
+            picker_command(&Event::Quit { timestamp: 0 }),
+            PickerCommand::Quit
+        );
+        let lost = Event::Window {
+            timestamp: 0,
+            window_id: 0,
+            win_event: WindowEvent::FocusLost,
+        };
+        assert_eq!(picker_command(&lost), PickerCommand::ForgetInput);
+    }
+
+    /// Opening the list pauses the game; closing it returns to the pause state
+    /// it had before, and a muted game stays silent.
+    #[test]
+    fn the_picker_keeps_the_pause_and_mute_state() {
+        assert!(resume_audio(false, false), "play resumes");
+        assert!(!resume_audio(true, false), "a paused game stays paused");
+        assert!(!resume_audio(false, true), "a muted game stays silent");
+        assert!(!resume_audio(true, true));
     }
 
     /// Up from the first slot wraps to the last, and down from the last wraps
@@ -1392,6 +1492,7 @@ mod tests {
             crate::state::wrap(&[], 0, Region::Ntsc, 0),
         )
         .expect("foreign state written");
+        save_state_slot(&rom_path, 5, &bus, &cpu).expect("latest state must be written");
 
         let picker = Picker::open(&rom_path, &bus.cart);
         assert!(
@@ -1400,6 +1501,11 @@ mod tests {
         );
         assert_eq!(picker.slots[1], Slot::Incompatible, "slot 2 is another ROM");
         assert_eq!(picker.slots[2], Slot::Empty, "slot 3 was never saved");
+        assert!(
+            matches!(picker.slots[4], Slot::Ready(_)),
+            "slot 5 is this ROM"
+        );
+        assert_eq!(picker.selected, 4, "the list opens on the last saved slot");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
