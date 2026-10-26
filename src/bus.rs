@@ -489,12 +489,21 @@ impl Bus {
     /// nothing here may add a factor of three. On PAL the CPU:PPU ratio is
     /// 5:16, so one call in fifteen adds a second dot.
     pub fn tick(&mut self) {
+        // MMC3's scanline counter is clocked by filtered PPU A12 rises. Consume
+        // them after every PPU dot, including PAL's extra dot, so a rise cannot
+        // be skipped by the 5:16 CPU:PPU ratio.
         self.ppu.tick();
+        if self.ppu.take_a12_rise() {
+            self.cart.clock_irq();
+        }
         if self.region == Region::Pal {
             self.pal_extra += 1;
             if self.pal_extra == 15 {
                 self.pal_extra = 0;
                 self.ppu.tick();
+                if self.ppu.take_a12_rise() {
+                    self.cart.clock_irq();
+                }
             }
         }
         self.dot += 1;
@@ -516,7 +525,9 @@ impl Bus {
             self.dmc_cycle();
         }
         self.irq_line_delayed = self.irq_line;
-        self.irq_line = self.apu.irq_pending();
+        // Both the APU frame counter and an MMC3-class mapper can hold /IRQ
+        // low, and the CPU sees a single wired-OR line.
+        self.irq_line = self.apu.irq_pending() || self.cart.irq_pending();
         if self.dma_stall > 0 {
             self.dma_stall -= 1;
         }
@@ -634,6 +645,34 @@ mod tests {
 
     fn blank_cart() -> Cartridge {
         cart_running(&[])
+    }
+
+    /// A mapper-4 image whose reset code and IRQ handler live in the fixed last
+    /// 8 KiB bank, where MMC3's reset vector has to be. `code` runs at `$E000`,
+    /// `handler` at `$E010`, and NMI lands on an RTI at `$E020`.
+    fn mmc3_cart_with_irq_handler(code: &[u8], handler: &[u8]) -> Cartridge {
+        mmc3_cart_in(Region::Ntsc, code, handler)
+    }
+
+    /// The same image with a NES 2.0 byte 12 timing mode, so PAL's extra PPU
+    /// dot can be tested against the mapper's A12 clock.
+    fn mmc3_cart_in(region: Region, code: &[u8], handler: &[u8]) -> Cartridge {
+        let mut header = crate::rom::ines_header(2, 0, 4); // 32 KiB PRG
+        if region == Region::Pal {
+            header[7] |= 0x08; // NES 2.0 signature
+            header[12] = 0x01; // licensed PAL
+        }
+        let mut bytes = header.to_vec();
+        bytes.resize(16 + 0x8000, 0);
+        let last = 16 + 0x6000;
+        bytes[last..last + code.len()].copy_from_slice(code);
+        bytes[last + 0x10..last + 0x10 + handler.len()].copy_from_slice(handler);
+        bytes[last + 0x20] = 0x40; // NMI lands on an RTI
+        let vectors = last + (0xFFFC - 0xE000);
+        bytes[vectors - 2..vectors].copy_from_slice(&0xE020u16.to_le_bytes()); // NMI
+        bytes[vectors..vectors + 2].copy_from_slice(&0xE000u16.to_le_bytes());
+        bytes[vectors + 2..vectors + 4].copy_from_slice(&0xE010u16.to_le_bytes());
+        Cartridge::load(&bytes).expect("synthetic MMC3 image must load")
     }
 
     /// `cart_running`, but with `region` selected through a NES 2.0 byte 12
@@ -888,6 +927,73 @@ mod tests {
         );
     }
 
+    /// MMC3's counter is clocked by the filtered rise of real PPU A12. With
+    /// rendering off and v low, A12 never rises, so no clock and no IRQ. Once
+    /// background `$0000` and sprites `$1000` are rendering, one rise per
+    /// scanline must reach the CPU's handler.
+    #[test]
+    fn an_mmc3_irq_is_clocked_by_rendering_scanlines_and_reaches_the_cpu() {
+        // INC $00; LDA #$00; STA $E000; RTI -- count, acknowledge, return.
+        let mut b = Bus::new(mmc3_cart_with_irq_handler(
+            &[0x58, 0x4C, 0x00, 0xE0], // CLI; JMP $E000
+            &[0xE6, 0x00, 0xA9, 0x00, 0x8D, 0x00, 0xE0, 0x40],
+        ));
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut b);
+        b.cpu_write(0xC000, 0); // latch 0: an IRQ on every clock
+        b.cpu_write(0xC001, 0); // reload
+        b.cpu_write(0xE001, 0); // enable
+
+        for _ in 0..500 {
+            b.tick();
+        }
+        assert!(
+            !b.cart.irq_pending(),
+            "A12 does not rise while rendering is disabled"
+        );
+
+        b.cpu_write(0x2000, 0x08); // BG $0000, sprites $1000
+        b.cpu_write(0x2001, 0x18); // background and sprites on
+        for _ in 0..400 {
+            b.tick();
+        }
+        assert!(
+            b.cart.irq_pending(),
+            "a rendering scanline must clock the MMC3 counter"
+        );
+
+        b.run_frame(&mut cpu);
+        assert!(
+            b.cpu_read(0x0000) >= 1,
+            "the MMC3 IRQ must reach the handler at $FFFE"
+        );
+        assert!(
+            !b.cart.irq_pending(),
+            "the handler's $E000 write acknowledges the IRQ"
+        );
+    }
+
+    /// PAL's 16 PPU dots per 5 CPU cycles must still deliver all 241 A12
+    /// clocks before vblank. A latch of 240 fires on the 241st clock; losing
+    /// the 15 pre-render/visible clocks the old pre-tick check missed leaves
+    /// the counter short and no IRQ asserted.
+    #[test]
+    fn pal_rendering_clocks_the_mmc3_counter_241_times_per_frame() {
+        let mut b = Bus::new(mmc3_cart_in(Region::Pal, &[], &[]));
+        b.cpu_write(0x2000, 0x08); // BG $0000, sprites $1000
+        b.cpu_write(0x2001, 0x18);
+        b.cpu_write(0xC000, 240); // reload 240
+        b.cpu_write(0xC001, 0); // then decrement to 0 on clock 241
+        b.cpu_write(0xE001, 0); // enable
+        while !b.ppu.frame_ready() {
+            b.tick();
+        }
+        assert!(
+            b.cart.irq_pending(),
+            "241 clocks must exhaust a latch of 240"
+        );
+    }
+
     #[test]
     fn a_held_frame_flag_does_not_re_fire_while_i_is_set() {
         // Handler: INC $00; JMP $8012 -- one more entry would count 2. It
@@ -998,6 +1104,24 @@ mod tests {
         let mut smb = Bus::new(blank_cart()); // mapper 66, synthesized
         smb.cpu_write(0x6000, 0x5A);
         assert_eq!(smb.cpu_read(0x6000), 0, "mapper 66 has no PRG RAM here");
+    }
+
+    /// MMC3's 8 KiB PRG RAM is always enabled -- SMB3 saves its level state
+    /// there -- and `$A001` must not close it: bit 7 is MMC6's read enable, and
+    /// iNES cannot tell the two boards apart.
+    #[test]
+    fn mmc3_prg_ram_round_trips_through_mmc6_control_bits() {
+        let mut b = Bus::new(mmc3_cart_with_irq_handler(&[], &[]));
+        b.cpu_write(0x6000, 0x5A);
+        assert_eq!(b.cpu_read(0x6000), 0x5A);
+        for value in [0x00, 0x10, 0x20, 0x40, 0x80] {
+            b.cpu_write(0xA001, value);
+            assert_eq!(
+                b.cpu_read(0x6000),
+                0x5A,
+                "$A001 ${value:02X} is MMC6's bank control; keep the RAM open"
+            );
+        }
     }
 
     /// A warm reset (the RESET button) keeps RAM; a power cycle clears it.
