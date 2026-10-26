@@ -323,14 +323,11 @@ pub struct Ppu {
     /// wherever sprites overlap. Evaluation fills them COMPACTLY, so a unit's
     /// index is not its OAM index: `is_sprite0` says which one is sprite 0.
     sprites: [Sprite; 8],
-    /// Whether the last PPU address placed on the bus had A12 set, and how many
-    /// dots it has stayed low. The MMC3 sees the filtered edge of this line,
-    /// not a synthetic once-per-scanline pulse.
-    a12_low: bool,
+    /// How many dots the last PPU address kept A12 low. The MMC3 sees the
+    /// filtered edge of this line, not a synthetic once-per-scanline pulse.
     a12_low_dots: u32,
-    /// Rising edges found since the last `take_a12_rise`; a `$2006` write can
-    /// produce one between two PPU ticks.
-    a12_rises: u8,
+    /// One rising edge can wait between two PPU ticks after a `$2006` write.
+    a12_rise: bool,
 }
 
 /// One sprite output unit: the X counter the 2C02 reference describes, the two
@@ -455,9 +452,8 @@ impl Ppu {
             attr_prev: 0,
             attr_cur: 0,
             sprites: [Sprite::default(); 8],
-            a12_low: true,
             a12_low_dots: 1,
-            a12_rises: 0,
+            a12_rise: false,
         }
     }
 
@@ -537,7 +533,7 @@ impl Ppu {
             self.observe_a12(addr);
         }
 
-        if self.a12_low {
+        if self.a12_low_dots > 0 {
             self.a12_low_dots = self.a12_low_dots.saturating_add(1);
         }
 
@@ -904,12 +900,10 @@ impl Ppu {
     fn observe_a12(&mut self, addr: u16) {
         if addr & 0x1000 != 0 {
             if self.a12_low_dots > A12_FILTER_DOTS {
-                self.a12_rises = self.a12_rises.saturating_add(1);
+                self.a12_rise = true;
             }
-            self.a12_low = false;
             self.a12_low_dots = 0;
-        } else if !self.a12_low {
-            self.a12_low = true;
+        } else if self.a12_low_dots == 0 {
             self.a12_low_dots = 1;
         }
     }
@@ -994,16 +988,12 @@ impl Ppu {
         self.frame_done
     }
 
-    /// Consume one filtered A12 rising edge found since the last call. MMC3
-    /// uses exactly these edges; a synthetic once-per-line pulse would miss
-    /// boards that run the background from `$1000` and sprites from `$0000`,
-    /// and would not see the extra edges of 8x16 sprites or `$2006`/`$2007`.
+    /// Consume the filtered A12 rising edge, if one is pending. MMC3 uses
+    /// exactly these edges; a synthetic once-per-line pulse would miss boards
+    /// that run the background from `$1000` and sprites from `$0000`, and would
+    /// not see the extra edges of 8x16 sprites or `$2006`/`$2007`.
     pub fn take_a12_rise(&mut self) -> bool {
-        if self.a12_rises == 0 {
-            return false;
-        }
-        self.a12_rises -= 1;
-        true
+        std::mem::take(&mut self.a12_rise)
     }
 
     pub fn framebuffer(&self) -> &[u32] {
@@ -1273,9 +1263,8 @@ impl Ppu {
         // A12 filtering is transient bus state and is not part of the state
         // format, so existing mappers' states keep loading unchanged. Start
         // the filter from the restored v address.
-        self.a12_low = self.v & 0x1000 == 0;
-        self.a12_low_dots = u32::from(self.a12_low);
-        self.a12_rises = 0;
+        self.a12_low_dots = u32::from(self.v & 0x1000 == 0);
+        self.a12_rise = false;
         if self.scanline >= self.region.scanlines() || self.dot >= DOTS_PER_LINE {
             return Err(format!(
                 "save state has an impossible PPU position {}.{}",

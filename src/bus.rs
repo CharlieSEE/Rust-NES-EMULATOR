@@ -493,7 +493,7 @@ impl Bus {
         // them after every PPU dot, including PAL's extra dot, so a rise cannot
         // be skipped by the 5:16 CPU:PPU ratio.
         self.ppu.tick();
-        while self.ppu.take_a12_rise() {
+        if self.ppu.take_a12_rise() {
             self.cart.clock_irq();
         }
         if self.region == Region::Pal {
@@ -501,7 +501,7 @@ impl Bus {
             if self.pal_extra == 15 {
                 self.pal_extra = 0;
                 self.ppu.tick();
-                while self.ppu.take_a12_rise() {
+                if self.ppu.take_a12_rise() {
                     self.cart.clock_irq();
                 }
             }

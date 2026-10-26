@@ -18,8 +18,8 @@
 //! banks instead of acting as one MMC3-style disable, and plain iNES cannot
 //! tell the two chips apart. Many emulators keep the whole window enabled for
 //! that reason; StarTropics and its sequel are the only commercial MMC6 games.
-//! The MMC3 `$A001` bit 6 write-protect is recorded but not enforced, because
-//! it only guards save RAM during power-off and MMC6 reuses the same bits.
+//! The MMC3 `$A001` write-protect bit is ignored along with the MMC6 control
+//! bits, because it only guards save RAM during power-off.
 //!
 //! Mapper 1 is MMC1: a five-write serial register controlling PRG mode, CHR
 //! banking and nametable mirroring. Zelda carries CHR RAM and an 8 KiB
@@ -163,9 +163,6 @@ struct Mmc3 {
     irq_reload: bool,
     irq_enabled: bool,
     irq_pending: bool,
-    /// `$A001` bit 6, kept so a state round-trips even though writes are not
-    /// blocked: iNES mapper 4 also covers MMC6 boards that reuse this bit.
-    prg_ram_protected: bool,
 }
 
 impl Cartridge {
@@ -325,7 +322,6 @@ impl Cartridge {
             writer.bool(self.mmc3.irq_reload);
             writer.bool(self.mmc3.irq_enabled);
             writer.bool(self.mmc3.irq_pending);
-            writer.bool(self.mmc3.prg_ram_protected);
         }
     }
 
@@ -383,7 +379,6 @@ impl Cartridge {
             self.mmc3.irq_reload = reader.bool()?;
             self.mmc3.irq_enabled = reader.bool()?;
             self.mmc3.irq_pending = reader.bool()?;
-            self.mmc3.prg_ram_protected = reader.bool()?;
         }
         Ok(())
     }
@@ -590,13 +585,7 @@ impl Cartridge {
                 self.mmc3.regs[register] = val;
             }
             0x8000 => self.mmc3.bank_select = val & 0xC7,
-            0xA000 if odd => {
-                // Bit 7 is MMC3's chip enable but MMC6's bank-1 read enable.
-                // With no reliable way to tell them apart under iNES, keep the
-                // RAM window open; only record MMC3's write-protect bit.
-                self.mmc3.prg_ram_protected = val & 0x40 != 0;
-            }
-            0xA000 => {
+            0xA000 if !odd => {
                 self.mirroring = if val & 1 == 0 {
                     Mirroring::Vertical
                 } else {
@@ -1291,7 +1280,6 @@ mod tests {
         cart.cpu_write(0x8000, 0x82); // R2
         cart.cpu_write(0x8001, 9);
         cart.cpu_write(0xA000, 1); // horizontal
-        cart.cpu_write(0xA001, 0x40); // MMC3 write-protect bit
         cart.cpu_write(0xC000, 10); // IRQ latch
         cart.cpu_write(0xC001, 0); // reload
         cart.cpu_write(0xE001, 0); // enable
