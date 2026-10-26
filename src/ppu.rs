@@ -25,6 +25,12 @@ const DOTS_PER_LINE: u32 = 341;
 const VISIBLE_LINES: u32 = 240;
 const VBLANK_FIRST: u32 = 241;
 
+/// The MMC3's A12 filter ignores a low pulse shorter than this many PPU dots,
+/// so normal same-table fetches and the four-dot gap between sprite pattern
+/// reads do not clock the scanline counter. Hardware filters A12 for three
+/// falling edges of M2, about ten PPU dots.
+const A12_FILTER_DOTS: u32 = 10;
+
 /// The 2C02 master palette, verbatim from the NESdev wiki page "PPU palettes",
 /// file `2C02G_U_wiki.pal` (generated with pally v0.23.0, `--cld -phd 4 -e`),
 /// downloaded from
@@ -317,6 +323,14 @@ pub struct Ppu {
     /// wherever sprites overlap. Evaluation fills them COMPACTLY, so a unit's
     /// index is not its OAM index: `is_sprite0` says which one is sprite 0.
     sprites: [Sprite; 8],
+    /// Whether the last PPU address placed on the bus had A12 set, and how many
+    /// dots it has stayed low. The MMC3 sees the filtered edge of this line,
+    /// not a synthetic once-per-scanline pulse.
+    a12_low: bool,
+    a12_low_dots: u32,
+    /// Rising edges found since the last `take_a12_rise`; a `$2006` write can
+    /// produce one between two PPU ticks.
+    a12_rises: u8,
 }
 
 /// One sprite output unit: the X counter the 2C02 reference describes, the two
@@ -441,6 +455,9 @@ impl Ppu {
             attr_prev: 0,
             attr_cur: 0,
             sprites: [Sprite::default(); 8],
+            a12_low: true,
+            a12_low_dots: 1,
+            a12_rises: 0,
         }
     }
 
@@ -480,10 +497,11 @@ impl Ppu {
         // pre-render line. It also keeps running when only sprites are enabled:
         // a disabled component is transparent, not absent, so the other one's
         // fetches and scroll updates are unaffected (NESdev "PPUMASK").
-        if self.rendering_enabled()
-            && (self.scanline < VISIBLE_LINES || self.scanline == pre_render)
-        {
+        let fetching = self.rendering_enabled()
+            && (self.scanline < VISIBLE_LINES || self.scanline == pre_render);
+        if fetching {
             self.background_dot();
+            self.sprite_fetch_dot();
             // "At dot 256 of each scanline ... the PPU increments the vertical
             // position in v", which skips the attribute table and wraps between
             // nametables. Not on the pre-render line: NESdev's Y-increment
@@ -511,6 +529,16 @@ impl Ppu {
                 self.evaluate_sprites();
                 self.load_sprite_units();
             }
+        } else {
+            // With rendering off, and while the PPU is outside the visible and
+            // pre-render lines, the address bus holds `v` (NESdev "PPU
+            // rendering", PPU address bus contents).
+            let addr = self.v & 0x3FFF;
+            self.observe_a12(addr);
+        }
+
+        if self.a12_low {
+            self.a12_low_dots = self.a12_low_dots.saturating_add(1);
         }
 
         self.dot += 1;
@@ -560,8 +588,9 @@ impl Ppu {
         if (1..=256).contains(&dot) || (321..=336).contains(&dot) {
             match dot % 8 {
                 1 => {
-                    self.fetch.tile =
-                        self.vram[vram_index(0x2000 | (self.v & 0x0FFF), self.mirroring)]
+                    let addr = 0x2000 | (self.v & 0x0FFF);
+                    self.observe_a12(addr);
+                    self.fetch.tile = self.vram[vram_index(addr, self.mirroring)];
                 }
                 3 => {
                     // "attribute address = $23C0 | (v & $0C00) | ((v >> 4) &
@@ -574,12 +603,19 @@ impl Ppu {
                         | (self.v & 0x0C00)
                         | ((self.v >> 4) & 0x38)
                         | ((self.v >> 2) & 0x07);
+                    self.observe_a12(addr);
                     let shift = (((self.v >> 6) & 1) << 2) | (((self.v >> 1) & 1) << 1);
                     self.fetch.attr = (self.vram[vram_index(addr, self.mirroring)] >> shift) & 3;
                 }
-                5 => self.fetch.lo = self.pattern_byte(0),
+                5 => {
+                    let addr = self.pattern_address(0);
+                    self.observe_a12(addr);
+                    self.fetch.lo = self.chr[self.crbank(addr)];
+                }
                 7 => {
-                    self.fetch.hi = self.pattern_byte(8);
+                    let addr = self.pattern_address(8);
+                    self.observe_a12(addr);
+                    self.fetch.hi = self.chr[self.crbank(addr)];
                     // The group is complete; it becomes the low half of the
                     // shifters one reload from now.
                     self.prev = self.cur;
@@ -851,17 +887,51 @@ impl Ppu {
             + if row >= 8 { 16 } else { 0 }
     }
 
-    /// A background pattern byte for the tile named by the nametable byte just
-    /// fetched: `$2000` bit 4 picks the table, bits 12-14 of `v` are the row
-    /// inside the tile, and the low plane lives 8 bytes below the high one.
-    fn pattern_byte(&self, plane: u16) -> u8 {
+    /// A background pattern address for the tile named by the nametable byte
+    /// just fetched: `$2000` bit 4 picks the table, bits 12-14 of `v` are the
+    /// row inside the tile, and the low plane lives 8 bytes below the high one.
+    fn pattern_address(&self, plane: u16) -> u16 {
         let base = if self.ctrl & 0x10 != 0 {
             0x1000
         } else {
             0x0000
         };
-        let addr = base + self.fetch.tile as u16 * 16 + ((self.v >> 12) & 7) + plane;
-        self.chr[self.crbank(addr)]
+        base + self.fetch.tile as u16 * 16 + ((self.v >> 12) & 7) + plane
+    }
+
+    /// Put one PPU address on the bus and clock the MMC3's filtered A12
+    /// detector when bit 12 rises after a low period.
+    fn observe_a12(&mut self, addr: u16) {
+        if addr & 0x1000 != 0 {
+            if self.a12_low_dots > A12_FILTER_DOTS {
+                self.a12_rises = self.a12_rises.saturating_add(1);
+            }
+            self.a12_low = false;
+            self.a12_low_dots = 0;
+        } else if !self.a12_low {
+            self.a12_low = true;
+            self.a12_low_dots = 1;
+        }
+    }
+
+    /// The sprite pattern fetches on dots 257-320 drive A12 just as background
+    /// fetches do. Each sprite has two garbage nametable reads, then the low
+    /// and high pattern bytes. Unused slots still fetch tile `$FF`, which
+    /// matters for 8x16 sprites: that dummy tile selects CHR bank 1.
+    fn sprite_fetch_dot(&mut self) {
+        if !(257..=320).contains(&self.dot) {
+            return;
+        }
+        let slot = ((self.dot - 257) / 8) as usize;
+        let phase = (self.dot - 257) % 8;
+        match phase {
+            0 | 2 => self.observe_a12(0x2000 | (self.v & 0x0FFF)),
+            4 | 6 => {
+                let tile = self.secondary_oam[slot * 4 + 1];
+                self.observe_a12(self.sprite_pattern_address(tile, 0));
+            }
+            _ => {}
+        }
     }
 
     /// The backdrop is palette RAM `$3F00`: a stock NES grounds the EXT pins,
@@ -924,19 +994,16 @@ impl Ppu {
         self.frame_done
     }
 
-    /// The dot where MMC3-class mappers see the one filtered PPU A12 rise per
-    /// scanline. Hardware clocks it during the sprite pattern fetches on every
-    /// rendering line, visible or pre-render; this PPU stands in for that with
-    /// dot 260, just after the visible pixels. It is 241 clocks a frame on
-    /// NTSC, as NESdev counts them.
-    ///
-    /// ponytail: pattern-table selection is not consulted, so a board whose
-    /// background and sprites share `$1000` still clocks once a line. Add real
-    /// A12 edge tracking if a game's raster split drifts.
-    pub fn a12_rise(&self) -> bool {
-        self.dot == 260
-            && self.rendering_enabled()
-            && (self.scanline < VISIBLE_LINES || self.scanline == self.pre_render())
+    /// Consume one filtered A12 rising edge found since the last call. MMC3
+    /// uses exactly these edges; a synthetic once-per-line pulse would miss
+    /// boards that run the background from `$1000` and sprites from `$0000`,
+    /// and would not see the extra edges of 8x16 sprites or `$2006`/`$2007`.
+    pub fn take_a12_rise(&mut self) -> bool {
+        if self.a12_rises == 0 {
+            return false;
+        }
+        self.a12_rises -= 1;
+        true
     }
 
     pub fn framebuffer(&self) -> &[u32] {
@@ -970,6 +1037,7 @@ impl Ppu {
             4 => self.oam[self.oam_addr as usize],
             7 => {
                 let addr = self.v & 0x3FFF;
+                self.observe_a12(addr);
                 // "The referenced 6-bit palette data is returned immediately
                 // instead of going to the internal read buffer", and the same
                 // access performs the shadowed nametable read underneath it.
@@ -977,11 +1045,13 @@ impl Ppu {
                     let value = self.palette[palette_index(addr)] & 0x3F;
                     self.read_buffer = self.ppu_bus_read(addr);
                     self.increment_v();
+                    self.observe_a12(self.v & 0x3FFF);
                     return value;
                 }
                 let value = self.read_buffer;
                 self.read_buffer = self.ppu_bus_read(addr);
                 self.increment_v();
+                self.observe_a12(self.v & 0x3FFF);
                 value
             }
             // $2000, $2001, $2003, $2005 and $2006 are write-only; they read
@@ -1025,6 +1095,10 @@ impl Ppu {
                 if self.write_latch {
                     self.t = (self.t & 0xFF00) | val as u16;
                     self.v = self.t;
+                    // PPUADDR writes also drive A12; the MMC3 sees those edges
+                    // even with rendering disabled, which its test ROMs and a
+                    // few games use to clock the counter by hand.
+                    self.observe_a12(self.v & 0x3FFF);
                 } else {
                     // Bits 14-15 of the written value are ignored and bit 14 of
                     // `t` is forced to 0.
@@ -1034,6 +1108,7 @@ impl Ppu {
             }
             7 => {
                 let addr = self.v & 0x3FFF;
+                self.observe_a12(addr);
                 if addr >= 0x3F00 {
                     self.palette[palette_index(addr)] = val & 0x3F;
                 } else if addr >= 0x2000 {
@@ -1052,6 +1127,7 @@ impl Ppu {
                 // whether or not the byte lands, and getting that wrong hangs
                 // any game that streams data through a fixed address window.
                 self.increment_v();
+                self.observe_a12(self.v & 0x3FFF);
             }
             // $2002 is read-only: "Reading from $2002 clears the vblank flag
             // ... Writes here have no effect." (2C02 technical reference.)
@@ -1194,6 +1270,12 @@ impl Ppu {
         self.read_buffer = reader.u8()?;
         self.scanline = reader.u32()?;
         self.dot = reader.u32()?;
+        // A12 filtering is transient bus state and is not part of the state
+        // format, so existing mappers' states keep loading unchanged. Start
+        // the filter from the restored v address.
+        self.a12_low = self.v & 0x1000 == 0;
+        self.a12_low_dots = u32::from(self.a12_low);
+        self.a12_rises = 0;
         if self.scanline >= self.region.scanlines() || self.dot >= DOTS_PER_LINE {
             return Err(format!(
                 "save state has an impossible PPU position {}.{}",
@@ -1350,20 +1432,153 @@ impl Ppu {
 mod tests {
     use super::*;
 
-    /// MMC3 counts 241 A12 rises a frame: the pre-render line plus 240 visible
-    /// lines. Vblank fetches nothing, so it must not add clocks.
+    /// MMC3 counts 241 A12 rises an NTSC frame: the pre-render line plus 240
+    /// visible lines. Vblank fetches nothing, so it must not add clocks.
     #[test]
     fn rendering_produces_241_mapper_clocks_per_frame() {
         let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x08); // background $0000, sprites $1000
         p.cpu_write(0x2001, 0x18);
         let mut clocks = 0;
         for _ in 0..89342 {
-            if p.a12_rise() {
+            p.tick();
+            while p.take_a12_rise() {
                 clocks += 1;
             }
-            p.tick();
         }
         assert_eq!(clocks, 241);
+    }
+
+    /// PAL has the same 241 rendering lines; the extra dot on 15 of every 16
+    /// bus ticks must not swallow one of the A12 rises.
+    #[test]
+    fn pal_rendering_produces_241_mapper_clocks_per_frame() {
+        let mut p = Ppu::for_region(Region::Pal);
+        p.cpu_write(0x2000, 0x08);
+        p.cpu_write(0x2001, 0x18);
+        let mut clocks = 0;
+        for _ in 0..106392 {
+            p.tick();
+            while p.take_a12_rise() {
+                clocks += 1;
+            }
+        }
+        assert_eq!(clocks, 241);
+    }
+
+    /// Pattern-table selection decides where A12 rises. With the background in
+    /// `$1000` and sprites in `$0000`, the rise is the background prefetch at
+    /// the end of the previous line, not a sprite fetch.
+    #[test]
+    fn background_pattern_table_selection_moves_the_a12_clock() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x10); // background $1000, sprites $0000
+        p.cpu_write(0x2001, 0x18);
+        let mut clocks = 0;
+        for _ in 0..89342 {
+            p.tick();
+            while p.take_a12_rise() {
+                clocks += 1;
+            }
+        }
+        assert_eq!(clocks, 241, "one rise per rendering line, at dot 325");
+    }
+
+    /// Both layers in the low table never raise A12 at all.
+    #[test]
+    fn both_pattern_tables_low_produce_no_a12_clocks() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x00);
+        p.cpu_write(0x2001, 0x18);
+        let mut clocks = 0;
+        for _ in 0..89342 {
+            p.tick();
+            while p.take_a12_rise() {
+                clocks += 1;
+            }
+        }
+        assert_eq!(clocks, 0);
+    }
+
+    /// 8x16 sprites take their table from the tile index's low bit, not from
+    /// `$2000` bit 3. Eight in-range even tiles therefore stay in `$0000`
+    /// while the background does too, and no sprite fetch clocks A12.
+    #[test]
+    fn eight_by_sixteen_sprite_tiles_drive_a12() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x20); // 8x16 sprites, background $0000
+        p.cpu_write(0x2001, 0x18);
+        for n in 0..8 {
+            p.put_sprite_for_test(n, 0, 0x00, 0, 0);
+        }
+        // Let scanline 0's evaluation fill secondary OAM, then count only
+        // scanline 1's sprite fetches.
+        while p.scanline != 1 {
+            p.tick();
+            while p.take_a12_rise() {}
+        }
+        let mut clocks = 0;
+        while p.scanline == 1 {
+            p.tick();
+            while p.take_a12_rise() {
+                clocks += 1;
+            }
+        }
+        assert_eq!(clocks, 0, "eight even 8x16 tiles all fetch from $0000");
+
+        for n in 0..8 {
+            p.put_sprite_for_test(n, 0, 0x01, 0, 0); // odd tile -> bank 1
+        }
+        // Line 2's evaluation sees the odd tiles; count line 3's fetches.
+        while p.scanline != 3 {
+            p.tick();
+            while p.take_a12_rise() {}
+        }
+        let mut clocks = 0;
+        while p.scanline == 3 {
+            p.tick();
+            while p.take_a12_rise() {
+                clocks += 1;
+            }
+        }
+        assert_eq!(clocks, 1, "odd 8x16 tiles raise A12 at the sprite fetch");
+    }
+
+    /// `$2006` and `$2007` put their VRAM address on the PPU bus, so toggling
+    /// A12 that way clocks the MMC3 filter even while rendering is disabled.
+    #[test]
+    fn ppu_address_writes_drive_the_a12_filter() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2006, 0x00);
+        p.cpu_write(0x2006, 0x00); // v = $0000, A12 low
+        for _ in 0..12 {
+            p.tick();
+        }
+        p.cpu_write(0x2006, 0x10);
+        p.cpu_write(0x2006, 0x00); // v = $1000, A12 high
+        assert!(p.take_a12_rise(), "a $2006 write must clock A12");
+
+        p.cpu_write(0x2006, 0x0F);
+        p.cpu_write(0x2006, 0xFF); // v = $0FFF, A12 low
+        for _ in 0..12 {
+            p.tick();
+        }
+        assert_eq!(p.cpu_read(0x2007), 0, "reading $0FFF");
+        assert!(
+            p.take_a12_rise(),
+            "$2007's increment to $1000 must clock A12"
+        );
+
+        p.cpu_write(0x2006, 0x0F);
+        p.cpu_write(0x2006, 0xFF); // v = $0FFF, A12 low
+        for _ in 0..12 {
+            p.tick();
+        }
+        p.cpu_write(0x2007, 0);
+        assert!(
+            p.take_a12_rise(),
+            "$2007's increment to $1000 must clock A12"
+        );
     }
 
     #[test]

@@ -8,11 +8,18 @@
 //! Mapper 4 is MMC3: four 8 KiB PRG windows (two switchable, the second-last
 //! and last fixed, with bit 6 of `$8000` swapping the switchable pair), 2 KiB
 //! and 1 KiB CHR windows selected by R0-R5, runtime mirroring at `$A000`, and
-//! an 8 KiB PRG RAM window enabled by `$A001` bit 7. Its scanline counter is
-//! clocked by PPU A12; the bus supplies one filtered pulse per rendering
-//! scanline (including the pre-render line, 241 a frame on NTSC) at dot 260.
-//! The `$A001` write-protect bit is recorded but not enforced, as many emulators
-//! omit it to stay compatible with the MMC6 boards that share mapper 4.
+//! an 8 KiB PRG RAM window. Its scanline counter is clocked by filtered rises
+//! of PPU A12, which the PPU reports from its real background and sprite fetch
+//! addresses (241 a frame with the usual `$0000` background and `$1000`
+//! sprites on NTSC).
+//!
+//! The PRG RAM window is always enabled. iNES mapper 4 also covers MMC6, where
+//! `$A001` bits 4-7 individually enable reads and writes to two 512-byte RAM
+//! banks instead of acting as one MMC3-style disable, and plain iNES cannot
+//! tell the two chips apart. Many emulators keep the whole window enabled for
+//! that reason; StarTropics and its sequel are the only commercial MMC6 games.
+//! The MMC3 `$A001` bit 6 write-protect is recorded but not enforced, because
+//! it only guards save RAM during power-off and MMC6 reuses the same bits.
 //!
 //! Mapper 1 is MMC1: a five-write serial register controlling PRG mode, CHR
 //! banking and nametable mirroring. Zelda carries CHR RAM and an 8 KiB
@@ -108,8 +115,8 @@ pub struct Cartridge {
     shift: u8,
     shift_count: u8,
     /// MMC1B PRG register bit 4: false disables `$6000-$7FFF` until the game
-    /// writes a value with the bit clear. Power-on is enabled. MMC3's `$A001`
-    /// bit 7 has the same effect.
+    /// writes a value with the bit clear. Power-on is enabled. MMC3 ignores
+    /// this field because its always-enabled window has to serve MMC6 too.
     prg_ram_enabled: bool,
     /// MMC3's register file. Defaults for every other board.
     mmc3: Mmc3,
@@ -157,7 +164,7 @@ struct Mmc3 {
     irq_enabled: bool,
     irq_pending: bool,
     /// `$A001` bit 6, kept so a state round-trips even though writes are not
-    /// blocked: iNES mapper 4 also covers MMC6 boards with a different meaning.
+    /// blocked: iNES mapper 4 also covers MMC6 boards that reuse this bit.
     prg_ram_protected: bool,
 }
 
@@ -257,9 +264,14 @@ impl Cartridge {
     /// MMC1's battery save both use the window; the SMB and Contra boards do
     /// not. NROM has no register, while MMC1's PRG register bit 4 is MMC1B's
     /// disable bit: writes with it set make `$6000-$7FFF` open bus until the
-    /// game clears it again.
+    /// game clears it again. MMC3's window is always enabled so MMC6 boards,
+    /// which give `$A001` bit 7 a different meaning, still work under iNES.
     pub fn prg_ram_enabled(&self) -> bool {
-        matches!(self.board, Board::Nrom | Board::Mmc1 | Board::Mmc3) && self.prg_ram_enabled
+        match self.board {
+            Board::Mmc3 => true,
+            Board::Nrom | Board::Mmc1 => self.prg_ram_enabled,
+            Board::UxRom | Board::GxRom => false,
+        }
     }
 
     /// Whether the cartridge has battery-backed PRG RAM to persist.
@@ -579,7 +591,9 @@ impl Cartridge {
             }
             0x8000 => self.mmc3.bank_select = val & 0xC7,
             0xA000 if odd => {
-                self.prg_ram_enabled = val & 0x80 != 0;
+                // Bit 7 is MMC3's chip enable but MMC6's bank-1 read enable.
+                // With no reliable way to tell them apart under iNES, keep the
+                // RAM window open; only record MMC3's write-protect bit.
                 self.mmc3.prg_ram_protected = val & 0x40 != 0;
             }
             0xA000 => {
@@ -1190,10 +1204,10 @@ mod tests {
         );
     }
 
-    /// `$A000` bit 0 picks the nametable arrangement, and `$A001` bit 7
-    /// enables the 8 KiB PRG RAM window.
+    /// `$A000` bit 0 picks the nametable arrangement. `$A001` is MMC6's bank
+    /// control on some mapper-4 boards, so none of its bits close PRG RAM.
     #[test]
-    fn mmc3_mirroring_and_prg_ram_enable_are_register_controlled() {
+    fn mmc3_mirroring_is_register_controlled_and_prg_ram_stays_enabled() {
         let mut c = mmc3_cart(2, 0);
         assert_eq!(
             c.mirroring(),
@@ -1206,15 +1220,13 @@ mod tests {
         assert_eq!(c.mirroring(), Mirroring::Horizontal);
 
         assert!(c.prg_ram_enabled(), "power-on PRG RAM is enabled");
-        c.cpu_write(0xA001, 0x00);
-        assert!(!c.prg_ram_enabled(), "$A001 bit 7 clear disables it");
-        c.cpu_write(0xA001, 0x80);
-        assert!(c.prg_ram_enabled());
-        // Bit 6 write protection is deliberately not enforced: iNES mapper 4
-        // also covers MMC6, whose $A001 means something else, and the write
-        // protect exists only to guard save RAM during power-off.
-        c.cpu_write(0xA001, 0xC0);
-        assert!(c.prg_ram_enabled(), "bit 6 does not disable the window");
+        for value in [0x00, 0x10, 0x20, 0x40, 0x80, 0xC0] {
+            c.cpu_write(0xA001, value);
+            assert!(
+                c.prg_ram_enabled(),
+                "$A001 ${value:02X} belongs to MMC6 or only write-protects; keep RAM reachable"
+            );
+        }
     }
 
     /// A `$C001` write arms a reload for the next clock. The counter then
@@ -1279,7 +1291,7 @@ mod tests {
         cart.cpu_write(0x8000, 0x82); // R2
         cart.cpu_write(0x8001, 9);
         cart.cpu_write(0xA000, 1); // horizontal
-        cart.cpu_write(0xA001, 0x00); // PRG RAM off
+        cart.cpu_write(0xA001, 0x40); // MMC3 write-protect bit
         cart.cpu_write(0xC000, 10); // IRQ latch
         cart.cpu_write(0xC001, 0); // reload
         cart.cpu_write(0xE001, 0); // enable
@@ -1298,7 +1310,10 @@ mod tests {
         );
         assert_eq!(before.0, 3, "mode 1 puts R6 at $C000");
         assert_eq!(before.1, 5);
-        assert!(!before.6);
+        assert!(
+            before.6,
+            "MMC3 PRG RAM stays enabled for MMC6 compatibility"
+        );
 
         let mut writer = StateWriter::new();
         cart.save_state(&mut writer);

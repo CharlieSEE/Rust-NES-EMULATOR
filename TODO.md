@@ -10,16 +10,15 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Suggested order
 
-1. Mapper 4 (MMC3) — largest library gain.
-2. ~~Save states~~ — done; rewind and frame advance build on it.
-3. Unofficial CPU opcodes — removes hard crashes.
-4. Zapper — makes the bundled Duck Hunt fully playable.
+1. Unofficial CPU opcodes — removes hard crashes.
+2. Zapper — makes the bundled Duck Hunt fully playable.
+3. Mapper 3 (CNROM) — small board with a large library.
 
 ---
 
 ## Unlock more games
 
-- [x] **Mapper 4 (MMC3)** — SMB3, Kirby, Mega Man 3–6, TMNT, Batman. Bank registers, 8 KiB CHR banking, PRG/CHR modes, scanline IRQ counter, mirroring control. *Done; one A12 pulse per rendering scanline, PRG RAM and battery saves, mapper state in save states.*
+- [x] **Mapper 4 (MMC3)** — SMB3, Kirby, Mega Man 3–6, TMNT, Batman. Bank registers, 8 KiB CHR banking, PRG/CHR modes, scanline IRQ counter, mirroring control. *Done; filtered PPU A12 edge tracking, always-enabled PRG RAM for MMC6 compatibility, battery saves, mapper state in save states.*
 - [ ] **Mapper 3 (CNROM)** — CHR bank register with bus conflicts. *Effort: S.*
 - [ ] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Effort: S.*
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
