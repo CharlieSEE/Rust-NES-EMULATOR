@@ -79,6 +79,7 @@ repository.
 | Quicksave slot 1–9 | `1`–`9` |
 | Quickload slot 1–9 | `Left Shift`+`1`–`9` |
 | Quickload latest slot | `F8` |
+| Save-state list | `F7` |
 | Fullscreen | `F11` |
 | Mute | `M` |
 | Quit | `Esc` |
@@ -99,11 +100,13 @@ the cartridge runs but cannot be aimed.
   not boot and will exit with a mapper error.
 - Save states live beside the ROM as `.state1`–`.state9` files, with a small
   `.state` index naming the newest: a bare digit saves, `Left Shift`+digit
-  loads, `F8` loads the most recently saved slot. A brief message on the frame
-  confirms saves and loads; failed save-state loads and writes are shown there
-  too, as well as in `nes-errors.log`. A state is tied to the exact ROM and
-  state format version, and a bad or foreign file is refused without
-  disturbing the running game. Rewind and cheats are not implemented yet.
+  loads, `F8` loads the most recently saved slot. `F7` opens the slot list,
+  showing each save's age and whether this ROM can load it; Up/Down choose,
+  Enter loads, Esc cancels. A brief message on the frame confirms saves and
+  loads; failed save-state loads and writes are shown there too, as well as in
+  `nes-errors.log`. A state is tied to the exact ROM and state format version,
+  and a bad or foreign file is refused without disturbing the running game.
+  Rewind and cheats are not implemented yet.
 
 ## For tinkerers
 
