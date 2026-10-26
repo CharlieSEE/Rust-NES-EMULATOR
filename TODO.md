@@ -47,6 +47,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Volume control** — hotkeys plus persisted config, separate master and APU balance. *Effort: S.*
 - [ ] **Per-game configuration** — remember volume, video filter, cheats and controller count per ROM hash. *Effort: M.*
 - [ ] **Recent ROM list** — extend the launcher config beyond the last folder. *Effort: S.*
+- [ ] **Launcher search** — type to filter the ROM list by file name, Backspace edits the query, Esc clears it. *Effort: S.*
 - [ ] **Live screenshot hotkey** — reuse the `--dump` PPM writer, save next to the ROM or in a screenshots folder. *Effort: S.*
 - [ ] **Game Genie cheats** — 6- and 8-letter code parsing, ROM patching, enable/disable at runtime. *Effort: M.*
 - [ ] **IPS/BPS patch support** — apply patches at load time, never modify the source ROM. *Effort: M.*
