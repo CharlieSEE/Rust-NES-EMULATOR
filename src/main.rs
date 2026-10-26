@@ -356,6 +356,20 @@ fn resume_audio(paused: bool, muted: bool) -> bool {
     !paused && !muted
 }
 
+/// A load replaces the machine's timeline: the frame the loop paused on belongs
+/// to the old one, and the queued samples are noise over the loaded state. Drop
+/// them, unpause so the next iteration renders what was restored, and restart
+/// the queue unless the player muted it.
+fn resume_after_load(paused: &mut bool, muted: bool, audio: Option<&sdl2::audio::AudioQueue<i16>>) {
+    *paused = false;
+    if let Some(queue) = audio {
+        queue.clear();
+        if !muted {
+            queue.resume();
+        }
+    }
+}
+
 /// A save or load writes no message of its own, so a short confirmation is
 /// the only sign it happened. Long enough to read, short enough to get out of
 /// the way.
@@ -944,18 +958,11 @@ fn run() -> Result<(), String> {
                         ) {
                             Ok(()) => {
                                 picker = None;
-                                // Loading returns to play only if the list was
-                                // opened during play; opening it from a pause
-                                // keeps the game paused, like Escape does.
-                                paused = picker_was_paused;
+                                // A load replaces the paused frame with the
+                                // restored one, so the game resumes either way.
+                                resume_after_load(&mut paused, muted, audio.as_ref());
                                 keys = 0;
                                 pad = 0;
-                                if let Some(queue) = &audio {
-                                    queue.clear();
-                                    if resume_audio(paused, muted) {
-                                        queue.resume();
-                                    }
-                                }
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1060,11 +1067,7 @@ fn run() -> Result<(), String> {
                             &mut cpu,
                         ) {
                             Ok(()) => {
-                                // The old timeline's samples would play over the
-                                // loaded one; drop them the way Reset does.
-                                if let Some(queue) = &audio {
-                                    queue.clear();
-                                }
+                                resume_after_load(&mut paused, muted, audio.as_ref());
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1087,9 +1090,7 @@ fn run() -> Result<(), String> {
                 } => match load_latest_state(::std::path::Path::new(&rom_path), &mut bus, &mut cpu)
                 {
                     Ok(slot) => {
-                        if let Some(queue) = &audio {
-                            queue.clear();
-                        }
+                        resume_after_load(&mut paused, muted, audio.as_ref());
                         toast = Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                     }
                     Err(e) => toast_error(&mut toast, &e),
@@ -1262,10 +1263,10 @@ mod tests {
         age_label, apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run,
         frame_budget, frame_sleep, latest_state_path, load_latest_state, load_state_slot,
         mask_for_name, missed_dumps, move_selection, parse_script, picker_command,
-        read_latest_slot, resume_audio, save_state_slot, slot_for, slot_line, state_slot_path,
-        wrap_text, write_atomic, Bus, Cartridge, Cpu, Picker, PickerCommand, Play, Region, Slot,
-        Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG,
-        TOAST_FG, W,
+        read_latest_slot, resume_after_load, resume_audio, save_state_slot, slot_for, slot_line,
+        state_slot_path, wrap_text, write_atomic, Bus, Cartridge, Cpu, Picker, PickerCommand, Play,
+        Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H,
+        TOAST_BG, TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -1507,6 +1508,15 @@ mod tests {
         );
         assert_eq!(picker.selected, 4, "the list opens on the last saved slot");
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A load replaces the machine, including the frame that was on screen
+    /// when the loop paused. Staying paused would keep showing that old frame.
+    #[test]
+    fn a_loaded_state_unpauses_the_frame_loop() {
+        let mut paused = true;
+        resume_after_load(&mut paused, false, None);
+        assert!(!paused, "a load must render the state it just restored");
     }
 
     #[test]
