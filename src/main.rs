@@ -211,6 +211,101 @@ fn load_latest_state(
     load_state_slot(rom_path, slot, bus, cpu).map(|()| slot)
 }
 
+/// One quick-save slot as the picker sees it. The age is relative: the
+/// question the list answers is "which of these is the run I want?".
+#[derive(Debug, PartialEq, Eq)]
+enum Slot {
+    Empty,
+    Ready(String),
+    Incompatible,
+}
+
+/// What the in-game slot list shows. Opening it reads each state once and
+/// checks it against the running cartridge; the result is fixed until the list
+/// is reopened, so entries cannot change under the selection.
+struct Picker {
+    slots: [Slot; SLOT_KEYS.len()],
+    selected: usize,
+}
+
+impl Picker {
+    fn open(rom_path: &::std::path::Path, cart: &Cartridge) -> Picker {
+        Picker {
+            slots: ::std::array::from_fn(|index| slot_state(rom_path, index + 1, cart)),
+            selected: 0,
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let mut lines = vec!["SAVE STATES".to_string()];
+        for (index, slot) in self.slots.iter().enumerate() {
+            lines.push(slot_line(index + 1, index == self.selected, slot));
+        }
+        lines.push("UP/DOWN choose".to_string());
+        lines.push("ENTER load  ESC cancel".to_string());
+        lines
+    }
+
+    fn select(&mut self, delta: isize) {
+        self.selected = move_selection(self.selected, delta);
+    }
+
+    fn selected_slot(&self) -> usize {
+        self.selected + 1
+    }
+}
+
+/// Read one slot's state file and decide whether this cartridge can load it.
+/// Missing is empty; any other read failure is incompatible, because the picker
+/// must not offer a slot it cannot even read.
+fn slot_state(rom_path: &::std::path::Path, slot: usize, cart: &Cartridge) -> Slot {
+    let path = state_slot_path(rom_path, slot);
+    let data = match ::std::fs::read(&path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Slot::Empty,
+        Err(_) => return Slot::Incompatible,
+    };
+    if crate::state::unwrap(&data, cart.mapper_id(), cart.region(), cart.fingerprint()).is_err() {
+        return Slot::Incompatible;
+    }
+    let age = ::std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(age_label)
+        .unwrap_or_else(|| "unknown".to_string());
+    Slot::Ready(age)
+}
+
+/// Relative age in the largest unit that still says something useful.
+fn age_label(elapsed: ::std::time::Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+/// One row of the picker. The marker sits in the first column so the selected
+/// row stays obvious against the frame behind the box.
+fn slot_line(slot: usize, selected: bool, state: &Slot) -> String {
+    let marker = if selected { '>' } else { ' ' };
+    let detail = match state {
+        Slot::Empty => "empty".to_string(),
+        Slot::Ready(age) => format!("saved {age}"),
+        Slot::Incompatible => "incompatible".to_string(),
+    };
+    format!("{marker}{slot}  {detail}")
+}
+
+/// Move the selection by one row, wrapping at both ends.
+fn move_selection(selected: usize, delta: isize) -> usize {
+    let count = SLOT_KEYS.len() as isize;
+    (selected as isize + delta).rem_euclid(count) as usize
+}
+
 /// A save or load writes no message of its own, so a short confirmation is
 /// the only sign it happened. Long enough to read, short enough to get out of
 /// the way.
@@ -309,21 +404,19 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Paint a centered box holding the toast's lines near the bottom of the
-/// frame. `Toast::new` bounds the width and line count, so the box always
-/// fits.
-fn draw_toast(fb: &mut [u32], toast: &Toast) {
-    let Some(text_width) = toast.lines.iter().map(|line| line.chars().count()).max() else {
+/// Paint a centered box of text at `y`, owned by whichever overlay called it.
+/// The callers bound their line width and count, so the box always fits.
+fn draw_panel(fb: &mut [u32], lines: &[String], y: usize) {
+    let Some(text_width) = lines.iter().map(|line| line.chars().count()).max() else {
         return;
     };
     let box_width = text_width * text::CELL + 2 * TOAST_PAD;
-    let box_height = toast.lines.len() * text::CELL + 2 * TOAST_PAD;
+    let box_height = lines.len() * text::CELL + 2 * TOAST_PAD;
     let x = (W - box_width) / 2;
-    let y = H - TOAST_MARGIN - box_height;
     for row in y..y + box_height {
         fb[row * W + x..row * W + x + box_width].fill(TOAST_BG);
     }
-    for (index, line) in toast.lines.iter().enumerate() {
+    for (index, line) in lines.iter().enumerate() {
         text::put_text(
             fb,
             W,
@@ -334,6 +427,18 @@ fn draw_toast(fb: &mut [u32], toast: &Toast) {
             TOAST_FG,
         );
     }
+}
+
+/// The toast sits at the bottom so it covers as little of the game as possible.
+fn draw_toast(fb: &mut [u32], toast: &Toast) {
+    let box_height = toast.lines.len() * text::CELL + 2 * TOAST_PAD;
+    draw_panel(fb, &toast.lines, H - TOAST_MARGIN - box_height);
+}
+
+/// The picker sits at the top, leaving the toast its own bottom space when a
+/// load fails while the list is open.
+fn draw_picker(fb: &mut [u32], picker: &Picker) {
+    draw_panel(fb, &picker.lines(), TOAST_MARGIN);
 }
 
 /// Record a failed save or load and put the same text on screen. The log line
@@ -738,6 +843,8 @@ fn run() -> Result<(), String> {
     let mut fullscreen = false;
     let mut running = true;
     let mut toast: Option<Toast> = None;
+    let mut picker: Option<Picker> = None;
+    let mut picker_was_paused = false;
     let mut overlay = vec![0u32; W * H];
     let mut frames = 0u32;
     while running {
@@ -745,6 +852,85 @@ fn run() -> Result<(), String> {
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
         for event in events.poll_iter() {
+            // The picker is modal: it owns the keys while it is open, so a
+            // digit cannot save over a slot the player is choosing and Escape
+            // cancels the list instead of quitting the game.
+            if picker.is_some() {
+                match event {
+                    Event::Quit { .. } => running = false,
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Escape),
+                        repeat: false,
+                        ..
+                    } => {
+                        picker = None;
+                        paused = picker_was_paused;
+                        keys = 0;
+                        pad = 0;
+                        if !paused && !muted {
+                            if let Some(queue) = &audio {
+                                queue.resume();
+                            }
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Up),
+                        repeat: false,
+                        ..
+                    } => {
+                        if let Some(open) = picker.as_mut() {
+                            open.select(-1);
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Down),
+                        repeat: false,
+                        ..
+                    } => {
+                        if let Some(open) = picker.as_mut() {
+                            open.select(1);
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Return),
+                        repeat: false,
+                        ..
+                    } => {
+                        let slot = picker.as_ref().expect("the guard checked").selected_slot();
+                        match load_state_slot(
+                            ::std::path::Path::new(&rom_path),
+                            slot,
+                            &mut bus,
+                            &mut cpu,
+                        ) {
+                            Ok(()) => {
+                                picker = None;
+                                paused = false;
+                                keys = 0;
+                                pad = 0;
+                                if let Some(queue) = &audio {
+                                    queue.clear();
+                                    if !muted {
+                                        queue.resume();
+                                    }
+                                }
+                                toast =
+                                    Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
+                            }
+                            Err(e) => toast_error(&mut toast, &e),
+                        }
+                    }
+                    Event::Window {
+                        win_event: WindowEvent::FocusLost,
+                        ..
+                    } => {
+                        keys = 0;
+                        pad = 0;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match event {
                 Event::KeyDown {
                     keycode: Some(Keycode::P),
@@ -801,6 +987,22 @@ fn run() -> Result<(), String> {
                             queue.clear();
                         } else if !paused {
                             queue.resume();
+                        }
+                    }
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::F7),
+                    repeat: false,
+                    ..
+                } => {
+                    picker_was_paused = paused;
+                    picker = Some(Picker::open(::std::path::Path::new(&rom_path), &bus.cart));
+                    keys = 0;
+                    pad = 0;
+                    if !paused {
+                        paused = true;
+                        if let Some(queue) = &audio {
+                            queue.pause();
                         }
                     }
                 }
@@ -934,13 +1136,17 @@ fn run() -> Result<(), String> {
         if toast.as_ref().is_some_and(|toast| !toast.visible()) {
             toast = None;
         }
-        let frame = match toast.as_ref() {
-            Some(toast) => {
-                overlay.copy_from_slice(bus.ppu.framebuffer());
-                draw_toast(&mut overlay, toast);
-                &overlay[..]
+        let frame = if picker.is_some() || toast.is_some() {
+            overlay.copy_from_slice(bus.ppu.framebuffer());
+            if let Some(picker) = picker.as_ref() {
+                draw_picker(&mut overlay, picker);
             }
-            None => bus.ppu.framebuffer(),
+            if let Some(toast) = toast.as_ref() {
+                draw_toast(&mut overlay, toast);
+            }
+            &overlay[..]
+        } else {
+            bus.ppu.framebuffer()
         };
         // SAFETY: u32 is plain old data and every bit pattern is a valid u32, so
         // all len*4 bytes of the frame are valid to read as u8.
@@ -1021,11 +1227,12 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run, frame_budget,
-        frame_sleep, latest_state_path, load_latest_state, load_state_slot, mask_for_name,
-        missed_dumps, parse_script, read_latest_slot, save_state_slot, slot_for, state_slot_path,
-        wrap_text, write_atomic, Bus, Cartridge, Cpu, Play, Region, Toast, AUDIO_FRAME_BYTES,
-        AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
+        age_label, apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run,
+        frame_budget, frame_sleep, latest_state_path, load_latest_state, load_state_slot,
+        mask_for_name, missed_dumps, move_selection, parse_script, read_latest_slot,
+        save_state_slot, slot_for, slot_line, state_slot_path, wrap_text, write_atomic, Bus,
+        Cartridge, Cpu, Picker, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -1119,6 +1326,80 @@ mod tests {
             Ok(3),
             "the confirmation must name the slot F8 chose"
         );
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// Recency is what the player needs; the exact wall-clock second is noise.
+    #[test]
+    fn a_slot_timestamp_reads_as_an_age() {
+        assert_eq!(age_label(Duration::ZERO), "just now");
+        assert_eq!(age_label(Duration::from_secs(59)), "just now");
+        assert_eq!(age_label(Duration::from_secs(60)), "1m ago");
+        assert_eq!(age_label(Duration::from_secs(3599)), "59m ago");
+        assert_eq!(age_label(Duration::from_secs(3600)), "1h ago");
+        assert_eq!(age_label(Duration::from_secs(86_399)), "23h ago");
+        assert_eq!(age_label(Duration::from_secs(86_400)), "1d ago");
+    }
+
+    /// The picker lists all nine slots, marks the selected one and says what
+    /// each slot is: a save with its age, empty, or incompatible.
+    #[test]
+    fn the_slot_list_marks_the_selection_and_its_state() {
+        let picker = Picker {
+            slots: std::array::from_fn(|index| match index {
+                0 => Slot::Ready("2m ago".to_string()),
+                1 => Slot::Empty,
+                2 => Slot::Incompatible,
+                _ => Slot::Empty,
+            }),
+            selected: 0,
+        };
+        let lines = picker.lines();
+        assert_eq!(lines[0], "SAVE STATES");
+        assert_eq!(lines[1], ">1  saved 2m ago");
+        assert_eq!(lines[2], " 2  empty");
+        assert_eq!(lines[3], " 3  incompatible");
+        assert_eq!(lines.len(), 12, "header, nine slots, two help lines");
+        assert_eq!(lines[10], "UP/DOWN choose");
+        assert_eq!(lines[11], "ENTER load  ESC cancel");
+        assert_eq!(slot_line(9, true, &Slot::Empty), ">9  empty");
+    }
+
+    /// Up from the first slot wraps to the last, and down from the last wraps
+    /// back to the first: the list is short enough that stopping is annoying.
+    #[test]
+    fn slot_selection_wraps_at_both_ends() {
+        assert_eq!(move_selection(0, -1), 8);
+        assert_eq!(move_selection(8, 1), 0);
+        assert_eq!(move_selection(4, -1), 3);
+    }
+
+    /// The picker checks every save against the running cartridge before it
+    /// offers it: foreign or corrupt states are marked, never loaded by mistake.
+    #[test]
+    fn the_picker_checks_each_slot_against_the_running_cartridge() {
+        let dir = std::env::temp_dir().join(format!("nes-picker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rom_path = dir.join("game.nes");
+        let mut bus = Bus::new(test_cartridge());
+        let mut cpu = Cpu::new();
+        bus.power_on();
+        cpu.reset(&mut bus);
+
+        save_state_slot(&rom_path, 1, &bus, &cpu).expect("state must be written");
+        std::fs::write(
+            state_slot_path(&rom_path, 2),
+            crate::state::wrap(&[], 0, Region::Ntsc, 0),
+        )
+        .expect("foreign state written");
+
+        let picker = Picker::open(&rom_path, &bus.cart);
+        assert!(
+            matches!(picker.slots[0], Slot::Ready(_)),
+            "slot 1 is this ROM"
+        );
+        assert_eq!(picker.slots[1], Slot::Incompatible, "slot 2 is another ROM");
+        assert_eq!(picker.slots[2], Slot::Empty, "slot 3 was never saved");
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
