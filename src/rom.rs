@@ -79,16 +79,24 @@ pub fn read_rom(path: &std::path::Path) -> Result<Vec<u8>, String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("{display}: {e}"))?;
-        if entry.is_dir() || !entry.name().to_ascii_lowercase().ends_with(".nes") {
+        if entry.is_dir() || !has_nes_suffix(entry.name()) {
             continue;
         }
         let name = entry.name().to_string();
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        // The entry's claimed size is archive metadata, so it is not trusted
+        // for a capacity hint; `read_to_end` grows to the real length.
+        let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut entry, &mut bytes)
             .map_err(|e| format!("{display}: {name}: {e}"))?;
         return Ok(bytes);
     }
     Err(format!("{display}: no .nes inside the zip"))
+}
+
+/// A `.nes` suffix in any case. Bytes, not a `&str` slice: the name can end
+/// inside a multi-byte character, and slicing there would panic.
+fn has_nes_suffix(name: &str) -> bool {
+    name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".nes")
 }
 
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
@@ -1495,13 +1503,14 @@ mod tests {
         );
     }
 
-    /// Writes one stored entry, so the test does not depend on a compressor.
+    /// Writes deflated entries, the method real archives use.
     fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
         use std::io::Write as _;
         let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
         for (name, bytes) in entries {
-            zip.start_file(*name, zip::write::SimpleFileOptions::default())
-                .unwrap();
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file(*name, options).unwrap();
             zip.write_all(bytes).unwrap();
         }
         zip.finish().unwrap();
