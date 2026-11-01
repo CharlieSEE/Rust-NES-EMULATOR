@@ -12,6 +12,9 @@ rfd = { version = "0.15", default-features = false, features = ["gtk3"] }
 # The launcher draws its own text. An 8x8 bitmap font keeps that to one tiny
 # dependency instead of SDL2_ttf plus a font file to find at runtime.
 font8x8 = "0.3"
+# ROMs also come as one `.nes` inside a `.zip`. Only inflate is needed to read
+# them; the archive is unpacked in memory and never written back to disk.
+zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # The launcher asks the game to quit with SIGTERM before falling back to
 # SIGKILL, so the game's battery save gets its final flush.

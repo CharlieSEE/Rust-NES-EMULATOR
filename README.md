@@ -27,11 +27,12 @@ cargo build --release
 
 ## Play
 
-Point the emulator at a `.nes` file:
+Point the emulator at a `.nes` file, or at a `.zip` holding one:
 
 ```sh
 cargo run --release -- "Super Mario Bros. + Duck Hunt (USA).nes"
 cargo run --release -- "Contra (USA).nes"
+cargo run --release -- "Contra (USA).zip"
 cargo run --release -- "Legend of Zelda, The (Europe) (Rev 1).nes"
 ```
 
@@ -52,7 +53,6 @@ Run the binary with no arguments:
 ```sh
 ./target/release/nes
 ```
-
 The launcher lists the `.nes` files in the last folder you picked, or in the
 folder holding the binary on first run. That folder is remembered in
 `nes-launcher.conf` next to the binary. Arrow keys move, `Enter` or a click
