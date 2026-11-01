@@ -48,7 +48,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Per-game configuration** — remember volume, video filter, cheats and controller count per ROM hash. *Effort: M.*
 - [x] **ZIP ROM loading** — run a compressed single-ROM `.zip` without unpacking. *Done; `rom::read_rom` returns the first `.nes` entry's bytes, the archive is unpacked in memory, saves and states stay keyed on the archive name, and the launcher lists `.zip` beside `.nes`.*
 - [ ] **Recent ROM list** — extend the launcher config beyond the last folder. *Effort: S.*
-- [ ] **Launcher search** — type to filter the ROM list by file name, Backspace edits the query, Esc clears it. *Effort: S.*
+- [x] **Launcher search** — type to filter the ROM list by file name, Backspace edits the query, Esc clears it. *Done; the header shows the match count and the query, and a folder refresh keeps both.*
 - [ ] **Live screenshot hotkey** — reuse the `--dump` PPM writer, save next to the ROM or in a screenshots folder. *Effort: S.*
 - [ ] **Game Genie cheats** — 6- and 8-letter code parsing, ROM patching, enable/disable at runtime. *Effort: M.*
 - [ ] **IPS/BPS patch support** — apply patches at load time, never modify the source ROM. *Effort: M.*
