@@ -53,9 +53,9 @@ Run the binary with no arguments:
 ```sh
 ./target/release/nes
 ```
-The launcher lists the `.nes` files in the last folder you picked, or in the
-folder holding the binary on first run. That folder is remembered in
-`nes-launcher.conf` next to the binary. Arrow keys move, `Enter` or a click
+The launcher lists the `.nes` files and single-ROM `.zip` archives in the last
+folder you picked, or in the folder holding the binary on first run. That
+folder is remembered in `nes-launcher.conf` next to the binary. Arrow keys move, `Enter` or a click
 starts the selected game, typing filters the list by file name, `Backspace`
 edits the filter, `F2` opens a folder picker, and `Esc` clears the filter or
 quits when there is none. Quitting a game returns to the list.
