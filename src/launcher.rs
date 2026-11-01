@@ -38,13 +38,13 @@ fn visible_rows() -> usize {
     (LIST_BOTTOM - LIST_TOP) / CELL
 }
 
-/// A file this launcher will boot: any case of `.nes`, nothing else.
+/// A file this launcher will boot: any case of `.nes` or a single-ROM `.zip`.
 fn is_rom(path: &Path) -> bool {
     path.extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("nes"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("nes") || ext.eq_ignore_ascii_case("zip"))
 }
 
-/// The `.nes` files directly in `dir`, sorted by name as the eye reads it.
+/// The bootable files directly in `dir`, sorted by name as the eye reads it.
 /// Subfolders are not walked -- a launcher that silently reaches into folders
 /// the user did not open is harder to explain than one that does not.
 fn scan(dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -653,11 +653,13 @@ mod tests {
     }
 
     #[test]
-    fn only_nes_files_are_roms_whatever_their_case() {
-        for name in ["game.nes", "GAME.NES", "Game.Nes", "a b.nes"] {
+    fn only_nes_and_zip_files_are_roms_whatever_their_case() {
+        for name in [
+            "game.nes", "GAME.NES", "Game.Nes", "a b.nes", "game.zip", "GAME.ZIP",
+        ] {
             assert!(is_rom(Path::new(name)), "{name} should boot");
         }
-        for name in ["game.smc", "game.nes.bak", "nes", "game.zip", ".nes"] {
+        for name in ["game.smc", "game.nes.bak", "nes", ".nes", "game.zip.bak"] {
             assert!(!is_rom(Path::new(name)), "{name} should not boot");
         }
     }

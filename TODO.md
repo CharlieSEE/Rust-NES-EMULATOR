@@ -46,6 +46,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Remappable controls** — config file for keyboard and gamepad bindings, with defaults matching the current README. *Effort: M.*
 - [ ] **Volume control** — hotkeys plus persisted config, separate master and APU balance. *Effort: S.*
 - [ ] **Per-game configuration** — remember volume, video filter, cheats and controller count per ROM hash. *Effort: M.*
+- [x] **ZIP ROM loading** — run a compressed single-ROM `.zip` without unpacking. *Done; `rom::read_rom` returns the first `.nes` entry's bytes, the archive is unpacked in memory, saves and states stay keyed on the archive name, and the launcher lists `.zip` beside `.nes`.*
 - [ ] **Recent ROM list** — extend the launcher config beyond the last folder. *Effort: S.*
 - [ ] **Launcher search** — type to filter the ROM list by file name, Backspace edits the query, Esc clears it. *Effort: S.*
 - [ ] **Live screenshot hotkey** — reuse the `--dump` PPM writer, save next to the ROM or in a screenshots folder. *Effort: S.*

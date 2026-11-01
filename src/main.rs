@@ -68,8 +68,9 @@ const AUDIO_TARGET: u32 = 1600 * AUDIO_FRAME_BYTES;
 /// Ten video frames is about 166 ms.
 const AUDIO_MAX_QUEUED: u32 = 10 * 800 * AUDIO_FRAME_BYTES;
 
-const USAGE: &str = "usage: nes <rom.nes> [--dump N[,N...]] [--play SCRIPT]\n\
-    \x20 <rom.nes>          the cartridge to boot, quoted if it has spaces\n\
+const USAGE: &str = "usage: nes <rom.nes|rom.zip> [--dump N[,N...]] [--play SCRIPT]\n\
+    \x20 <rom>              the cartridge to boot, quoted if it has spaces; a\n\
+    \x20                    .zip holding one .nes is read without unpacking\n\
     \x20 --dump N[,N...]   after each listed frame write frame-N.ppm; the last\n\
     \x20                    one ends the run\n\
     \x20 --play SCRIPT      hold scripted buttons, e.g. START,WAIT60,RIGHT120\n\
@@ -843,7 +844,7 @@ fn run() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
 
-    let bytes = ::std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let bytes = rom::read_rom(::std::path::Path::new(&rom_path))?;
     let mut bus = Bus::new(Cartridge::load(&bytes)?);
     let budget = frame_budget(bus.cart.region());
     let mut cpu = Cpu::new();
