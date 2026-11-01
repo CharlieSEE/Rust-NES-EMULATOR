@@ -153,9 +153,6 @@ fn elide(text: &str, max: usize, keep_tail: bool) -> String {
 /// the click mapping.
 struct List {
     all: Vec<PathBuf>,
-    /// Lowercased file name for each entry in `all`, built once per folder so
-    /// filtering does not allocate a string per ROM on every keystroke.
-    keys: Vec<String>,
     roms: Vec<PathBuf>,
     query: String,
     selected: usize,
@@ -165,37 +162,20 @@ struct List {
 impl List {
     fn new(roms: Vec<PathBuf>) -> List {
         let mut list = List {
-            all: Vec::new(),
-            keys: Vec::new(),
+            all: roms,
             roms: Vec::new(),
             query: String::new(),
             selected: 0,
             scroll: 0,
         };
-        list.reload(roms);
+        list.apply_filter();
         list
-    }
-
-    /// Replace the folder and drop the search, for a folder the player picked.
-    fn reset(&mut self, roms: Vec<PathBuf>) {
-        self.query.clear();
-        self.reload(roms);
     }
 
     /// Re-read the same folder without losing the search. The caller restores
     /// the cursor, since a re-read can move the selected ROM's index.
     fn reload(&mut self, roms: Vec<PathBuf>) {
         self.all = roms;
-        self.keys = self
-            .all
-            .iter()
-            .map(|path| {
-                path.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_lowercase()
-            })
-            .collect();
         self.apply_filter();
     }
 
@@ -207,9 +187,16 @@ impl List {
         self.roms = self
             .all
             .iter()
-            .zip(&self.keys)
-            .filter(|(_, key)| query.is_empty() || key.contains(&query))
-            .map(|(path, _)| path.clone())
+            .filter(|path| {
+                query.is_empty()
+                    || path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .cloned()
             .collect();
         self.selected = 0;
         self.scroll = 0;
@@ -663,7 +650,8 @@ pub fn run() -> Result<(), String> {
                                 Ok(roms) => {
                                     remember(&picked);
                                     dir = picked;
-                                    list.reset(roms);
+                                    list.query.clear();
+                                    list.reload(roms);
                                     dirty = true;
                                 }
                                 Err(e) => report_over(&canvas, &format!("launcher: {e}")),
