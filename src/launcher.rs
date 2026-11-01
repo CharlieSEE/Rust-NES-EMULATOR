@@ -153,6 +153,9 @@ fn elide(text: &str, max: usize, keep_tail: bool) -> String {
 /// the click mapping.
 struct List {
     all: Vec<PathBuf>,
+    /// Lowercased file name for each entry in `all`, built once per folder so
+    /// filtering does not allocate a string per ROM on every keystroke.
+    keys: Vec<String>,
     roms: Vec<PathBuf>,
     query: String,
     selected: usize,
@@ -162,29 +165,37 @@ struct List {
 impl List {
     fn new(roms: Vec<PathBuf>) -> List {
         let mut list = List {
-            all: roms,
+            all: Vec::new(),
+            keys: Vec::new(),
             roms: Vec::new(),
             query: String::new(),
             selected: 0,
             scroll: 0,
         };
-        list.apply_filter();
+        list.reload(roms);
         list
     }
 
     /// Replace the folder and drop the search, for a folder the player picked.
     fn reset(&mut self, roms: Vec<PathBuf>) {
-        self.all = roms;
         self.query.clear();
-        self.selected = 0;
-        self.scroll = 0;
-        self.apply_filter();
+        self.reload(roms);
     }
 
     /// Re-read the same folder without losing the search. The caller restores
     /// the cursor, since a re-read can move the selected ROM's index.
     fn reload(&mut self, roms: Vec<PathBuf>) {
         self.all = roms;
+        self.keys = self
+            .all
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+            })
+            .collect();
         self.apply_filter();
     }
 
@@ -196,16 +207,9 @@ impl List {
         self.roms = self
             .all
             .iter()
-            .filter(|path| {
-                query.is_empty()
-                    || path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .contains(&query)
-            })
-            .cloned()
+            .zip(&self.keys)
+            .filter(|(_, key)| query.is_empty() || key.contains(&query))
+            .map(|(path, _)| path.clone())
             .collect();
         self.selected = 0;
         self.scroll = 0;
@@ -319,7 +323,9 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
     }
 
     if list.roms.is_empty() {
-        let hint = if list.query.is_empty() {
+        let hint = if list.all.is_empty() {
+            // An empty folder cannot match anything, whatever the query: the
+            // folder picker is still the way out.
             "Press F2 to choose a folder"
         } else {
             "No ROM matches. ESC clears the search"
@@ -331,9 +337,9 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
         (0, true) => "ENTER play   F2 folder   ESC quit".to_string(),
         (1, true) => "GAME RUNNING   F2 folder   ESC quit".to_string(),
         (n, true) => format!("{n} GAMES RUNNING   F2 folder   ESC quit"),
-        (0, false) => "ENTER play   ESC clear search".to_string(),
-        (1, false) => "GAME RUNNING   ESC clear search".to_string(),
-        (n, false) => format!("{n} GAMES RUNNING   ESC clear search"),
+        (0, false) => "ENTER play   ESC clear   F2 folder".to_string(),
+        (1, false) => "GAME RUNNING   ESC clear   F2 folder".to_string(),
+        (n, false) => format!("{n} GAMES RUNNING   ESC clear   F2 folder"),
     };
     put_text(fb, W, H, MARGIN, LIST_BOTTOM + 4, &footer, DIM);
 }
@@ -806,6 +812,7 @@ mod tests {
             "/roms/Super Mario Bros.nes",
             "/roms/Zelda.nes",
             "/mario/mario 3.nes",
+            "/mario/Contra.nes",
         ]));
         list.move_by(2, visible_rows());
         list.search_push("MARIO");
@@ -826,7 +833,7 @@ mod tests {
         assert!(list.roms.is_empty(), "no match leaves an empty list");
 
         assert!(list.search_clear(), "Esc clears a non-empty search");
-        assert_eq!(list.roms.len(), 3, "clearing brings every ROM back");
+        assert_eq!(list.roms.len(), 4, "clearing brings every ROM back");
         assert!(
             !list.search_clear(),
             "an empty search falls through to quit"
