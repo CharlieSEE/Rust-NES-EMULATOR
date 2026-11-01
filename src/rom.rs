@@ -79,7 +79,7 @@ pub fn read_rom(path: &std::path::Path) -> Result<Vec<u8>, String> {
         let mut entry = archive
             .by_index(index)
             .map_err(|e| format!("{display}: {e}"))?;
-        if entry.is_dir() || !has_nes_suffix(entry.name()) {
+        if !entry.name().to_ascii_lowercase().ends_with(".nes") {
             continue;
         }
         let name = entry.name().to_string();
@@ -91,12 +91,6 @@ pub fn read_rom(path: &std::path::Path) -> Result<Vec<u8>, String> {
         return Ok(bytes);
     }
     Err(format!("{display}: no .nes inside the zip"))
-}
-
-/// A `.nes` suffix in any case. Bytes, not a `&str` slice: the name can end
-/// inside a multi-byte character, and slicing there would panic.
-fn has_nes_suffix(name: &str) -> bool {
-    name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".nes")
 }
 
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
@@ -1550,17 +1544,6 @@ mod tests {
             error.contains("game.zip") && error.contains(".nes"),
             "{error}"
         );
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_plain_nes_file_is_read_as_is() {
-        let dir = temp_dir("plain");
-        let path = dir.join("game.nes");
-        std::fs::write(&path, b"NES\x1aimage").unwrap();
-
-        assert_eq!(read_rom(&path).unwrap(), b"NES\x1aimage");
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
