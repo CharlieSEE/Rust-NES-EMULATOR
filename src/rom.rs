@@ -63,6 +63,34 @@ use crate::ppu::Mirroring;
 use crate::region::Region;
 use crate::state::{rom_fingerprint, StateReader, StateWriter};
 
+/// Bytes of a ROM on disk: a plain image, or the `.nes` inside a single-ROM
+/// `.zip`. The archive is unpacked in memory and never written back.
+pub fn read_rom(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let display = path.display();
+    let zipped = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+    if !zipped {
+        return std::fs::read(path).map_err(|e| format!("{display}: {e}"));
+    }
+    let file = std::fs::File::open(path).map_err(|e| format!("{display}: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{display}: {e}"))?;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|e| format!("{display}: {e}"))?;
+        if entry.is_dir() || !entry.name().to_ascii_lowercase().ends_with(".nes") {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut bytes)
+            .map_err(|e| format!("{display}: {name}: {e}"))?;
+        return Ok(bytes);
+    }
+    Err(format!("{display}: no .nes inside the zip"))
+}
+
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
 /// PRG ROM bank" -- ONE 32 KiB block over the whole window. There is no
 /// separately selectable `$C000-$FFFF` half; `$8000` and `$C000` are both
@@ -1465,5 +1493,66 @@ mod tests {
             before,
             "every MMC1 register must come back"
         );
+    }
+
+    /// Writes one stored entry, so the test does not depend on a compressor.
+    fn write_zip(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        use std::io::Write as _;
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        for (name, bytes) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    fn temp_dir(test: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nes-rom-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_zip_rom_is_the_nes_entry_inside_it() {
+        let dir = temp_dir("zip");
+        let path = dir.join("game.zip");
+        let image = ines_header(1, 1, 0).to_vec();
+        write_zip(
+            &path,
+            &[("readme.txt", b"not a rom"), ("Game (USA).NES", &image)],
+        );
+
+        assert_eq!(read_rom(&path).expect("the zip must load"), image);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_zip_without_a_nes_entry_names_the_archive() {
+        let dir = temp_dir("zip-empty");
+        let path = dir.join("game.zip");
+        write_zip(&path, &[("readme.txt", b"not a rom")]);
+
+        let error = read_rom(&path).expect_err("a zip with no .nes must fail");
+
+        assert!(
+            error.contains("game.zip") && error.contains(".nes"),
+            "{error}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_plain_nes_file_is_read_as_is() {
+        let dir = temp_dir("plain");
+        let path = dir.join("game.nes");
+        std::fs::write(&path, b"NES\x1aimage").unwrap();
+
+        assert_eq!(read_rom(&path).unwrap(), b"NES\x1aimage");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
