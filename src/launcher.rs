@@ -147,25 +147,90 @@ fn elide(text: &str, max: usize, keep_tail: bool) -> String {
 
 /// The list and where it is looking. All movement goes through here so the
 /// selection and the scroll offset cannot disagree.
+///
+/// `all` is the folder; `roms` is the part of it matching `query`. Every ROM
+/// action reads `roms`, so filtering is invisible to selection, scrolling and
+/// the click mapping.
 struct List {
+    all: Vec<PathBuf>,
     roms: Vec<PathBuf>,
+    query: String,
     selected: usize,
     scroll: usize,
 }
 
 impl List {
     fn new(roms: Vec<PathBuf>) -> List {
-        List {
-            roms,
+        let mut list = List {
+            all: roms,
+            roms: Vec::new(),
+            query: String::new(),
             selected: 0,
             scroll: 0,
+        };
+        list.apply_filter();
+        list
+    }
+
+    /// Replace the folder and drop the search, for a folder the player picked.
+    fn reset(&mut self, roms: Vec<PathBuf>) {
+        self.all = roms;
+        self.query.clear();
+        self.selected = 0;
+        self.scroll = 0;
+        self.apply_filter();
+    }
+
+    /// Re-read the same folder without losing the search. The caller restores
+    /// the cursor, since a re-read can move the selected ROM's index.
+    fn reload(&mut self, roms: Vec<PathBuf>) {
+        self.all = roms;
+        self.apply_filter();
+    }
+
+    /// Rebuild `roms` from `all`, case-insensitively matching the query against
+    /// the file name. Filtering changes what is selected, so the cursor returns
+    /// to the top of the new list.
+    fn apply_filter(&mut self) {
+        let query = self.query.to_lowercase();
+        self.roms = self
+            .all
+            .iter()
+            .filter(|path| {
+                query.is_empty()
+                    || path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .cloned()
+            .collect();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    fn search_push(&mut self, text: &str) {
+        self.query.push_str(text);
+        self.apply_filter();
+    }
+
+    fn search_backspace(&mut self) {
+        if self.query.pop().is_some() {
+            self.apply_filter();
         }
     }
 
-    fn reset(&mut self, roms: Vec<PathBuf>) {
-        self.roms = roms;
-        self.selected = 0;
-        self.scroll = 0;
+    /// Clear the search. Returns whether there was one, so Esc can fall back to
+    /// quitting when nothing is filtered.
+    fn search_clear(&mut self) -> bool {
+        if self.query.is_empty() {
+            return false;
+        }
+        self.query.clear();
+        self.apply_filter();
+        true
     }
 
     fn move_by(&mut self, delta: isize, visible: usize) {
@@ -213,10 +278,21 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
         &elide(&dir.display().to_string(), (W - 2 * MARGIN) / CELL, true),
         DIM,
     );
-    let count = match list.roms.len() {
-        0 => "no .nes files here".to_string(),
-        1 => "1 ROM".to_string(),
-        n => format!("{n} ROMs"),
+    let count = if list.query.is_empty() {
+        match list.roms.len() {
+            0 => "no .nes files here".to_string(),
+            1 => "1 ROM".to_string(),
+            n => format!("{n} ROMs"),
+        }
+    } else {
+        // The query is at the end, so a long one is cut from the start: the
+        // characters just typed are the ones worth showing.
+        format!(
+            "{} of {}   find: {}_",
+            list.roms.len(),
+            list.all.len(),
+            elide(&list.query, 16, true)
+        )
     };
     put_text(fb, W, H, MARGIN, 30, &count, DIM);
 
@@ -243,21 +319,21 @@ fn render(fb: &mut [u32], dir: &Path, list: &List, running: usize) {
     }
 
     if list.roms.is_empty() {
-        put_text(
-            fb,
-            W,
-            H,
-            MARGIN,
-            LIST_TOP + CELL,
-            "Press O to choose a folder",
-            DIM,
-        );
+        let hint = if list.query.is_empty() {
+            "Press F2 to choose a folder"
+        } else {
+            "No ROM matches. ESC clears the search"
+        };
+        put_text(fb, W, H, MARGIN, LIST_TOP + CELL, hint, DIM);
     }
 
-    let footer = match running {
-        0 => "ENTER play   O folder   ESC quit".to_string(),
-        1 => "GAME RUNNING   O folder   ESC quit".to_string(),
-        n => format!("{n} GAMES RUNNING   O folder   ESC quit"),
+    let footer = match (running, list.query.is_empty()) {
+        (0, true) => "ENTER play   F2 folder   ESC quit".to_string(),
+        (1, true) => "GAME RUNNING   F2 folder   ESC quit".to_string(),
+        (n, true) => format!("{n} GAMES RUNNING   F2 folder   ESC quit"),
+        (0, false) => "ENTER play   ESC clear search".to_string(),
+        (1, false) => "GAME RUNNING   ESC clear search".to_string(),
+        (n, false) => format!("{n} GAMES RUNNING   ESC clear search"),
     };
     put_text(fb, W, H, MARGIN, LIST_BOTTOM + 4, &footer, DIM);
 }
@@ -299,7 +375,7 @@ fn refresh(dir: &Path, list: &mut List, visible: usize) {
         Ok(roms) => {
             let selected = list.roms.get(list.selected).cloned();
             let scroll = list.scroll;
-            list.reset(roms);
+            list.reload(roms);
             if let Some(path) = selected {
                 if let Some(index) = list.roms.iter().position(|rom| *rom == path) {
                     list.selected = index;
@@ -523,7 +599,18 @@ pub fn run() -> Result<(), String> {
                     repeat,
                     ..
                 } => match key {
-                    Keycode::Escape | Keycode::Q => break,
+                    Keycode::Escape => {
+                        // A repeat must not clear the search and then quit:
+                        // one held Esc is still one Escape press.
+                        if !repeat && !list.search_clear() {
+                            break;
+                        }
+                        dirty = true;
+                    }
+                    Keycode::Backspace => {
+                        list.search_backspace();
+                        dirty = true;
+                    }
                     Keycode::Up => {
                         list.move_by(-1, visible);
                         dirty = true;
@@ -557,7 +644,8 @@ pub fn run() -> Result<(), String> {
                             }
                         }
                     }
-                    Keycode::O => {
+                    // Held F2 must not queue a picker per repeat.
+                    Keycode::F2 if !repeat => {
                         if let Some(picked) = rfd::FileDialog::new()
                             .set_title("NES ROM folder")
                             .set_directory(&dir)
@@ -578,6 +666,16 @@ pub fn run() -> Result<(), String> {
                     }
                     _ => {}
                 },
+                // Typed text arrives here, not as KeyDown, so keyboard layouts
+                // and shifted characters work without a keycode-to-character
+                // table. Control characters are Enter and friends, which have
+                // their own meaning above.
+                Event::TextInput { text, .. } => {
+                    if !text.is_empty() && !text.chars().any(char::is_control) {
+                        list.search_push(&text);
+                        dirty = true;
+                    }
+                }
                 Event::MouseButtonDown {
                     mouse_btn: MouseButton::Left,
                     clicks,
@@ -687,6 +785,75 @@ mod tests {
         let cut = elide("/home/charlie/DataSSD/projects/roms/nes", 20, true);
         assert_eq!(cut, "...projects/roms/nes");
         assert_eq!(cut.chars().count(), 20);
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    fn names(list: &List) -> Vec<String> {
+        list.roms
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn typing_filters_roms_by_file_name_without_regard_to_case() {
+        let mut list = List::new(paths(&[
+            "/roms/Super Mario Bros.nes",
+            "/roms/Zelda.nes",
+            "/mario/mario 3.nes",
+        ]));
+        list.move_by(2, visible_rows());
+        list.search_push("MARIO");
+        assert_eq!(
+            names(&list),
+            ["Super Mario Bros.nes", "mario 3.nes"],
+            "the match is case-insensitive and the query is not glued to the start"
+        );
+        assert_eq!(list.selected, 0, "a new filter starts at the top");
+
+        list.search_push(" 3");
+        assert_eq!(names(&list), ["mario 3.nes"]);
+
+        list.search_backspace();
+        assert_eq!(names(&list), ["Super Mario Bros.nes", "mario 3.nes"]);
+
+        list.search_push("zzz");
+        assert!(list.roms.is_empty(), "no match leaves an empty list");
+
+        assert!(list.search_clear(), "Esc clears a non-empty search");
+        assert_eq!(list.roms.len(), 3, "clearing brings every ROM back");
+        assert!(
+            !list.search_clear(),
+            "an empty search falls through to quit"
+        );
+    }
+
+    #[test]
+    fn refresh_keeps_the_search_and_the_cursor_inside_it() {
+        let dir = std::env::temp_dir().join(format!("nes-launcher-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["mario-01.nes", "mario-02.nes", "zelda.nes"] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+
+        let mut list = List::new(super::scan(&dir).unwrap());
+        list.search_push("mario");
+        list.move_by(1, visible_rows());
+        super::refresh(&dir, &mut list, visible_rows());
+
+        assert_eq!(list.query, "mario", "a folder refresh keeps the search");
+        assert_eq!(names(&list), ["mario-01.nes", "mario-02.nes"]);
+        assert_eq!(
+            list.roms[list.selected].file_name().unwrap(),
+            "mario-02.nes",
+            "and the cursor stays on the ROM it was on"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
