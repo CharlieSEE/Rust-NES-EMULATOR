@@ -266,11 +266,11 @@ impl Bus {
             // The cartridge may populate this window with PRG RAM. Both NROM
             // test images do -- blargg's ROMs report their results here -- and
             // MMC1 exposes its battery save here. MMC1's PRG register can
-            // disable the window; the SMB and Contra boards map nothing below
-            // `$8000`, so for them it is open bus.
+            // disable the window; the standard CNROM board modeled here, SMB
+            // and Contra map nothing below `$8000`, so for them it is open bus.
             0x6000..=0x7FFF if self.cart.prg_ram_enabled() => self.prg_ram[addr as usize - 0x6000],
-            // Mappers 2 and 66 map nothing below $8000: no PRG RAM, no
-            // registers, so `$4020-$7FFF` is open bus.
+            // Mappers 2 and 66 and this CNROM board map nothing below $8000:
+            // no PRG RAM, no registers, so `$4020-$7FFF` is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
             _ => 0,
         }
@@ -303,8 +303,9 @@ impl Bus {
             0x8000..=0xFFFF => {
                 self.cart.cpu_write(addr, val);
                 // MMC1 can change CHR banking and mirroring in a write, and
-                // GxROM's CHR bits live in the PRG register. Push whatever the
-                // mapper now reports on every write.
+                // GxROM's and CNROM's CHR bits live in their PRG-window
+                // registers. Push whatever the mapper now reports on every
+                // write.
                 self.ppu.set_chr_map(self.cart.chr_map());
                 self.ppu.set_mirroring(self.cart.mirroring());
             }
