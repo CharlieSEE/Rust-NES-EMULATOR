@@ -100,9 +100,13 @@ the cartridge runs but cannot be aimed.
   **mapper 4 (MMC3/TxROM)** and **mapper 66** (the SMB/Duck Hunt board) are
   supported. Mapper 4 covers SMB3, Kirby's Adventure, Mega Man 3–6 and most of
   the TxROM library. Games on other mappers still exit with a mapper error.
-- Save states live beside the ROM as `.state1`–`.state9` files, with a small
-  `.state` index naming the newest: a bare digit saves, `Left Shift`+digit
-  loads, `F8` loads the most recently saved slot. `F7` opens the slot list,
+- Save states live in `saves/<game>/` beside the binary, one folder per game:
+  `state1`–`state9` plus a small `latest` file naming the newest. `<game>` is
+  the ROM filename without its extension, so a game's `.nes` and `.zip` share
+  one folder -- and two different ROMs with the same filename share one too.
+  States an older build wrote beside the ROM move there on first run. A bare
+  digit saves, `Left Shift`+digit loads, `F8` loads the most recently saved
+  slot. `F7` opens the slot list,
   showing each save's age and whether this ROM can load it; Up/Down choose,
   Enter loads, Esc cancels. A brief message on the frame confirms saves and
   loads; failed save-state loads and writes are shown there too, as well as in

@@ -124,25 +124,69 @@ fn slot_for(key: Scancode) -> Option<usize> {
         .map(|index| index + 1)
 }
 
-/// Where slot `slot` lives: beside the ROM, next to its battery save, so a
-/// folder of ROMs takes its states with it. `Zelda.nes` becomes
-/// `Zelda.state3`.
-fn state_slot_path(rom_path: &::std::path::Path, slot: usize) -> ::std::path::PathBuf {
-    rom_path.with_extension(format!("state{slot}"))
+/// The folder holding every game's states: `saves` beside the executable, the
+/// same place as the config file and the error log. Without an executable path
+/// it falls back to `saves` in the current directory.
+fn saves_root() -> ::std::path::PathBuf {
+    report::exe_dir().unwrap_or_default().join("saves")
+}
+
+/// One game's folder under `saves_root`. The extension is dropped, so
+/// `Zelda.nes` and `Zelda.zip` are the same game and share
+/// `saves/Zelda/`.
+fn game_save_dir(
+    saves_root: &::std::path::Path,
+    rom_path: &::std::path::Path,
+) -> ::std::path::PathBuf {
+    saves_root.join(rom_path.file_stem().unwrap_or_default())
+}
+
+/// Move states written beside the ROM by an older build into the game's
+/// folder, so an upgrade does not make saved games look lost. Runs only when
+/// the folder does not exist yet. Each file is copied before the old one is
+/// removed, and a failure is logged rather than stopping play.
+fn migrate_legacy_states(rom_path: &::std::path::Path, save_dir: &::std::path::Path) {
+    if save_dir.exists() {
+        return;
+    }
+    let states = (1..=SLOT_KEYS.len())
+        .map(|slot| {
+            (
+                rom_path.with_extension(format!("state{slot}")),
+                state_slot_path(save_dir, slot),
+            )
+        })
+        .chain([(
+            rom_path.with_extension("state"),
+            latest_state_path(save_dir),
+        )]);
+    for (old, new) in states.filter(|(old, _)| old.exists()) {
+        if let Err(e) = ::std::fs::create_dir_all(save_dir)
+            .and_then(|()| ::std::fs::copy(&old, &new))
+            .and_then(|_| ::std::fs::remove_file(&old))
+        {
+            report::log_error(&format!("cannot move {}: {e}", old.display()));
+        }
+    }
+}
+
+/// Where slot `slot` lives inside a game's folder: `saves/Zelda/state3`.
+fn state_slot_path(save_dir: &::std::path::Path, slot: usize) -> ::std::path::PathBuf {
+    save_dir.join(format!("state{slot}"))
 }
 
 /// The one-byte index naming the slot `F8` loads. Kept beside the states, and
 /// written after every successful save, so "latest" does not depend on file
 /// times -- a copied or restored save folder would otherwise reorder itself.
-fn latest_state_path(rom_path: &::std::path::Path) -> ::std::path::PathBuf {
-    rom_path.with_extension("state")
+fn latest_state_path(save_dir: &::std::path::Path) -> ::std::path::PathBuf {
+    save_dir.join("latest")
 }
 
 /// The slot named by the index file. Missing is `None` (nothing saved yet);
 /// an unreadable, unparsable or out-of-range index is an error, because guessing
 /// would load a state the player did not ask for.
-fn read_latest_slot(rom_path: &::std::path::Path) -> Result<Option<usize>, String> {
-    let path = latest_state_path(rom_path);
+fn read_latest_slot(save_dir: &::std::path::Path) -> Result<Option<usize>, String> {
+    let path = latest_state_path(save_dir);
     let text = match ::std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Ok(None),
@@ -169,27 +213,29 @@ fn read_latest_slot(rom_path: &::std::path::Path) -> Result<Option<usize>, Strin
 /// save, so a crash mid-write leaves the previous state intact. The index is
 /// updated only after the state itself is safely on disk.
 fn save_state_slot(
-    rom_path: &::std::path::Path,
+    save_dir: &::std::path::Path,
     slot: usize,
     bus: &Bus,
     cpu: &Cpu,
 ) -> Result<(), String> {
-    let path = state_slot_path(rom_path, slot);
+    let path = state_slot_path(save_dir, slot);
+    ::std::fs::create_dir_all(save_dir)
+        .map_err(|e| format!("cannot create {}: {e}", save_dir.display()))?;
     write_atomic(&path, &bus.save_state(cpu))
         .map_err(|e| format!("cannot save state slot {slot}: {e}"))?;
-    write_atomic(&latest_state_path(rom_path), format!("{slot}\n").as_bytes())
+    write_atomic(&latest_state_path(save_dir), format!("{slot}\n").as_bytes())
         .map_err(|e| format!("slot {slot} saved, but cannot record it for F8: {e}"))
 }
 
 /// Apply a slot to a running machine. `Bus::load_state` validates and swaps the
 /// whole machine, so a missing, corrupt or foreign state leaves play untouched.
 fn load_state_slot(
-    rom_path: &::std::path::Path,
+    save_dir: &::std::path::Path,
     slot: usize,
     bus: &mut Bus,
     cpu: &mut Cpu,
 ) -> Result<(), String> {
-    let path = state_slot_path(rom_path, slot);
+    let path = state_slot_path(save_dir, slot);
     let data = ::std::fs::read(&path).map_err(|e| match e.kind() {
         ::std::io::ErrorKind::NotFound => format!("state slot {slot} is empty: {}", path.display()),
         _ => format!("cannot read {}: {e}", path.display()),
@@ -199,17 +245,17 @@ fn load_state_slot(
 }
 
 fn load_latest_state(
-    rom_path: &::std::path::Path,
+    save_dir: &::std::path::Path,
     bus: &mut Bus,
     cpu: &mut Cpu,
 ) -> Result<usize, String> {
-    let slot = read_latest_slot(rom_path)?.ok_or_else(|| {
+    let slot = read_latest_slot(save_dir)?.ok_or_else(|| {
         format!(
-            "no save states for {}: press 1-9 to make one",
-            rom_path.display()
+            "no save states in {}: press 1-9 to make one",
+            save_dir.display()
         )
     })?;
-    load_state_slot(rom_path, slot, bus, cpu).map(|()| slot)
+    load_state_slot(save_dir, slot, bus, cpu).map(|()| slot)
 }
 
 /// One quick-save slot as the picker sees it. The age is relative: the
@@ -230,11 +276,11 @@ struct Picker {
 }
 
 impl Picker {
-    fn open(rom_path: &::std::path::Path, cart: &Cartridge) -> Picker {
-        let slots = ::std::array::from_fn(|index| slot_state(rom_path, index + 1, cart));
+    fn open(save_dir: &::std::path::Path, cart: &Cartridge) -> Picker {
+        let slots = ::std::array::from_fn(|index| slot_state(save_dir, index + 1, cart));
         // The slot the player saved last is the one they are most likely to
         // want; an index naming a broken or foreign file falls back to slot 1.
-        let selected = read_latest_slot(rom_path)
+        let selected = read_latest_slot(save_dir)
             .ok()
             .flatten()
             .filter(|&slot| matches!(&slots[slot - 1], Slot::Ready(_)))
@@ -260,8 +306,8 @@ impl Picker {
 /// Read one slot's state file and decide whether this cartridge can load it.
 /// Missing is empty; any other read failure is incompatible, because the picker
 /// must not offer a slot it cannot even read.
-fn slot_state(rom_path: &::std::path::Path, slot: usize, cart: &Cartridge) -> Slot {
-    let path = state_slot_path(rom_path, slot);
+fn slot_state(save_dir: &::std::path::Path, slot: usize, cart: &Cartridge) -> Slot {
+    let path = state_slot_path(save_dir, slot);
     let data = match ::std::fs::read(&path) {
         Ok(data) => data,
         Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Slot::Empty,
@@ -766,6 +812,10 @@ fn run() -> Result<(), String> {
     let Some(rom_path) = args.next() else {
         return launcher::run();
     };
+    // States are keyed by game, so moving the ROM does not lose them.
+    let rom = ::std::path::Path::new(&rom_path);
+    let save_dir = game_save_dir(&saves_root(), rom);
+    migrate_legacy_states(rom, &save_dir);
     let mut dump_at: Vec<u32> = Vec::new();
     let mut script = None;
     while let Some(arg) = args.next() {
@@ -951,12 +1001,7 @@ fn run() -> Result<(), String> {
                     }
                     PickerCommand::Load => {
                         let slot = picker.as_ref().expect("the guard checked").selected + 1;
-                        match load_state_slot(
-                            ::std::path::Path::new(&rom_path),
-                            slot,
-                            &mut bus,
-                            &mut cpu,
-                        ) {
+                        match load_state_slot(&save_dir, slot, &mut bus, &mut cpu) {
                             Ok(()) => {
                                 picker = None;
                                 // A load replaces the paused frame with the
@@ -1043,7 +1088,7 @@ fn run() -> Result<(), String> {
                     ..
                 } => {
                     picker_was_paused = paused;
-                    picker = Some(Picker::open(::std::path::Path::new(&rom_path), &bus.cart));
+                    picker = Some(Picker::open(&save_dir, &bus.cart));
                     keys = 0;
                     pad = 0;
                     if !paused {
@@ -1061,12 +1106,7 @@ fn run() -> Result<(), String> {
                 } if slot_for(key).is_some() => {
                     let slot = slot_for(key).expect("the guard just matched a slot key");
                     if keymod.contains(Mod::LSHIFTMOD) {
-                        match load_state_slot(
-                            ::std::path::Path::new(&rom_path),
-                            slot,
-                            &mut bus,
-                            &mut cpu,
-                        ) {
+                        match load_state_slot(&save_dir, slot, &mut bus, &mut cpu) {
                             Ok(()) => {
                                 resume_after_load(&mut paused, muted, audio.as_ref());
                                 toast =
@@ -1075,7 +1115,7 @@ fn run() -> Result<(), String> {
                             Err(e) => toast_error(&mut toast, &e),
                         }
                     } else {
-                        match save_state_slot(::std::path::Path::new(&rom_path), slot, &bus, &cpu) {
+                        match save_state_slot(&save_dir, slot, &bus, &cpu) {
                             Ok(()) => {
                                 toast =
                                     Some(Toast::new(&format!("Saved slot {slot}"), CONFIRM_TOAST))
@@ -1088,8 +1128,7 @@ fn run() -> Result<(), String> {
                     keycode: Some(Keycode::F8),
                     repeat: false,
                     ..
-                } => match load_latest_state(::std::path::Path::new(&rom_path), &mut bus, &mut cpu)
-                {
+                } => match load_latest_state(&save_dir, &mut bus, &mut cpu) {
                     Ok(slot) => {
                         resume_after_load(&mut paused, muted, audio.as_ref());
                         toast = Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
@@ -1262,12 +1301,12 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         age_label, apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run,
-        frame_budget, frame_sleep, latest_state_path, load_latest_state, load_state_slot,
-        mask_for_name, missed_dumps, move_selection, parse_script, picker_command,
-        read_latest_slot, resume_after_load, resume_audio, save_state_slot, slot_for, slot_line,
-        state_slot_path, wrap_text, write_atomic, Bus, Cartridge, Cpu, Picker, PickerCommand, Play,
-        Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H,
-        TOAST_BG, TOAST_FG, W,
+        frame_budget, frame_sleep, game_save_dir, latest_state_path, load_latest_state,
+        load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps, move_selection,
+        parse_script, picker_command, read_latest_slot, resume_after_load, resume_audio,
+        save_state_slot, slot_for, slot_line, state_slot_path, wrap_text, write_atomic, Bus,
+        Cartridge, Cpu, Picker, PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES,
+        AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
@@ -1305,15 +1344,49 @@ mod tests {
     }
 
     #[test]
-    fn a_state_slot_is_a_sibling_of_the_rom() {
+    fn a_state_slot_lives_in_a_folder_per_game() {
+        let root = std::path::Path::new("/saves");
+        let rom = std::path::Path::new("/roms/Zelda.nes");
+        let save_dir = game_save_dir(root, rom);
+        assert_eq!(save_dir, std::path::PathBuf::from("/saves/Zelda"));
         assert_eq!(
-            state_slot_path(std::path::Path::new("/roms/Zelda.nes"), 3),
-            std::path::PathBuf::from("/roms/Zelda.state3")
+            state_slot_path(&save_dir, 3),
+            std::path::PathBuf::from("/saves/Zelda/state3")
         );
         assert_eq!(
-            latest_state_path(std::path::Path::new("/roms/Zelda.nes")),
-            std::path::PathBuf::from("/roms/Zelda.state")
+            latest_state_path(&save_dir),
+            std::path::PathBuf::from("/saves/Zelda/latest")
         );
+        assert_eq!(
+            game_save_dir(root, std::path::Path::new("/roms/Zelda.zip")),
+            save_dir,
+            "the same game as a zip shares its states"
+        );
+    }
+
+    #[test]
+    fn legacy_states_move_into_the_game_folder() {
+        let dir =
+            std::env::temp_dir().join(format!("nes-legacy-state-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let rom_path = dir.join("game.nes");
+        let save_dir = dir.join("saves").join("game");
+        std::fs::write(rom_path.with_extension("state3"), b"slot 3").expect("legacy slot");
+        std::fs::write(rom_path.with_extension("state"), b"3\n").expect("legacy index");
+
+        migrate_legacy_states(&rom_path, &save_dir);
+
+        assert_eq!(
+            std::fs::read(state_slot_path(&save_dir, 3)).unwrap(),
+            b"slot 3"
+        );
+        assert_eq!(std::fs::read(latest_state_path(&save_dir)).unwrap(), b"3\n");
+        assert!(
+            !rom_path.with_extension("state3").exists(),
+            "the old slot is moved, not left behind"
+        );
+        assert!(!rom_path.with_extension("state").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     /// A 16 KiB NROM image whose CPU sits in a jump-to-self loop, enough to
@@ -1332,16 +1405,16 @@ mod tests {
     fn a_saved_slot_reloads_into_the_running_machine() {
         let dir = std::env::temp_dir().join(format!("nes-state-slot-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let rom_path = dir.join("game.nes");
+        let save_dir = dir.join("saves").join("game");
         let mut bus = Bus::new(test_cartridge());
         let mut cpu = Cpu::new();
         bus.power_on();
         cpu.reset(&mut bus);
 
         let saved = bus.save_state(&cpu);
-        save_state_slot(&rom_path, 3, &bus, &cpu).expect("state must be written");
+        save_state_slot(&save_dir, 3, &bus, &cpu).expect("state must be written");
         assert_eq!(
-            read_latest_slot(&rom_path).expect("index readable"),
+            read_latest_slot(&save_dir).expect("index readable"),
             Some(3),
             "a save records itself for F8"
         );
@@ -1350,14 +1423,14 @@ mod tests {
         bus.ppu.take_frame();
         assert_ne!(bus.save_state(&cpu), saved, "the machine must move on");
 
-        load_state_slot(&rom_path, 3, &mut bus, &mut cpu).expect("state must load");
+        load_state_slot(&save_dir, 3, &mut bus, &mut cpu).expect("state must load");
         assert_eq!(
             bus.save_state(&cpu),
             saved,
             "the loaded machine differs from the saved one"
         );
         assert_eq!(
-            load_latest_state(&rom_path, &mut bus, &mut cpu),
+            load_latest_state(&save_dir, &mut bus, &mut cpu),
             Ok(3),
             "the confirmation must name the slot F8 chose"
         );
@@ -1482,21 +1555,21 @@ mod tests {
     fn the_picker_checks_each_slot_against_the_running_cartridge() {
         let dir = std::env::temp_dir().join(format!("nes-picker-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let rom_path = dir.join("game.nes");
+        let save_dir = dir.join("saves").join("game");
         let mut bus = Bus::new(test_cartridge());
         let mut cpu = Cpu::new();
         bus.power_on();
         cpu.reset(&mut bus);
 
-        save_state_slot(&rom_path, 1, &bus, &cpu).expect("state must be written");
+        save_state_slot(&save_dir, 1, &bus, &cpu).expect("state must be written");
         std::fs::write(
-            state_slot_path(&rom_path, 2),
+            state_slot_path(&save_dir, 2),
             crate::state::wrap(&[], 0, Region::Ntsc, 0),
         )
         .expect("foreign state written");
-        save_state_slot(&rom_path, 5, &bus, &cpu).expect("latest state must be written");
+        save_state_slot(&save_dir, 5, &bus, &cpu).expect("latest state must be written");
 
-        let picker = Picker::open(&rom_path, &bus.cart);
+        let picker = Picker::open(&save_dir, &bus.cart);
         assert!(
             matches!(picker.slots[0], Slot::Ready(_)),
             "slot 1 is this ROM"
@@ -1524,23 +1597,24 @@ mod tests {
     fn the_latest_slot_comes_from_the_index_not_file_times() {
         let dir = std::env::temp_dir().join(format!("nes-latest-slot-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let rom_path = dir.join("game.nes");
-        let index = latest_state_path(&rom_path);
+        let save_dir = dir.join("saves").join("game");
+        std::fs::create_dir_all(&save_dir).expect("save folder");
+        let index = latest_state_path(&save_dir);
 
-        assert_eq!(read_latest_slot(&rom_path), Ok(None), "nothing saved yet");
+        assert_eq!(read_latest_slot(&save_dir), Ok(None), "nothing saved yet");
 
         std::fs::write(&index, b"2\n").expect("index written");
-        assert_eq!(read_latest_slot(&rom_path), Ok(Some(2)));
+        assert_eq!(read_latest_slot(&save_dir), Ok(Some(2)));
 
         std::fs::write(&index, b"0\n").expect("index written");
         assert!(
-            read_latest_slot(&rom_path).unwrap_err().contains("1-9"),
+            read_latest_slot(&save_dir).unwrap_err().contains("1-9"),
             "an out-of-range slot names the valid range"
         );
 
         std::fs::write(&index, b"nine\n").expect("index written");
         assert!(
-            read_latest_slot(&rom_path).unwrap_err().contains("nine"),
+            read_latest_slot(&save_dir).unwrap_err().contains("nine"),
             "unreadable text is quoted back"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
@@ -1982,8 +2056,8 @@ mod tests {
     fn a_status_message_wraps_to_the_screen_width() {
         assert_eq!(wrap_text("Saved slot 3", 28), ["Saved slot 3"]);
         assert_eq!(
-            wrap_text("state slot 9 is empty: /roms/Legend of Zelda.state9", 28),
-            ["state slot 9 is empty:", "/roms/Legend of Zelda.state9"]
+            wrap_text("state slot 9 is empty: /saves/Legend of Zelda/state9", 28),
+            ["state slot 9 is empty:", "/saves/Legend of", "Zelda/state9"]
         );
         let long = "x".repeat(60);
         let lines = wrap_text(&long, 28);
