@@ -10,9 +10,8 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Suggested order
 
-1. Unofficial CPU opcodes — removes hard crashes.
-2. Zapper — makes the bundled Duck Hunt fully playable.
-3. Mapper 3 (CNROM) — small board with a large library.
+1. Zapper — makes the bundled Duck Hunt fully playable.
+2. Mapper 3 (CNROM) — small board with a large library.
 
 ---
 
@@ -23,7 +22,8 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Effort: S.*
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
 - [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
-- [ ] **Unofficial CPU opcodes** — `cpu.rs` currently panics on undocumented opcodes. Implement the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants). *Effort: M.*
+- [x] **Unofficial CPU opcodes** — `cpu.rs` panicked on undocumented opcodes. Implemented the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants) with their addressing modes and cycle counts, plus `$EB` as SBC so the complete nestest golden log runs. *Done.*
+- [ ] **Unstable CPU opcodes** — JAM, XAA, SHA, SHX, SHY, TAS, LAS and LXA still panic. Add only when a specific game needs one. *Effort: S.*
 - [x] **DMC channel** — `$4010–$4013` registers, sample fetching through the CPU bus, 3/4-cycle DMA stalls, controller-read corruption, output level, sample-end IRQ, and `$4015` status bits. *Done.*
 - [x] **PAL support** — 50 Hz timing (312 scanlines, 5:16 CPU:PPU dots), 2A07 APU clock, noise and frame-counter tables, 2C07 palette, and region detection from NES 2.0 byte 12 or iNES flags 9/10. Dendy and dual-region headers fall back to NTSC. *Done.*
 - [ ] **NES 2.0 header support** — parse console type, mapper/submapper, PRG/CHR size exponents, RAM sizes. *Effort: S.*

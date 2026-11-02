@@ -766,7 +766,7 @@ mod tests {
     /// `apu_advance_ahead` places an APU-register access on its instruction's
     /// last cycle by advancing the APU and then skipping the same number of
     /// ticks, so whatever the instruction is, the APU must end up exactly its
-    /// cycle count further on. Every documented opcode, with and without an
+    /// cycle count further on. Every implemented opcode, with and without an
     /// access to the APU window: the skipped ticks are owed either way.
     #[test]
     fn an_instruction_advances_the_apu_by_exactly_its_cycle_count() {
@@ -775,7 +775,10 @@ mod tests {
         // Y are 0, so the address is unchanged). No operand lands on $4014:
         // the DMA's reads are a separate path with its own tests.
         for ops in [[0x00u8, 0x00], [0x15, 0x40], [0x17, 0x40], [0x03, 0x40]] {
-            for &op in crate::cpu::DOCUMENTED {
+            for &op in crate::cpu::DOCUMENTED
+                .iter()
+                .chain(crate::cpu::UNOFFICIAL.iter())
+            {
                 let mut bus = Bus::new(cart_running(&[op, ops[0], ops[1]]));
                 let mut cpu = Cpu::new();
                 bus.power_on();

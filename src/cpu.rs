@@ -1,8 +1,11 @@
 //! The 2A03's CPU: a 6502 core with the NES's own deviations.
 //!
-//! Documented opcodes only -- SMB is compiled from them and an undocumented
-//! opcode here is a cartridge fault, so `step` panics with the address rather
-//! than pretending. Cycle counts are exact: one table of base counts plus the
+//! Documented opcodes plus the stable undocumented set games actually use
+//! (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS and the NOP
+//! variants), and `$EB` as SBC because the golden log exercises it. The other
+//! unstable slots still panic with the address rather than pretending: no
+//! bundled game reaches them, and guessing at JAM's bus behaviour would hide a
+//! cartridge fault. Cycle counts are exact: one table of base counts plus the
 //! two standard penalties, never baked together.
 //!
 //! Two deliberate ceilings:
@@ -74,56 +77,55 @@ enum Mode {
     Rel,
 }
 
-/// Base cycles per opcode: the documented counts with no page-cross or
-/// taken-branch penalty. Those two adjustments are added in `operand` and
-/// `branch`, never baked in here, so this table is the reference a human can
-/// check against a 6502 datasheet row by row. Every one of the 105
-/// undocumented slots is 1 and none is reached -- `step` panics on them, and
-/// nothing branches on the value, so the uniform 1 is deliberately unchecked.
+/// Base cycles per opcode: the documented counts, the stable undocumented
+/// groups, and no page-cross or taken-branch penalty. Those two adjustments
+/// are added in `operand` and `branch`, never baked in here, so this table is
+/// the reference a human can check against a 6502 datasheet row by row. The
+/// remaining unstable slots still carry 1 because `step` panics before any of
+/// their modes is read.
 #[rustfmt::skip]
 const CYCLES: [u8; 256] = [
 //    0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
-      7,  6,  1,  1,  1,  3,  5,  1,  3,  2,  2,  1,  1,  4,  6,  1, // 00
-      2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 10
-      6,  6,  1,  1,  3,  3,  5,  1,  4,  2,  2,  1,  4,  4,  6,  1, // 20
-      2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 30
-      6,  6,  1,  1,  1,  3,  5,  1,  3,  2,  2,  1,  3,  4,  6,  1, // 40
-      2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 50
-      6,  6,  1,  1,  1,  3,  5,  1,  4,  2,  2,  1,  5,  4,  6,  1, // 60
-      2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // 70
-      1,  6,  1,  1,  3,  3,  3,  1,  2,  1,  2,  1,  4,  4,  4,  1, // 80
-      2,  6,  1,  1,  4,  4,  4,  1,  2,  5,  2,  1,  1,  5,  1,  1, // 90
-      2,  6,  2,  1,  3,  3,  3,  1,  2,  2,  2,  1,  4,  4,  4,  1, // a0
-      2,  5,  1,  1,  4,  4,  4,  1,  2,  4,  2,  1,  4,  4,  4,  1, // b0
-      2,  6,  1,  1,  3,  3,  5,  1,  2,  2,  2,  1,  4,  4,  6,  1, // c0
-      2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // d0
-      2,  6,  1,  1,  3,  3,  5,  1,  2,  2,  2,  1,  4,  4,  6,  1, // e0
-      2,  5,  1,  1,  1,  4,  6,  1,  2,  4,  1,  1,  1,  4,  7,  1, // f0
+      7,  6,  1,  8,  3,  3,  5,  5,  3,  2,  2,  2,  4,  4,  6,  6, // 00
+      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 10
+      6,  6,  1,  8,  3,  3,  5,  5,  4,  2,  2,  2,  4,  4,  6,  6, // 20
+      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 30
+      6,  6,  1,  8,  3,  3,  5,  5,  3,  2,  2,  2,  3,  4,  6,  6, // 40
+      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 50
+      6,  6,  1,  8,  3,  3,  5,  5,  4,  2,  2,  2,  5,  4,  6,  6, // 60
+      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 70
+      2,  6,  2,  6,  3,  3,  3,  3,  2,  2,  2,  1,  4,  4,  4,  4, // 80
+      2,  6,  1,  1,  4,  4,  4,  4,  2,  5,  2,  1,  1,  5,  1,  1, // 90
+      2,  6,  2,  6,  3,  3,  3,  3,  2,  2,  2,  1,  4,  4,  4,  4, // a0
+      2,  5,  1,  5,  4,  4,  4,  4,  2,  4,  2,  1,  4,  4,  4,  4, // b0
+      2,  6,  2,  8,  3,  3,  5,  5,  2,  2,  2,  2,  4,  4,  6,  6, // c0
+      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // d0
+      2,  6,  2,  8,  3,  3,  5,  5,  2,  2,  2,  2,  4,  4,  6,  6, // e0
+      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // f0
 ];
 
 /// Addressing mode per opcode, indexed by the same opcode as `CYCLES`. `M` is
 /// just a short name for `Mode`, so a row of sixteen stays on one line and the
-/// table stays checkable against a datasheet by eye. Both tables carry
-/// `Mode::Imp` in the 105 undocumented slots, which `step` panics on before a
-/// mode is ever read.
+/// table stays checkable against a datasheet by eye. Remaining unstable slots
+/// carry `Mode::Imp`; `step` panics on them before a mode is ever read.
 #[rustfmt::skip]
 const MODE: [Mode; 256] = [
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Imp, // 00
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 10
-    M::Abs,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 20
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 30
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 40
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 50
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Imp, // 60
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // 70
-    M::Imp,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // 80
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp, // 90
-    M::Imm,  M::IndX, M::Imm,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // a0
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::AbsY, M::Imp, // b0
-    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // c0
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // d0
-    M::Imm,  M::IndX, M::Imp,  M::Imp,  M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imp,  M::Imm,  M::Imp,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Imp, // e0
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::Imp,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::Imp, // f0
+    M::Imp,  M::IndX, M::Imp,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 00
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // 10
+    M::Abs,  M::IndX, M::Imp,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 20
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // 30
+    M::Imp,  M::IndX, M::Imp,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 40
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // 50
+    M::Imp,  M::IndX, M::Imp,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  // 60
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // 70
+    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 80
+    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::ZpY,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp,  // 90
+    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // a0
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpY,  M::ZpY,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::AbsY, M::AbsY, // b0
+    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // c0
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // d0
+    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // e0
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // f0
 ];
 use Mode as M;
 
@@ -141,6 +143,32 @@ pub(crate) const DOCUMENTED: &[u8] = &[
     0xBE, 0xC0, 0xC1, 0xC4, 0xC5, 0xC6, 0xC8, 0xC9, 0xCA, 0xCC, 0xCD, 0xCE, 0xD0, 0xD1, 0xD5, 0xD6,
     0xD8, 0xD9, 0xDD, 0xDE, 0xE0, 0xE1, 0xE4, 0xE5, 0xE6, 0xE8, 0xE9, 0xEA, 0xEC, 0xED, 0xEE, 0xF0,
     0xF1, 0xF5, 0xF6, 0xF8, 0xF9, 0xFD, 0xFE,
+];
+
+/// The stable undocumented opcodes, plus `$EB` (SBC), which the golden log
+/// exercises. The remaining unstable ones (JAM, XAA, SHA, SHX, SHY, TAS, LAS
+/// and LXA) still panic; see `an_undocumented_opcode_stops_the_cpu`.
+#[cfg(test)]
+pub(crate) const UNOFFICIAL: &[u8] = &[
+    0x03, 0x07, 0x0F, 0x13, 0x17, 0x1B, 0x1F, // SLO
+    0x23, 0x27, 0x2F, 0x33, 0x37, 0x3B, 0x3F, // RLA
+    0x43, 0x47, 0x4F, 0x53, 0x57, 0x5B, 0x5F, // SRE
+    0x63, 0x67, 0x6F, 0x73, 0x77, 0x7B, 0x7F, // RRA
+    0x83, 0x87, 0x8F, 0x97, // SAX
+    0xA3, 0xA7, 0xAF, 0xB3, 0xB7, 0xBF, // LAX
+    0xC3, 0xC7, 0xCF, 0xD3, 0xD7, 0xDB, 0xDF, // DCP
+    0xE3, 0xE7, 0xEF, 0xF3, 0xF7, 0xFB, 0xFF, // ISC
+    0x0B, 0x2B, // ANC
+    0x4B, // ALR
+    0x6B, // ARR
+    0xCB, // AXS
+    0xEB, // SBC: unstable, but the golden log runs it
+    0x1A, 0x3A, 0x5A, 0x7A, 0xDA, 0xFA, // NOP implied
+    0x80, 0x82, 0x89, 0xC2, 0xE2, // NOP immediate
+    0x04, 0x44, 0x64, // NOP zero page
+    0x14, 0x34, 0x54, 0x74, 0xD4, 0xF4, // NOP zero page,X
+    0x0C, // NOP absolute
+    0x1C, 0x3C, 0x5C, 0x7C, 0xDC, 0xFC, // NOP absolute,X
 ];
 
 /// Base address plus an index register, and whether that crosses a page -- the
@@ -325,7 +353,7 @@ impl Cpu {
                 self.add(v);
                 cycles += crossed as u8;
             }
-            0xE9 | 0xE5 | 0xF5 | 0xED | 0xFD | 0xF9 | 0xF1 | 0xE1 => {
+            0xE9 | 0xEB | 0xE5 | 0xF5 | 0xED | 0xFD | 0xF9 | 0xF1 | 0xE1 => {
                 let (v, crossed) = self.fetch(bus, mode);
                 self.add(!v); // SBC is ADC with the operand inverted
                 cycles += crossed as u8;
@@ -448,8 +476,117 @@ impl Cpu {
             0xD8 => self.p &= !D,
             0xF8 => self.p |= D,
             0xEA => {} // NOP
+            // --- stable undocumented opcodes ---
+            //
+            // Read-modify-writes chain a shift/rotate/inc/dec with a documented
+            // ALU step. The mode and cycle come from the tables above; only
+            // the combination is unusual.
+            0x03 | 0x07 | 0x0F | 0x13 | 0x17 | 0x1B | 0x1F => {
+                // SLO: ASL memory, then ORA memory into A.
+                let ea = self.operand(bus, mode).0;
+                let v = self.asl(bus.read(ea));
+                bus.write(ea, v);
+                self.a |= v;
+                self.nz(self.a);
+            }
+            0x23 | 0x27 | 0x2F | 0x33 | 0x37 | 0x3B | 0x3F => {
+                // RLA: ROL memory, then AND memory into A. ROL's C survives.
+                let ea = self.operand(bus, mode).0;
+                let v = self.rol(bus.read(ea));
+                bus.write(ea, v);
+                self.a &= v;
+                self.nz(self.a);
+            }
+            0x43 | 0x47 | 0x4F | 0x53 | 0x57 | 0x5B | 0x5F => {
+                // SRE: LSR memory, then EOR memory into A.
+                let ea = self.operand(bus, mode).0;
+                let v = self.lsr(bus.read(ea));
+                bus.write(ea, v);
+                self.a ^= v;
+                self.nz(self.a);
+            }
+            0x63 | 0x67 | 0x6F | 0x73 | 0x77 | 0x7B | 0x7F => {
+                // RRA: ROR memory, then ADC memory. ROR's C becomes ADC's carry.
+                let ea = self.operand(bus, mode).0;
+                let v = self.ror(bus.read(ea));
+                bus.write(ea, v);
+                self.add(v);
+            }
+            0xC3 | 0xC7 | 0xCF | 0xD3 | 0xD7 | 0xDB | 0xDF => {
+                // DCP: DEC memory, then CMP memory. CMP owns every flag DCP
+                // sets, so DEC's N/Z are deliberately not recorded first.
+                let ea = self.operand(bus, mode).0;
+                let v = bus.read(ea).wrapping_sub(1);
+                bus.write(ea, v);
+                self.compare(self.a, v);
+            }
+            0xE3 | 0xE7 | 0xEF | 0xF3 | 0xF7 | 0xFB | 0xFF => {
+                // ISC: INC memory, then SBC memory.
+                let ea = self.operand(bus, mode).0;
+                let v = bus.read(ea).wrapping_add(1);
+                bus.write(ea, v);
+                self.add(!v);
+            }
+            0x83 | 0x87 | 0x8F | 0x97 => {
+                // SAX: store A & X. No flags.
+                let ea = self.operand(bus, mode).0;
+                bus.write(ea, self.a & self.x);
+            }
+            0xA3 | 0xA7 | 0xAF | 0xB3 | 0xB7 | 0xBF => {
+                // LAX: load A and X with the same byte.
+                let (v, crossed) = self.fetch(bus, mode);
+                self.a = v;
+                self.x = v;
+                self.nz(v);
+                cycles += crossed as u8;
+            }
+            0x0B | 0x2B => {
+                // ANC: AND, then C = N.
+                let (v, crossed) = self.fetch(bus, mode);
+                self.a &= v;
+                self.nz(self.a);
+                self.set(C, self.a & 0x80 != 0);
+                cycles += crossed as u8;
+            }
+            0x4B => {
+                // ALR: AND, then LSR A.
+                let (v, crossed) = self.fetch(bus, mode);
+                self.a &= v;
+                self.a = self.lsr(self.a);
+                cycles += crossed as u8;
+            }
+            0x6B => {
+                // ARR: AND, then ROR A, then the NMOS's odd C/V:
+                // C = result bit 6, V = result bit 6 XOR bit 5.
+                let (v, crossed) = self.fetch(bus, mode);
+                self.a &= v;
+                let carry = self.flag(C);
+                self.a = (self.a >> 1) | (u8::from(carry) << 7);
+                self.nz(self.a);
+                self.set(C, self.a & 0x40 != 0);
+                self.set(V, ((self.a >> 6) ^ (self.a >> 5)) & 1 != 0);
+                cycles += crossed as u8;
+            }
+            0xCB => {
+                // AXS: X = (A & X) - operand.
+                let (v, crossed) = self.fetch(bus, mode);
+                let t = self.a & self.x;
+                self.x = t.wrapping_sub(v);
+                self.set(C, t >= v);
+                self.nz(self.x);
+                cycles += crossed as u8;
+            }
+            // The NOP variants only fetch their operand (and pay the page
+            // cross when an indexed one has to). Implied NOPs fetch nothing.
+            0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => {}
+            0x04 | 0x0C | 0x14 | 0x1C | 0x34 | 0x3C | 0x44 | 0x54 | 0x5C | 0x64 | 0x74 | 0x7C
+            | 0x80 | 0x82 | 0x89 | 0xC2 | 0xD4 | 0xDC | 0xE2 | 0xF4 | 0xFC => {
+                let (ea, crossed) = self.operand(bus, mode);
+                let _ = bus.read(ea);
+                cycles += crossed as u8;
+            }
             _ => panic!(
-                "unimplemented opcode ${op:02X} at ${:04X}: documented-only CPU",
+                "unimplemented opcode ${op:02X} at ${:04X}: unsupported undocumented opcode",
                 self.pc.wrapping_sub(1)
             ),
         }
@@ -1192,11 +1329,170 @@ mod tests {
         }
     }
 
+    /// Runs a zero-page read-modify-write illegal opcode, which every group
+    /// here takes five cycles for.
+    fn unofficial_rmw(op: u8, mem: u8, a: u8, carry: bool) -> (Cpu, TestBus) {
+        let mut bus = TestBus::new();
+        load(&mut bus, PROG, &[op, 0x10]);
+        bus.write(0x0010, mem);
+        let mut c = Cpu::new();
+        c.pc = PROG;
+        c.a = a;
+        c.p = U | if carry { C } else { 0 };
+        assert_eq!(c.step(&mut bus), 5, "opcode ${op:02X}");
+        (c, bus)
+    }
+
+    #[test]
+    fn stable_unofficial_rmw_opcodes_chain_their_two_documented_steps() {
+        // SLO: ASL $10 then ORA $10 into A.
+        let (c, mut bus) = unofficial_rmw(0x07, 0x81, 0x01, false);
+        assert_eq!(bus.read(0x10), 0x02);
+        assert_eq!(c.a, 0x03);
+        assert!(c.flag(C));
+
+        // RLA: ROL $10 then AND $10 into A.
+        let (c, mut bus) = unofficial_rmw(0x27, 0x81, 0xFF, false);
+        assert_eq!(bus.read(0x10), 0x02);
+        assert_eq!(c.a, 0x02);
+        assert!(c.flag(C));
+
+        // SRE: LSR $10 then EOR $10 into A.
+        let (c, mut bus) = unofficial_rmw(0x47, 0x03, 0x01, false);
+        assert_eq!(bus.read(0x10), 0x01);
+        assert_eq!(c.a, 0x00);
+        assert!(c.flag(C));
+        assert!(c.flag(Z));
+
+        // RRA: ROR $10 then ADC $10. The carry ROR shifts out is the carry
+        // ADC adds, so this also pins the order of the two halves.
+        let (c, mut bus) = unofficial_rmw(0x67, 0x02, 0x00, true);
+        assert_eq!(bus.read(0x10), 0x81);
+        assert_eq!(c.a, 0x81);
+        assert!(!c.flag(C));
+        assert!(c.flag(N));
+
+        // DCP: DEC $10 then CMP $10. Equal values leave C and Z set.
+        let (c, mut bus) = unofficial_rmw(0xC7, 0x10, 0x0F, false);
+        assert_eq!(bus.read(0x10), 0x0F);
+        assert_eq!(c.a, 0x0F);
+        assert!(c.flag(C));
+        assert!(c.flag(Z));
+
+        // ISC: INC $10 then SBC $10.
+        let (c, mut bus) = unofficial_rmw(0xE7, 0x00, 0x01, false);
+        assert_eq!(bus.read(0x10), 0x01);
+        assert_eq!(c.a, 0xFF);
+        assert!(!c.flag(C));
+        assert!(c.flag(N));
+    }
+
+    #[test]
+    fn stable_unofficial_load_store_and_immediate_opcodes_match_their_parts() {
+        // SAX $10 stores A & X and touches no flags.
+        let mut bus = TestBus::new();
+        load(&mut bus, PROG, &[0x87, 0x10]);
+        let mut c = Cpu::new();
+        c.pc = PROG;
+        c.a = 0xF0;
+        c.x = 0x0F;
+        c.p = C | Z;
+        assert_eq!(c.step(&mut bus), 3);
+        assert_eq!(bus.read(0x0010), 0x00);
+        assert_eq!(c.p, C | Z, "SAX changes no flags");
+
+        // LAX $10 loads A and X with the same byte.
+        bus.write(0x0010, 0x80);
+        load(&mut bus, PROG, &[0xA7, 0x10]);
+        c.pc = PROG;
+        assert_eq!(c.step(&mut bus), 3);
+        assert_eq!((c.a, c.x), (0x80, 0x80));
+        assert!(c.flag(N));
+
+        // ANC #$0F: AND, then C = N.
+        load(&mut bus, PROG, &[0x0B, 0x0F]);
+        c.pc = PROG;
+        c.a = 0xF0;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.a, 0x00);
+        assert!(c.flag(Z));
+        assert!(!c.flag(C));
+
+        // ALR #$0F: AND, then LSR A.
+        load(&mut bus, PROG, &[0x4B, 0x0F]);
+        c.pc = PROG;
+        c.a = 0xF0;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.a, 0x00);
+        assert!(c.flag(Z));
+        assert!(!c.flag(C));
+
+        // ARR #$FF: AND, ROR A, then the 6502's odd C/V from bits 6 and 5.
+        load(&mut bus, PROG, &[0x6B, 0xFF]);
+        c.pc = PROG;
+        c.a = 0x80;
+        c.p = C;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.a, 0xC0);
+        assert!(c.flag(C), "C is result bit 6");
+        assert!(c.flag(V), "V is result bit 6 XOR bit 5");
+
+        // AXS #$0F: X = (A & X) - operand.
+        load(&mut bus, PROG, &[0xCB, 0x0F]);
+        c.pc = PROG;
+        c.a = 0xF0;
+        c.x = 0x0F;
+        c.p = C;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.x, 0xF1);
+        assert!(!c.flag(C));
+        assert!(c.flag(N));
+    }
+
+    #[test]
+    fn stable_unofficial_nops_consume_their_operands_and_cycles() {
+        // (program, X, cycles, bytes consumed)
+        for (program, x, want_cycles, want_pc) in [
+            (b"\x1A".as_slice(), 0, 2, 0x12FF),
+            (b"\x80\xAA", 0, 2, 0x1300),
+            (b"\x04\x10", 0, 3, 0x1300),
+            (b"\x14\x10", 0, 4, 0x1300),
+            (b"\x0C\x00\x20", 0, 4, 0x1301),
+            (b"\x1C\xFE\x12", 1, 4, 0x1301),
+            (b"\x1C\xFF\x12", 1, 5, 0x1301),
+        ] {
+            let mut bus = TestBus::new();
+            load(&mut bus, PROG, program);
+            let mut c = Cpu::new();
+            c.pc = PROG;
+            c.x = x;
+            c.p = C | N;
+            let before = c.p;
+            assert_eq!(c.step(&mut bus), want_cycles, "NOP {:02X?}", program);
+            assert_eq!(c.pc, want_pc, "NOP {:02X?}", program);
+            assert_eq!(c.p, before, "a NOP changes no flags");
+        }
+    }
+
+    /// Every unofficial opcode this CPU claims is dispatched. The nestest
+    /// golden log validates their per-mode lengths and cycle counts; this only
+    /// catches a missing match arm.
+    #[test]
+    fn every_unofficial_opcode_runs() {
+        for &op in UNOFFICIAL {
+            let mut bus = TestBus::new();
+            load(&mut bus, PROG, &[op]);
+            let mut c = Cpu::new();
+            c.pc = PROG;
+            assert!(c.step(&mut bus) >= 2, "opcode ${op:02X}");
+        }
+    }
+
     #[test]
     #[should_panic(expected = "unimplemented opcode $02")]
     fn an_undocumented_opcode_stops_the_cpu() {
         let mut bus = TestBus::new();
-        load(&mut bus, PROG, &[0x02]); // a NOP on the NMOS 6502, undocumented
+        load(&mut bus, PROG, &[0x02]); // a JAM on the NMOS 6502: not stable
         let mut c = Cpu::new();
         c.pc = PROG;
         c.step(&mut bus);
