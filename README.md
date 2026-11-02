@@ -97,9 +97,11 @@ the cartridge runs but cannot be aimed.
 - **The Legend of Zelda** — playable on mapper 1 (MMC1); progress is saved to
   a `.sav` file beside the ROM periodically while playing and on exit.
 - iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)**,
-  **mapper 4 (MMC3/TxROM)** and **mapper 66** (the SMB/Duck Hunt board) are
-  supported. Mapper 4 covers SMB3, Kirby's Adventure, Mega Man 3–6 and most of
-  the TxROM library. Games on other mappers still exit with a mapper error.
+  **mapper 3 (CNROM)**, **mapper 4 (MMC3/TxROM)** and **mapper 66** (the
+  SMB/Duck Hunt board) are supported. Mapper 4 covers SMB3, Kirby's Adventure,
+  Mega Man 3–6 and most of the TxROM library; mapper 3 covers Arkanoid,
+  Adventure Island and other standard CNROM titles. Games on other mappers
+  still exit with a mapper error.
 - Save states live in `saves/<game>/` beside the binary, one folder per game:
   `state1`–`state9` plus a small `latest` file naming the newest. `<game>` is
   the ROM filename without its extension, so a game's `.nes` and `.zip` share

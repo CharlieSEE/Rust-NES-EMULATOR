@@ -1,6 +1,6 @@
 # Feature backlog
 
-Current state: mappers 0/1/2/4/66, cycle-based PPU with scanline IRQ support in
+Current state: mappers 0/1/2/3/4/66, cycle-based PPU with scanline IRQ support in
 the cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
 serialization with quicksave slots and an in-game slot picker, launcher,
 scripted input and frame dumps.
@@ -11,14 +11,16 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 ## Suggested order
 
 1. Zapper — makes the bundled Duck Hunt fully playable.
-2. Mapper 3 (CNROM) — small board with a large library.
 
 ---
 
 ## Unlock more games
 
 - [x] **Mapper 4 (MMC3)** — SMB3, Kirby, Mega Man 3–6, TMNT, Batman. Bank registers, 8 KiB CHR banking, PRG/CHR modes, scanline IRQ counter, mirroring control. *Done; filtered PPU A12 edge tracking, always-enabled PRG RAM for MMC6 compatibility, battery saves, mapper state in save states.*
-- [ ] **Mapper 3 (CNROM)** — CHR bank register with bus conflicts. *Effort: S.*
+- [x] **Mapper 3 (CNROM)** — CHR bank register with bus conflicts. *Done; fixed PRG, 8 KiB CHR banking with AND-type bus conflicts, CHR bank in save states.*
+- [ ] **Mapper 185 (CNROM variant)** — 8 KiB CHR gated by chip-select bits; needs the correct submapper value or the first-two-reads heuristic. *Effort: S; issue #57.*
+- [ ] **CNROM NES 2.0 submappers** — submapper 1 disables bus conflicts; parse the NES 2.0 mapper/submapper fields. *Effort: S; issue #55; depends on NES 2.0 header support.*
+- [ ] **CNROM Namcot PRG RAM** — 2 KiB at `$6000-$7FFF`, mirrored three times, for Hayauchi Super Igo. *Effort: S; issue #56.*
 - [ ] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Effort: S.*
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
 - [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
