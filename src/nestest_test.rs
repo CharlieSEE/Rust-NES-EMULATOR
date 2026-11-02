@@ -100,9 +100,10 @@ fn nestest_matches_the_golden_log_from_c000_to_the_end() {
     // The first log line is the state before `$C000` runs, with reset's seven
     // cycles already on the hardware clock.
     let mut cycles = 7u64;
-    let mut checked = 0usize;
+    // The shipped log has 8991 lines; a truncated file must fail instead of
+    // finishing the loop with nothing checked.
+    assert!(log.lines().count() >= 8_900, "nestest.log is incomplete");
     for (number, line) in log.lines().enumerate() {
-        checked += 1;
         let want =
             parse(line).unwrap_or_else(|| panic!("line {}: cannot parse {line:?}", number + 1));
         let (pc, a, x, y, p, sp) = cpu.registers();
@@ -115,20 +116,8 @@ fn nestest_matches_the_golden_log_from_c000_to_the_end() {
             line
         );
         assert_eq!(cycles, want.cycles, "line {} cycle count", number + 1);
-        // The core deliberately stops at documented opcodes; the golden log
-        // switches to kevtris's `*NOP`-style illegal opcodes here. The state
-        // before that instruction is still part of the trace and was checked
-        // above, but stepping into it would panic by design.
-        if line.split_whitespace().any(|t| t.starts_with('*')) {
-            break;
-        }
+        // The whole log runs now, including kevtris's `*NOP`-style illegal
+        // opcodes: every one it exercises is implemented.
         cycles += cpu.step(&mut bus) as u64;
     }
-    // The shipped log has 5003 documented lines before the first illegal one.
-    // An empty or truncated file must fail instead of finishing the loop with
-    // nothing checked, which is exactly what a vacuous pass looked like.
-    assert!(
-        checked >= 5_000,
-        "only {checked} lines were checked; nestest.log is incomplete"
-    );
 }
