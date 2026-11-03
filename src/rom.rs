@@ -1,10 +1,10 @@
 //! iNES loader for the boards this emulator knows: mapper 1 (MMC1) for
 //! "Legend of Zelda", mapper 2 (UxROM) for "Contra", mapper 3 (CNROM) for its
-//! large library, mapper 66 (UxROM variant with bus conflicts) for "Super Mario
-//! Bros. + Duck Hunt", mapper 4 (MMC3) for the TxROM library, and mapper 0
-//! (NROM) for blargg's APU test ROMs -- NROM-128 and NROM-256, both with the
-//! `$6000-$7FFF` PRG RAM the tests need, and the 2005 suite with no CHR at all
-//! (the PPU gets RAM instead).
+//! large library, mapper 4 (MMC3) for the TxROM library, mapper 7 (AxROM) for
+//! "Battletoads" and its siblings, mapper 66 (UxROM variant with bus conflicts)
+//! for "Super Mario Bros. + Duck Hunt", and mapper 0 (NROM) for blargg's APU
+//! test ROMs -- NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM the
+//! tests need, and the 2005 suite with no CHR at all (the PPU gets RAM instead).
 //!
 //! Mapper 4 is MMC3: four 8 KiB PRG windows (two switchable, the second-last
 //! and last fixed, with bit 6 of `$8000` swapping the switchable pair), 2 KiB
@@ -41,6 +41,15 @@
 //! Regular boards connect only two latch outputs for up to 32 KiB of CHR; the
 //! modulo over the image's real bank count also covers the 128 KiB Bandai
 //! variant, whose four outputs are all connected.
+//!
+//! Mapper 7 is AxROM: one 32 KiB PRG bank over the whole `$8000-$FFFF` window,
+//! selected by bits 0-3 of any write in that window (bit 3 only exists on the
+//! 512 KiB variant), and bit 4 of the same register selects the 1 KiB VRAM page
+//! all four nametables use (0 lower, 1 upper). The board carries 8 KiB of CHR
+//! RAM and no PRG RAM. Plain iNES cannot name the board revision, so the model
+//! follows NES 2.0 submapper 0's guidance and does not emulate bus conflicts;
+//! NES 2.0 submapper 2 (AMROM) asks for AND-type conflicts, and that one is
+//! honoured. The ANROM and AN1ROM boards have none.
 //!
 //! The SMB + Duck Hunt iNES header is honest about that cartridge: its `chr=2`
 //! really is 16 KiB of tile data, its `prg=4` really is 64 KiB, and its
@@ -137,10 +146,13 @@ pub struct Cartridge {
     header: [u8; 16],
     /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
     board: Board,
+    /// NES 2.0 submapper, 0 for plain iNES. Mapper 7 uses it to choose
+    /// AND-type bus conflicts (submapper 2).
+    submapper: u8,
     /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
-    /// `$8000-$FFFF` on GxROM, a 16 KiB bank at `$8000-$BFFF` on UxROM, and
-    /// MMC1's PRG register in 16 KiB units whose meaning follows `control`.
-    /// NROM and CNROM have no PRG bank register, so it stays 0.
+    /// `$8000-$FFFF` on GxROM and AxROM, a 16 KiB bank at `$8000-$BFFF` on
+    /// UxROM, and MMC1's PRG register in 16 KiB units whose meaning follows
+    /// `control`. NROM and CNROM have no PRG bank register, so it stays 0.
     bank: usize,
     /// The two 4 KiB CHR banks the board maps at `$0000-$0FFF` and
     /// `$1000-$1FFF`. GxROM's and CNROM's 8 KiB value fills both; MMC1 selects
@@ -168,7 +180,7 @@ pub struct Cartridge {
     region: Region,
 }
 
-/// The six boards this emulator knows how to read.
+/// The seven boards this emulator knows how to read.
 #[derive(Clone, Copy)]
 enum Board {
     /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
@@ -185,6 +197,9 @@ enum Board {
     /// UxROM, the Contra board: 16 KiB switchable low window, last 16 KiB
     /// fixed high window, and no CHR banking.
     UxRom,
+    /// AxROM, the Battletoads board: one 32 KiB bank over the whole PRG
+    /// window, one-screen mirroring selected by the same register, CHR RAM.
+    AxRom,
     /// MMC3, the TxROM board: 8 KiB PRG windows, 1-2 KiB CHR windows,
     /// switchable mirroring and a scanline IRQ counter.
     Mmc3,
@@ -226,7 +241,8 @@ impl Cartridge {
         if bytes.len() < start + prg_len + chr_len {
             return Err(format!("truncated CHR: header claims {chr_len} bytes"));
         }
-        let mapper = bytes[7] & 0xF0 | bytes[6] >> 4;
+        let flags7 = bytes[7];
+        let nes20 = flags7 & 0x0C == 0x08;
         // NES 2.0 marks itself in flags 7 bits 2-3 and puts the CPU/PPU timing
         // in byte 12: 0 NTSC, 1 licensed PAL, 2 multiple-region, 3 Dendy. A
         // plain iNES header only has flags 9 bit 0 and flags 10 bits 0-1, and
@@ -236,11 +252,18 @@ impl Cartridge {
         // bytes 12-15 zero before iNES fields are trusted; a ripper signature
         // in the tail can leave anything in flags 9/10.
         //
+        // NES 2.0 also extends the mapper number to 12 bits in byte 8's low
+        // nibble and puts the submapper in its high nibble. iNES leaves byte 8
+        // as padding, so only trust it once the signature says NES 2.0.
+        let mapper = if nes20 {
+            u16::from(bytes[8] & 0x0F) << 8 | u16::from(flags7 & 0xF0) | u16::from(bytes[6] >> 4)
+        } else {
+            u16::from(flags7 & 0xF0 | bytes[6] >> 4)
+        };
+        let submapper = if nes20 { bytes[8] >> 4 } else { 0 };
         // ponytail: Dendy and multiple-region fall back to NTSC. Both are a
         // mixed clock this emulator has no model for; add a Region variant
         // when a Dendy game turns up.
-        let flags7 = bytes[7];
-        let nes20 = flags7 & 0x0C == 0x08;
         let plain_ines = flags7 & 0x0C == 0x00 && bytes[12..16] == [0; 4];
         let region = if nes20 {
             match bytes[12] & 0x03 {
@@ -258,10 +281,11 @@ impl Cartridge {
             2 => Board::UxRom,
             3 => Board::CnRom,
             4 => Board::Mmc3,
+            7 => Board::AxRom,
             66 => Board::GxRom,
             other => {
                 return Err(format!(
-                    "mapper {other}, only 0, 1, 2, 3, 4 and 66 are supported"
+                    "mapper {other}, only 0, 1, 2, 3, 4, 7 and 66 are supported"
                 ));
             }
         };
@@ -269,15 +293,21 @@ impl Cartridge {
         // bank is measured, and `POWER_ON_BANK % (prg_len / BANK)` would divide
         // by zero for a 16 KiB image.
         let bank = match board {
-            Board::Nrom | Board::CnRom | Board::Mmc1 | Board::Mmc3 | Board::UxRom => 0,
+            Board::Nrom
+            | Board::CnRom
+            | Board::Mmc1
+            | Board::Mmc3
+            | Board::UxRom
+            | Board::AxRom => 0,
             Board::GxRom => POWER_ON_BANK % (prg_len / BANK).max(1),
         };
         // MMC1's control register powers up at $0C: PRG mode 3, 8 KiB CHR
-        // mode, and one-screen lower nametable arrangement. GxROM is hardwired
-        // vertical. The rest follow the header bit; MMC3's `$A000` overrides it
-        // as soon as the game writes the register.
+        // mode, and one-screen lower nametable arrangement. AxROM's bank
+        // register powers up at 0, which also selects the lower nametable
+        // page. GxROM is hardwired vertical. The rest follow the header bit;
+        // MMC3's `$A000` overrides it as soon as the game writes the register.
         let mirroring = match board {
-            Board::Mmc1 => Mirroring::SingleLower,
+            Board::Mmc1 | Board::AxRom => Mirroring::SingleLower,
             Board::GxRom => Mirroring::Vertical,
             Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom if flags6 & 0x01 != 0 => {
                 Mirroring::Vertical
@@ -289,6 +319,7 @@ impl Cartridge {
             chr: bytes[start + prg_len..start + prg_len + chr_len].to_vec(),
             header,
             board,
+            submapper,
             bank,
             chr_banks: [0, 1],
             control: 0x0C,
@@ -304,8 +335,8 @@ impl Cartridge {
 
     /// Whether the CPU can reach PRG RAM right now. NROM's test images and
     /// MMC1's battery save both use the window; the standard CNROM board
-    /// modeled here, SMB and Contra do not. NROM has no register, while MMC1's
-    /// PRG register bit 4 is MMC1B's disable bit: writes with it set make
+    /// modeled here, SMB, Contra and AxROM do not. NROM has no register, while
+    /// MMC1's PRG register bit 4 is MMC1B's disable bit: writes with it set make
     /// `$6000-$7FFF` open bus until the game clears it again. MMC3's window is
     /// always enabled so MMC6 boards, which give `$A001` bit 7 a different
     /// meaning, still work under iNES.
@@ -313,7 +344,7 @@ impl Cartridge {
         match self.board {
             Board::Mmc3 => true,
             Board::Nrom | Board::Mmc1 => self.prg_ram_enabled,
-            Board::UxRom | Board::GxRom | Board::CnRom => false,
+            Board::UxRom | Board::GxRom | Board::CnRom | Board::AxRom => false,
         }
     }
 
@@ -336,6 +367,7 @@ impl Cartridge {
             Board::UxRom => 2,
             Board::CnRom => 3,
             Board::Mmc3 => 4,
+            Board::AxRom => 7,
             Board::GxRom => 66,
         }
     }
@@ -383,7 +415,7 @@ impl Cartridge {
             Board::Mmc1 => 16,
             Board::UxRom => (self.prg.len() / PRG_UNIT).max(1),
             Board::Mmc3 => 1,
-            Board::GxRom => (self.prg.len() / BANK).max(1),
+            Board::GxRom | Board::AxRom => (self.prg.len() / BANK).max(1),
         };
         if bank >= banks {
             return Err(format!(
@@ -522,14 +554,14 @@ impl Cartridge {
 
     /// The CPU's `$8000-$FFFF` window. NROM and CNROM have no PRG bank
     /// register: 16 KiB images mirror their single block, 32 KiB ones map both
-    /// halves directly, and `& (len - 1)` does both. GxROM maps one 32 KiB bank
-    /// across the whole window. UxROM maps a 16 KiB bank at `$8000-$BFFF` and
-    /// pins the last 16 KiB of the file at `$C000-$FFFF`. MMC1 follows its PRG
-    /// mode.
+    /// halves directly, and `& (len - 1)` does both. GxROM and AxROM map one
+    /// 32 KiB bank across the whole window. UxROM maps a 16 KiB bank at
+    /// `$8000-$BFFF` and pins the last 16 KiB of the file at `$C000-$FFFF`.
+    /// MMC1 follows its PRG mode.
     pub fn cpu_read(&self, addr: u16) -> u8 {
         match self.board {
             Board::Nrom | Board::CnRom => self.prg[addr as usize & (self.prg.len() - 1)],
-            Board::GxRom => self.prg[self.bank * BANK + (addr as usize - 0x8000)],
+            Board::GxRom | Board::AxRom => self.prg[self.bank * BANK + (addr as usize - 0x8000)],
             Board::UxRom if addr < 0xC000 => {
                 self.prg[self.bank * PRG_UNIT + (addr as usize - 0x8000)]
             }
@@ -597,6 +629,12 @@ impl Cartridge {
     /// 2 is conventionally emulated without bus conflicts, and Contra's bank
     /// table writes the byte already in ROM anyway.
     ///
+    /// AxROM selects one 32 KiB bank from bits 0-3 (bit 3 only on the 512 KiB
+    /// variant) and the one-screen nametable page from bit 4 on any write in
+    /// `$8000-$FFFF`. The bank counter wraps modulo the image's bank count.
+    /// Plain iNES uses the submapper-0 rule and has no bus conflicts; NES 2.0
+    /// submapper 2 ANDs the written value with the PRG byte at that address.
+    ///
     /// MMC1 receives five serial bits per register write, least significant
     /// first; bit 7 of a write resets the shift register instead.
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
@@ -635,6 +673,26 @@ impl Cartridge {
                     // select past the end wraps rather than reading out of
                     // bounds.
                     self.bank = (val as usize) % (self.prg.len() / PRG_UNIT);
+                }
+            }
+            Board::AxRom => {
+                if addr >= 0x8000 {
+                    // Register: xxxM PPPP on the 512 KiB variant; standard
+                    // boards leave bit 3 unused. The latch sees the written
+                    // value ANDed with the PRG byte at that address only on
+                    // NES 2.0 submapper 2 (AMROM), which is the only AxROM
+                    // submapper that has bus conflicts.
+                    let value = if self.submapper == 2 {
+                        val & self.cpu_read(addr)
+                    } else {
+                        val
+                    };
+                    self.bank = (value & 0x0F) as usize % (self.prg.len() / BANK).max(1);
+                    self.mirroring = if value & 0x10 != 0 {
+                        Mirroring::SingleUpper
+                    } else {
+                        Mirroring::SingleLower
+                    };
                 }
             }
             Board::Mmc3 => self.mmc3_write(addr, val),
@@ -716,8 +774,8 @@ impl Cartridge {
 /// 16-byte iNES header for a synthetic image, shared by every image builder in
 /// the crate. `mapper` is split the way iNES has it: low nibble in byte 6, high
 /// nibble in byte 7. 66 is the SMB + Duck Hunt GxROM board (vertical mirroring),
-/// 1 is MMC1 (battery, horizontal header bits), 2 is UxROM, 3 is CNROM, 0 is
-/// plain NROM.
+/// 1 is MMC1 (battery, horizontal header bits), 2 is UxROM, 3 is CNROM, 7 is
+/// AxROM, 0 is plain NROM.
 #[cfg(test)]
 pub(crate) fn ines_header(prg_banks: u8, chr_banks: u8, mapper: u8) -> [u8; 16] {
     let mut h = [0u8; 16];
@@ -781,6 +839,28 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0x22, PRG_UNIT));
         bytes.resize(bytes.len() + 4 * CHR_BANK, 0);
         Cartridge::load(&bytes).expect("synthetic CNROM image must load")
+    }
+
+    /// Raw bytes for a synthesized AxROM image: `prg_banks` 32 KiB blocks,
+    /// each filled with its own index, no CHR (the PPU gets RAM), mapper 7.
+    fn axrom_bytes(prg_banks: u8) -> Vec<u8> {
+        let mut bytes = ines_header(prg_banks * 2, 0, 7).to_vec();
+        bytes.extend((0..prg_banks).flat_map(|bank| std::iter::repeat_n(bank, BANK)));
+        bytes
+    }
+
+    fn axrom_cart(prg_banks: u8) -> Cartridge {
+        Cartridge::load(&axrom_bytes(prg_banks)).expect("synthetic AxROM image must load")
+    }
+
+    /// The same image with a NES 2.0 signature and `submapper`, and `patch`
+    /// written at `$8000` in the power-on bank so a bus conflict is observable.
+    fn axrom_nes20_cart(submapper: u8, prg_banks: u8, patch: u8) -> Cartridge {
+        let mut bytes = axrom_bytes(prg_banks);
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[8] = submapper << 4;
+        bytes[16] = patch;
+        Cartridge::load(&bytes).expect("synthetic NES 2.0 AxROM image must load")
     }
 
     /// A synthesized UxROM image: `prg_banks` 16 KiB blocks, each filled with
@@ -1135,6 +1215,155 @@ mod tests {
             .load_state(&mut StateReader::new(&bytes))
             .expect("CNROM mapper state must load");
         assert_eq!(restored.chr_map(), before, "the CHR bank must come back");
+    }
+
+    /// AxROM maps one 32 KiB bank over the whole `$8000-$FFFF` window, and the
+    /// register decodes every write in that window. A model that keeps the old
+    /// fixed top half fails the `$C000` checks.
+    #[test]
+    fn axrom_maps_one_32k_bank_across_the_whole_window() {
+        let mut c = axrom_cart(4); // 128 KiB = four 32 KiB banks
+        assert_eq!(c.mapper_id(), 7, "axrom_cart must load as mapper 7");
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000), c.cpu_read(0xFFFF)),
+            (0, 0, 0),
+            "power-on bank 0 covers the whole window"
+        );
+
+        c.cpu_write(0x8000, 2);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000), c.cpu_read(0xFFFF)),
+            (2, 2, 2),
+            "bank 2 took both halves of the window"
+        );
+
+        // The register decodes every write in $8000-$FFFF, not just $8000.
+        c.cpu_write(0xFFD0, 1);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000)),
+            (1, 1),
+            "a write in the upper half still moves the bank"
+        );
+
+        // The 74HC161 counts modulo the image's bank count.
+        c.cpu_write(0x8000, 7);
+        assert_eq!(c.cpu_read(0x8000), 3, "bank 7 wraps to bank 3 of 4");
+    }
+
+    /// Register bit 4 selects the 1 KiB VRAM page for all four nametables:
+    /// clear is the lower page, set is the upper. Bits 2-0 keep banking.
+    #[test]
+    fn axrom_register_bit_four_switches_one_screen_mirroring() {
+        let mut c = axrom_cart(4);
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::SingleLower,
+            "power-on selects the lower nametable page"
+        );
+
+        c.cpu_write(0x8000, 0x10);
+        assert_eq!(c.mirroring(), Mirroring::SingleUpper);
+        assert_eq!(c.cpu_read(0x8000), 0, "bit 4 does not move the bank");
+
+        c.cpu_write(0x8000, 0x12);
+        assert_eq!(c.mirroring(), Mirroring::SingleUpper);
+        assert_eq!(c.cpu_read(0x8000), 2, "bit 4 and bank bits share a write");
+
+        c.cpu_write(0x8000, 0x02);
+        assert_eq!(c.mirroring(), Mirroring::SingleLower);
+        assert_eq!(c.cpu_read(0x8000), 2);
+    }
+
+    /// NES 2.0 submapper 2 names an AxROM board with AND-type bus conflicts:
+    /// the latch sees the written byte ANDed with the PRG byte at that address.
+    #[test]
+    fn axrom_nes20_submapper_two_applies_and_type_bus_conflicts() {
+        // Bank 0's $8000 reads $01, so writing $03 leaves $01 and selects bank 1.
+        let mut c = axrom_nes20_cart(2, 4, 0x01);
+        c.cpu_write(0x8000, 0x03);
+        assert_eq!(
+            c.cpu_read(0x8001),
+            1,
+            "only the bit the ROM drives high survives"
+        );
+
+        // A write with no bit in common with the ROM leaves the bank alone.
+        let mut c = axrom_nes20_cart(2, 4, 0x00);
+        c.cpu_write(0x8000, 0x02);
+        assert_eq!(c.cpu_read(0x8001), 0, "AND with 0 selects bank 0");
+
+        // The mirroring bit is part of the same conflict.
+        let mut c = axrom_nes20_cart(2, 4, 0x00);
+        c.cpu_write(0x8000, 0x10);
+        assert_eq!(c.mirroring(), Mirroring::SingleLower);
+        let mut c = axrom_nes20_cart(2, 4, 0x10);
+        c.cpu_write(0x8000, 0x10);
+        assert_eq!(c.mirroring(), Mirroring::SingleUpper);
+    }
+
+    /// Submapper 0 and 1 have no bus conflicts, so the written value reaches
+    /// the register unchanged.
+    #[test]
+    fn axrom_nes20_submapper_one_has_no_bus_conflicts() {
+        let mut c = axrom_nes20_cart(1, 4, 0x00);
+        c.cpu_write(0x8000, 0x02);
+        assert_eq!(c.cpu_read(0x8001), 2, "the write selected bank 2 directly");
+        c.cpu_write(0x8000, 0x10);
+        assert_eq!(c.mirroring(), Mirroring::SingleUpper);
+    }
+
+    /// Bit 3 is the fourth bank bit on the 512 KiB AxROM variant, so a 16-bank
+    /// image must reach banks 8-15.
+    #[test]
+    fn axrom_uses_bit_three_for_the_upper_half_of_a_512k_image() {
+        let mut c = axrom_cart(16);
+        assert_eq!(c.prg.len(), 16 * BANK, "512 KiB of PRG");
+        c.cpu_write(0x8000, 0x08);
+        assert_eq!(c.cpu_read(0x8000), 8, "bit 3 selected bank 8");
+        c.cpu_write(0x8000, 0x0F);
+        assert_eq!(c.cpu_read(0x8000), 15, "all four bank bits are live");
+    }
+
+    /// AxROM has 8 KiB of CHR RAM and no PRG RAM, and its mirroring is entirely
+    /// register-controlled: the iNES header bit must not leak through.
+    #[test]
+    fn axrom_has_no_prg_ram_and_ignores_the_header_mirroring() {
+        let mut bytes = axrom_bytes(2);
+        bytes[6] |= 0x01; // header asks for vertical mirroring
+        let c = Cartridge::load(&bytes).expect("synthetic AxROM image must load");
+        assert!(!c.prg_ram_enabled(), "AxROM has no $6000-$7FFF RAM");
+        assert!(c.chr_rom().is_empty(), "no CHR bytes -> the PPU gets RAM");
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::SingleLower,
+            "the board powers up one-screen lower regardless of the header"
+        );
+    }
+
+    /// The bank and the one-screen page are mapper state: both must survive a
+    /// save and load.
+    #[test]
+    fn a_saved_axrom_state_restores_the_bank_and_mirroring() {
+        use crate::state::{StateReader, StateWriter};
+
+        let mut cart = axrom_cart(4);
+        cart.cpu_write(0x8000, 0x12); // bank 2, upper nametable
+        let before = (cart.cpu_read(0x8000), cart.mirroring());
+        assert_eq!(before, (2, Mirroring::SingleUpper));
+
+        let mut writer = StateWriter::new();
+        cart.save_state(&mut writer);
+        let bytes = writer.finish();
+
+        let mut restored = axrom_cart(4);
+        restored
+            .load_state(&mut StateReader::new(&bytes))
+            .expect("AxROM mapper state must load");
+        assert_eq!(
+            (restored.cpu_read(0x8000), restored.mirroring()),
+            before,
+            "the bank and nametable page must come back"
+        );
     }
 
     /// The real test suites must load: apu_reset is NROM-256 with 8 KiB CHR,

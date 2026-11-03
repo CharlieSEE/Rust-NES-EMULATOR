@@ -1,6 +1,6 @@
 # Feature backlog
 
-Current state: mappers 0/1/2/3/4/66, cycle-based PPU with scanline IRQ support in
+Current state: mappers 0/1/2/3/4/7/66, cycle-based PPU with scanline IRQ support in
 the cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
 serialization with quicksave slots and an in-game slot picker, launcher,
 scripted input and frame dumps.
@@ -21,7 +21,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Mapper 185 (CNROM variant)** — 8 KiB CHR gated by chip-select bits; needs the correct submapper value or the first-two-reads heuristic. *Effort: S; issue #57.*
 - [ ] **CNROM NES 2.0 submappers** — submapper 1 disables bus conflicts; parse the NES 2.0 mapper/submapper fields. *Effort: S; issue #55; depends on NES 2.0 header support.*
 - [ ] **CNROM Namcot PRG RAM** — 2 KiB at `$6000-$7FFF`, mirrored three times, for Hayauchi Super Igo. *Effort: S; issue #56.*
-- [ ] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Effort: S.*
+- [x] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Done; 32 KiB PRG bank from bits 0-3 (512 KiB variant included), one-screen page from bit 4, CHR RAM, NES 2.0 submapper 2 bus conflicts, bank and mirroring in save states.*
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
 - [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
 - [x] **Unofficial CPU opcodes** — `cpu.rs` panicked on undocumented opcodes. Implemented the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants) with their addressing modes and cycle counts, plus `$EB` as SBC so the complete nestest golden log runs. *Done.*
