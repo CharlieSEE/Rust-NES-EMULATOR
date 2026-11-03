@@ -25,7 +25,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
 - [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
 - [x] **Unofficial CPU opcodes** — `cpu.rs` panicked on undocumented opcodes. Implemented the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants) with their addressing modes and cycle counts, plus `$EB` as SBC so the complete nestest golden log runs. *Done.*
-- [ ] **Unstable CPU opcodes** — JAM, XAA, SHA, SHX, SHY, TAS, LAS and LXA still panic. Add only when a specific game needs one. *Effort: S.*
+- [ ] **Unstable CPU opcodes** — JAM, XAA, SHA, SHX, SHY, TAS, LAS and LXA still panic. Add only when a specific game needs one. *Effort: S; issue #59.*
 - [x] **DMC channel** — `$4010–$4013` registers, sample fetching through the CPU bus, 3/4-cycle DMA stalls, controller-read corruption, output level, sample-end IRQ, and `$4015` status bits. *Done.*
 - [x] **PAL support** — 50 Hz timing (312 scanlines, 5:16 CPU:PPU dots), 2A07 APU clock, noise and frame-counter tables, 2C07 palette, and region detection from NES 2.0 byte 12 or iNES flags 9/10. Dendy and dual-region headers fall back to NTSC. *Done.*
 - [ ] **NES 2.0 header support** — parse console type, mapper/submapper, PRG/CHR size exponents, RAM sizes. *Effort: S.*
@@ -39,7 +39,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [x] **Save-state slot picker** — in-game list of slots 1–9 with timestamps and a compatibility check, then load or cancel. Needs a text overlay over the frame. *Done; `F7` lists slots with their age and compatibility, Up/Down choose, Enter loads, Esc cancels.*
 - [x] **Save-state status messages** — brief confirmation of the saved slot and on-screen text for load and write failures; the same failures stay in stderr and `nes-errors.log`. *Done; the overlay is reusable by the slot picker.*
 - [ ] **Auto-save state on quit** — write a reserved slot on a clean exit so a session can resume without pressing a digit. *Effort: S.*
-- [ ] **Unpause after quickload** — loading while paused leaves the pre-load frame on screen until the next frame runs. *Effort: S.*
+- [x] **Unpause after quickload** — loading while paused leaves the pre-load frame on screen until the next frame runs. *Done; a load unpauses and restarts audio so the restored frame renders immediately.*
 - [ ] **Rewind** — ring buffer of compressed save states sampled every N frames. *Effort: M, after save states.*
 - [ ] **Fast-forward** — hold-to-turbo, with audio muted or pitch-shifted. *Effort: S.*
 - [ ] **Frame advance** — pause plus single-frame stepping. *Effort: S.*
