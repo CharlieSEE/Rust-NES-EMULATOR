@@ -1,6 +1,6 @@
 # Feature backlog
 
-Current state: mappers 0/1/2/3/4/7/66, cycle-based PPU with scanline IRQ support in
+Current state: mappers 0/1/2/3/4/7/66/71, cycle-based PPU with scanline IRQ support in
 the cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
 serialization with quicksave slots and an in-game slot picker, launcher,
 scripted input and frame dumps.
@@ -23,7 +23,8 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **CNROM Namcot PRG RAM** — 2 KiB at `$6000-$7FFF`, mirrored three times, for Hayauchi Super Igo. *Effort: S; issue #56.*
 - [x] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Done; 32 KiB PRG bank from bits 0-3 (512 KiB variant included), one-screen page from bit 4, CHR RAM, NES 2.0 submapper 2 bus conflicts, bank and mirroring in save states.*
 - [ ] **Mapper 9/10 (MMC2/MMC4)** — Punch-Out!! and Fire Emblem class boards, latch-based CHR switching. *Effort: M.*
-- [ ] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Effort: S.*
+- [x] **Mapper 71 (Camerica/Codemasters)** — simple UxROM variant used by many unlicensed games. *Done; 16 KiB PRG banking from bits 0-3 in `$C000-$FFFF`, fixed last bank, CHR RAM, no bus conflicts, Fire Hawk's `$9000-$9FFF` one-screen mirroring, bank and mirroring in save states.*
+- [ ] **Fantastic Adventures of Dizzy (mapper 71)** — the 256 KiB US and Aladdin images render garbage or execute into RAM; the Europe image hits a JAM opcode. Four other Camerica titles work, so investigate the core CPU/PPU rather than banking. *Effort: M; issue #61.*
 - [x] **Unofficial CPU opcodes** — `cpu.rs` panicked on undocumented opcodes. Implemented the stable illegal-opcode set (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS, and the NOP variants) with their addressing modes and cycle counts, plus `$EB` as SBC so the complete nestest golden log runs. *Done.*
 - [ ] **Unstable CPU opcodes** — JAM, XAA, SHA, SHX, SHY, TAS, LAS and LXA still panic. Add only when a specific game needs one. *Effort: S; issue #59.*
 - [x] **DMC channel** — `$4010–$4013` registers, sample fetching through the CPU bus, 3/4-cycle DMA stalls, controller-read corruption, output level, sample-end IRQ, and `$4015` status bits. *Done.*

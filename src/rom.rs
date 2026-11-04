@@ -1,8 +1,9 @@
 //! iNES loader for the boards this emulator knows: mapper 1 (MMC1) for
 //! "Legend of Zelda", mapper 2 (UxROM) for "Contra", mapper 3 (CNROM) for its
 //! large library, mapper 4 (MMC3) for the TxROM library, mapper 7 (AxROM) for
-//! "Battletoads" and its siblings, mapper 66 (UxROM variant with bus conflicts)
-//! for "Super Mario Bros. + Duck Hunt", and mapper 0 (NROM) for blargg's APU
+//! "Battletoads" and its siblings, mapper 71 (Camerica/Codemasters) for its
+//! unlicensed library, mapper 66 (UxROM variant with bus conflicts) for
+//! "Super Mario Bros. + Duck Hunt", and mapper 0 (NROM) for blargg's APU
 //! test ROMs -- NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM the
 //! tests need, and the 2005 suite with no CHR at all (the PPU gets RAM instead).
 //!
@@ -50,6 +51,13 @@
 //! follows NES 2.0 submapper 0's guidance and does not emulate bus conflicts;
 //! NES 2.0 submapper 2 (AMROM) asks for AND-type conflicts, and that one is
 //! honoured. The ANROM and AN1ROM boards have none.
+//!
+//! Mapper 71 is Camerica/Codemasters: UxROM's 16 KiB low window and fixed last
+//! bank, but the bank register is `xxxx PPPP` at `$C000-$FFFF` only, with no
+//! bus conflicts. The boards carry CHR RAM and no PRG RAM. Ordinary boards
+//! hardwire mirroring from the header; Fire Hawk's BF9097 wires a one-screen
+//! latch to `$9000-$9FFF` bit 4 (NES 2.0 submapper 1). Plain iNES cannot name
+//! that board, so the address alone selects it, as other emulators do.
 //!
 //! The SMB + Duck Hunt iNES header is honest about that cartridge: its `chr=2`
 //! really is 16 KiB of tile data, its `prg=4` really is 64 KiB, and its
@@ -151,8 +159,9 @@ pub struct Cartridge {
     submapper: u8,
     /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
     /// `$8000-$FFFF` on GxROM and AxROM, a 16 KiB bank at `$8000-$BFFF` on
-    /// UxROM, and MMC1's PRG register in 16 KiB units whose meaning follows
-    /// `control`. NROM and CNROM have no PRG bank register, so it stays 0.
+    /// UxROM and Camerica, and MMC1's PRG register in 16 KiB units whose
+    /// meaning follows `control`. NROM and CNROM have no PRG bank register, so
+    /// it stays 0.
     bank: usize,
     /// The two 4 KiB CHR banks the board maps at `$0000-$0FFF` and
     /// `$1000-$1FFF`. GxROM's and CNROM's 8 KiB value fills both; MMC1 selects
@@ -180,7 +189,7 @@ pub struct Cartridge {
     region: Region,
 }
 
-/// The seven boards this emulator knows how to read.
+/// The eight boards this emulator knows how to read.
 #[derive(Clone, Copy)]
 enum Board {
     /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
@@ -197,6 +206,9 @@ enum Board {
     /// UxROM, the Contra board: 16 KiB switchable low window, last 16 KiB
     /// fixed high window, and no CHR banking.
     UxRom,
+    /// Camerica/Codemasters, mapper 71: UxROM banking with the register in
+    /// `$C000-$FFFF` only, plus Fire Hawk's `$9000-$9FFF` mirroring latch.
+    Camerica,
     /// AxROM, the Battletoads board: one 32 KiB bank over the whole PRG
     /// window, one-screen mirroring selected by the same register, CHR RAM.
     AxRom,
@@ -283,9 +295,10 @@ impl Cartridge {
             4 => Board::Mmc3,
             7 => Board::AxRom,
             66 => Board::GxRom,
+            71 => Board::Camerica,
             other => {
                 return Err(format!(
-                    "mapper {other}, only 0, 1, 2, 3, 4, 7 and 66 are supported"
+                    "mapper {other}, only 0, 1, 2, 3, 4, 7, 66 and 71 are supported"
                 ));
             }
         };
@@ -298,6 +311,7 @@ impl Cartridge {
             | Board::Mmc1
             | Board::Mmc3
             | Board::UxRom
+            | Board::Camerica
             | Board::AxRom => 0,
             Board::GxRom => POWER_ON_BANK % (prg_len / BANK).max(1),
         };
@@ -309,10 +323,14 @@ impl Cartridge {
         let mirroring = match board {
             Board::Mmc1 | Board::AxRom => Mirroring::SingleLower,
             Board::GxRom => Mirroring::Vertical,
-            Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom if flags6 & 0x01 != 0 => {
+            Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom | Board::Camerica
+                if flags6 & 0x01 != 0 =>
+            {
                 Mirroring::Vertical
             }
-            Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom => Mirroring::Horizontal,
+            Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom | Board::Camerica => {
+                Mirroring::Horizontal
+            }
         };
         Ok(Cartridge {
             prg: bytes[start..start + prg_len].to_vec(),
@@ -344,7 +362,7 @@ impl Cartridge {
         match self.board {
             Board::Mmc3 => true,
             Board::Nrom | Board::Mmc1 => self.prg_ram_enabled,
-            Board::UxRom | Board::GxRom | Board::CnRom | Board::AxRom => false,
+            Board::UxRom | Board::Camerica | Board::GxRom | Board::CnRom | Board::AxRom => false,
         }
     }
 
@@ -369,6 +387,7 @@ impl Cartridge {
             Board::Mmc3 => 4,
             Board::AxRom => 7,
             Board::GxRom => 66,
+            Board::Camerica => 71,
         }
     }
 
@@ -413,7 +432,7 @@ impl Cartridge {
             // MMC1's PRG register is four bits, and a value past the ROM's
             // count wraps in `mmc1_prg_banks`, exactly as on hardware.
             Board::Mmc1 => 16,
-            Board::UxRom => (self.prg.len() / PRG_UNIT).max(1),
+            Board::UxRom | Board::Camerica => (self.prg.len() / PRG_UNIT).max(1),
             Board::Mmc3 => 1,
             Board::GxRom | Board::AxRom => (self.prg.len() / BANK).max(1),
         };
@@ -555,17 +574,19 @@ impl Cartridge {
     /// The CPU's `$8000-$FFFF` window. NROM and CNROM have no PRG bank
     /// register: 16 KiB images mirror their single block, 32 KiB ones map both
     /// halves directly, and `& (len - 1)` does both. GxROM and AxROM map one
-    /// 32 KiB bank across the whole window. UxROM maps a 16 KiB bank at
-    /// `$8000-$BFFF` and pins the last 16 KiB of the file at `$C000-$FFFF`.
-    /// MMC1 follows its PRG mode.
+    /// 32 KiB bank across the whole window. UxROM and Camerica map a 16 KiB
+    /// bank at `$8000-$BFFF` and pin the last 16 KiB of the file at
+    /// `$C000-$FFFF`. MMC1 follows its PRG mode.
     pub fn cpu_read(&self, addr: u16) -> u8 {
         match self.board {
             Board::Nrom | Board::CnRom => self.prg[addr as usize & (self.prg.len() - 1)],
             Board::GxRom | Board::AxRom => self.prg[self.bank * BANK + (addr as usize - 0x8000)],
-            Board::UxRom if addr < 0xC000 => {
+            Board::UxRom | Board::Camerica if addr < 0xC000 => {
                 self.prg[self.bank * PRG_UNIT + (addr as usize - 0x8000)]
             }
-            Board::UxRom => self.prg[self.prg.len() - PRG_UNIT + (addr as usize - 0xC000)],
+            Board::UxRom | Board::Camerica => {
+                self.prg[self.prg.len() - PRG_UNIT + (addr as usize - 0xC000)]
+            }
             Board::Mmc1 => {
                 let (low, high) = self.mmc1_prg_banks();
                 let bank = if addr < 0xC000 { low } else { high };
@@ -635,6 +656,11 @@ impl Cartridge {
     /// Plain iNES uses the submapper-0 rule and has no bus conflicts; NES 2.0
     /// submapper 2 ANDs the written value with the PRG byte at that address.
     ///
+    /// Camerica's bank register is `xxxx PPPP` at `$C000-$FFFF` only, with no
+    /// bus conflicts; the last 16 KiB stays fixed. Fire Hawk's mirroring latch
+    /// is at `$9000-$9FFF`, bit 4 for the one-screen page. Writes elsewhere in
+    /// the PRG window change nothing.
+    ///
     /// MMC1 receives five serial bits per register write, least significant
     /// first; bit 7 of a write resets the shift register instead.
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
@@ -673,6 +699,26 @@ impl Cartridge {
                     // select past the end wraps rather than reading out of
                     // bounds.
                     self.bank = (val as usize) % (self.prg.len() / PRG_UNIT);
+                }
+            }
+            Board::Camerica => {
+                // BF9093/9097: bank select is `xxxx PPPP` in `$C000-$FFFF`
+                // only, with no bus conflicts. The low window moves; the last
+                // 16 KiB stays fixed. Writes to `$8000` on startup (Micro
+                // Machines, Ultimate Stuntman) must not bank.
+                if addr >= 0xC000 {
+                    self.bank = (val & 0x0F) as usize % (self.prg.len() / PRG_UNIT);
+                }
+                // Fire Hawk's BF9097 decodes the mirroring latch at
+                // `$9000-$9FFF`; the board is NES 2.0 submapper 1. Old iNES
+                // dumps cannot name the board, so the address alone is the
+                // heuristic other emulators use.
+                if (0x9000..0xA000).contains(&addr) {
+                    self.mirroring = if val & 0x10 != 0 {
+                        Mirroring::SingleUpper
+                    } else {
+                        Mirroring::SingleLower
+                    };
                 }
             }
             Board::AxRom => {
@@ -775,7 +821,7 @@ impl Cartridge {
 /// the crate. `mapper` is split the way iNES has it: low nibble in byte 6, high
 /// nibble in byte 7. 66 is the SMB + Duck Hunt GxROM board (vertical mirroring),
 /// 1 is MMC1 (battery, horizontal header bits), 2 is UxROM, 3 is CNROM, 7 is
-/// AxROM, 0 is plain NROM.
+/// AxROM, 71 is Camerica, 0 is plain NROM.
 #[cfg(test)]
 pub(crate) fn ines_header(prg_banks: u8, chr_banks: u8, mapper: u8) -> [u8; 16] {
     let mut h = [0u8; 16];
@@ -871,6 +917,20 @@ mod tests {
             bytes.extend(std::iter::repeat_n(bank, PRG_UNIT));
         }
         Cartridge::load(&bytes).expect("synthetic UxROM image must load")
+    }
+
+    /// Raw bytes for a synthesized Camerica image: `prg_banks` 16 KiB blocks,
+    /// each filled with its own index, no CHR (the PPU gets RAM), mapper 71.
+    fn camerica_bytes(prg_banks: u8) -> Vec<u8> {
+        let mut bytes = ines_header(prg_banks, 0, 71).to_vec();
+        for bank in 0..prg_banks {
+            bytes.extend(std::iter::repeat_n(bank, PRG_UNIT));
+        }
+        bytes
+    }
+
+    fn camerica_cart(prg_banks: u8) -> Cartridge {
+        Cartridge::load(&camerica_bytes(prg_banks)).expect("synthetic Camerica image must load")
     }
 
     /// The real Contra cartridge, or `None` when it is not on disk.
@@ -1072,6 +1132,91 @@ mod tests {
         c.cpu_write(0xFFD3, 3);
         assert_eq!(c.cpu_read(0x8000), 3, "bank 3 is mapped low");
         assert_eq!(c.cpu_read(0xC000), 7, "the fixed bank did not move");
+    }
+
+    /// Mapper 71 is UxROM with the bank register in `$C000-$FFFF` only. Games
+    /// like Micro Machines write `$8000` at startup, and that write must not
+    /// move the bank. The low window switches and the last bank stays fixed.
+    #[test]
+    fn camerica_banks_only_from_the_upper_window_and_keeps_the_last_bank_fixed() {
+        let mut c = camerica_cart(8);
+        assert_eq!(c.mapper_id(), 71, "camerica_cart must load as mapper 71");
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xBFFF), c.cpu_read(0xC000)),
+            (0, 0, 7),
+            "power-on bank 0 low, last bank fixed high"
+        );
+        assert!(!c.prg_ram_enabled(), "mapper 71 has no $6000-$7FFF RAM");
+        assert!(c.chr_rom().is_empty(), "no CHR bytes -> the PPU gets RAM");
+
+        c.cpu_write(0x8000, 2);
+        assert_eq!(c.cpu_read(0x8000), 0, "$8000 is not the bank register");
+
+        c.cpu_write(0xC000, 2);
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xBFFF), c.cpu_read(0xC000)),
+            (2, 2, 7),
+            "the register moves only the low window"
+        );
+
+        c.cpu_write(0xFFD0, 1);
+        assert_eq!(c.cpu_read(0x8000), 1, "$FFD0 is in the register window");
+
+        c.cpu_write(0xC000, 0x1F);
+        assert_eq!(c.cpu_read(0x8000), 7, "bank 15 wraps to bank 7 of 8");
+    }
+
+    /// The header fixes ordinary mapper 71 mirroring, and the Fire Hawk board
+    /// (NES 2.0 submapper 1, and the same `$9000` heuristic for plain iNES)
+    /// switches one-screen mirroring with bit 4. Only `$9000-$9FFF` is the
+    /// mirroring register; `$8000` is not.
+    #[test]
+    fn camerica_fire_hawk_writes_switch_one_screen_mirroring() {
+        let mut bytes = camerica_bytes(8);
+        bytes[6] |= 0x01; // header asks for vertical mirroring
+        let mut c = Cartridge::load(&bytes).expect("synthetic Camerica image must load");
+        assert_eq!(c.mirroring(), Mirroring::Vertical, "header mirroring");
+
+        c.cpu_write(0x9000, 0x10);
+        assert_eq!(c.mirroring(), Mirroring::SingleUpper);
+        assert_eq!(c.cpu_read(0x8000), 0, "the write did not select a bank");
+
+        c.cpu_write(0x9000, 0x00);
+        assert_eq!(c.mirroring(), Mirroring::SingleLower);
+
+        c.cpu_write(0x8000, 0x10);
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::SingleLower,
+            "only $9000-$9FFF controls mirroring"
+        );
+    }
+
+    /// The bank and the one-screen page are mapper state: both must survive a
+    /// save and load.
+    #[test]
+    fn a_saved_camerica_state_restores_the_bank_and_mirroring() {
+        use crate::state::{StateReader, StateWriter};
+
+        let mut cart = camerica_cart(8);
+        cart.cpu_write(0xC000, 3);
+        cart.cpu_write(0x9000, 0x10);
+        let before = (cart.cpu_read(0x8000), cart.mirroring());
+        assert_eq!(before, (3, Mirroring::SingleUpper));
+
+        let mut writer = StateWriter::new();
+        cart.save_state(&mut writer);
+        let bytes = writer.finish();
+
+        let mut restored = camerica_cart(8);
+        restored
+            .load_state(&mut StateReader::new(&bytes))
+            .expect("mapper 71 state must load");
+        assert_eq!(
+            (restored.cpu_read(0x8000), restored.mirroring()),
+            before,
+            "the bank and nametable page must come back"
+        );
     }
 
     /// NROM-128 (16 KiB PRG) mirrors the single block across the whole
