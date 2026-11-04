@@ -56,8 +56,9 @@
 //! bank, but the bank register is `xxxx PPPP` at `$C000-$FFFF` only, with no
 //! bus conflicts. The boards carry CHR RAM and no PRG RAM. Ordinary boards
 //! hardwire mirroring from the header; Fire Hawk's BF9097 wires a one-screen
-//! latch to `$9000-$9FFF` bit 4 (NES 2.0 submapper 1). Plain iNES cannot name
-//! that board, so the address alone selects it, as other emulators do.
+//! latch over `$8000-$9FFF` bit 4 (NES 2.0 submapper 1). Plain iNES cannot name
+//! that board, so the `$9000-$9FFF` subset is the heuristic other emulators
+//! use. NES 2.0 submapper 0 keeps the header's fixed mirroring.
 //!
 //! The SMB + Duck Hunt iNES header is honest about that cartridge: its `chr=2`
 //! really is 16 KiB of tile data, its `prg=4` really is 64 KiB, and its
@@ -207,7 +208,7 @@ enum Board {
     /// fixed high window, and no CHR banking.
     UxRom,
     /// Camerica/Codemasters, mapper 71: UxROM banking with the register in
-    /// `$C000-$FFFF` only, plus Fire Hawk's `$9000-$9FFF` mirroring latch.
+    /// `$C000-$FFFF` only, plus Fire Hawk's mirroring latch.
     Camerica,
     /// AxROM, the Battletoads board: one 32 KiB bank over the whole PRG
     /// window, one-screen mirroring selected by the same register, CHR RAM.
@@ -658,8 +659,10 @@ impl Cartridge {
     ///
     /// Camerica's bank register is `xxxx PPPP` at `$C000-$FFFF` only, with no
     /// bus conflicts; the last 16 KiB stays fixed. Fire Hawk's mirroring latch
-    /// is at `$9000-$9FFF`, bit 4 for the one-screen page. Writes elsewhere in
-    /// the PRG window change nothing.
+    /// covers `$8000-$9FFF` for NES 2.0 submapper 1 and `$9000-$9FFF` for the
+    /// plain-iNES heuristic, bit 4 for the one-screen page. Submapper 0 keeps
+    /// the header mirroring, so writes elsewhere in the PRG window change
+    /// nothing.
     ///
     /// MMC1 receives five serial bits per register write, least significant
     /// first; bit 7 of a write resets the shift register instead.
@@ -709,11 +712,19 @@ impl Cartridge {
                 if addr >= 0xC000 {
                     self.bank = (val & 0x0F) as usize % (self.prg.len() / PRG_UNIT);
                 }
-                // Fire Hawk's BF9097 decodes the mirroring latch at
-                // `$9000-$9FFF`; the board is NES 2.0 submapper 1. Old iNES
-                // dumps cannot name the board, so the address alone is the
-                // heuristic other emulators use.
-                if (0x9000..0xA000).contains(&addr) {
+                // Fire Hawk's BF9097 decodes the mirroring latch over
+                // `$8000-$9FFF`; NES 2.0 submapper 1 names the board. Old iNES
+                // dumps cannot, so the `$9000-$9FFF` subset is the heuristic
+                // other emulators use. Submapper 0 boards keep the header's
+                // fixed mirroring, and their startup `$8000` writes must not
+                // change it.
+                let nes20 = self.header[7] & 0x0C == 0x08;
+                let fire_hawk_write = if nes20 {
+                    self.submapper == 1 && (0x8000..0xA000).contains(&addr)
+                } else {
+                    (0x9000..0xA000).contains(&addr)
+                };
+                if fire_hawk_write {
                     self.mirroring = if val & 0x10 != 0 {
                         Mirroring::SingleUpper
                     } else {
@@ -931,6 +942,14 @@ mod tests {
 
     fn camerica_cart(prg_banks: u8) -> Cartridge {
         Cartridge::load(&camerica_bytes(prg_banks)).expect("synthetic Camerica image must load")
+    }
+
+    /// The same image with a NES 2.0 header naming a mapper 71 submapper.
+    fn camerica_nes20_bytes(prg_banks: u8, submapper: u8) -> Vec<u8> {
+        let mut bytes = camerica_bytes(prg_banks);
+        bytes[7] |= 0x08;
+        bytes[8] = submapper << 4;
+        bytes
     }
 
     /// The real Contra cartridge, or `None` when it is not on disk.
@@ -1177,9 +1196,12 @@ mod tests {
         let mut c = Cartridge::load(&bytes).expect("synthetic Camerica image must load");
         assert_eq!(c.mirroring(), Mirroring::Vertical, "header mirroring");
 
-        c.cpu_write(0x9000, 0x10);
+        c.cpu_write(0xC000, 3);
+        assert_eq!(c.cpu_read(0x8000), 3, "bank 3 selected for the latch check");
+
+        c.cpu_write(0x9000, 0x12);
         assert_eq!(c.mirroring(), Mirroring::SingleUpper);
-        assert_eq!(c.cpu_read(0x8000), 0, "the write did not select a bank");
+        assert_eq!(c.cpu_read(0x8000), 3, "the write did not select a bank");
 
         c.cpu_write(0x9000, 0x00);
         assert_eq!(c.mirroring(), Mirroring::SingleLower);
@@ -1189,6 +1211,49 @@ mod tests {
             c.mirroring(),
             Mirroring::SingleLower,
             "only $9000-$9FFF controls mirroring"
+        );
+    }
+
+    /// NES 2.0 submapper 0 is the hardwired-mirroring board: neither `$8000`
+    /// nor `$9000` is a mirroring register, so the header wins.
+    #[test]
+    fn camerica_nes20_submapper_zero_keeps_header_mirroring() {
+        let mut bytes = camerica_nes20_bytes(8, 0);
+        bytes[6] |= 0x01;
+        let mut c = Cartridge::load(&bytes).expect("synthetic Camerica image must load");
+        c.cpu_write(0xC000, 3);
+
+        c.cpu_write(0x9000, 0x12);
+        c.cpu_write(0x8000, 0x12);
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::Vertical,
+            "submapper 0 ignores both addresses"
+        );
+        assert_eq!(c.cpu_read(0x8000), 3, "neither write banks on submapper 0");
+    }
+
+    /// NES 2.0 submapper 1 is Fire Hawk: its latch spans `$8000-$9FFF`, while
+    /// the bank register stays in `$C000-$FFFF`.
+    #[test]
+    fn camerica_nes20_fire_hawk_uses_the_full_8000_9fff_latch() {
+        let mut c = Cartridge::load(&camerica_nes20_bytes(8, 1))
+            .expect("synthetic Camerica image must load");
+        c.cpu_write(0xC000, 3);
+        assert_eq!(c.cpu_read(0x8000), 3);
+
+        c.cpu_write(0x8000, 0x10);
+        assert_eq!(c.mirroring(), Mirroring::SingleUpper);
+        assert_eq!(c.cpu_read(0x8000), 3, "the latch write did not bank");
+
+        c.cpu_write(0x9FFF, 0x00);
+        assert_eq!(c.mirroring(), Mirroring::SingleLower);
+
+        c.cpu_write(0xA000, 0x10);
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::SingleLower,
+            "$A000 is outside the latch"
         );
     }
 
