@@ -104,6 +104,13 @@ pub struct Bus {
     /// The cycle count `Cpu::step` announced for the instruction in progress,
     /// or 0 when the bus has not been told (a DMA's reads, a test).
     instr_cycles: u8,
+    /// A PPU-register write held for the store's last cycle. `Cpu::step`
+    /// performs the access before ticking the instruction, but the 6502 puts
+    /// `/WE` on the bus only on that final cycle; games time mid-frame mask
+    /// and scroll changes against exactly that dot.
+    pending_ppu_write: Option<(u16, u8)>,
+    /// Bus ticks (`Cpu::step`'s clock) still owed before the held write lands.
+    ppu_write_delay: u8,
     /// The APU's frame interrupt line, and the same line one CPU cycle ago: the
     /// CPU samples `/IRQ` during the penultimate cycle of an instruction, which
     /// is what blargg's `08.irq_timing` measures, so `run_frame` asks about the
@@ -133,6 +140,8 @@ impl Bus {
             in_instruction: false,
             apu_skip: 0,
             instr_cycles: 0,
+            pending_ppu_write: None,
+            ppu_write_delay: 0,
             irq_line: false,
             irq_line_delayed: false,
         };
@@ -172,6 +181,8 @@ impl Bus {
         self.in_instruction = false;
         self.apu_skip = 0;
         self.instr_cycles = 0;
+        self.pending_ppu_write = None;
+        self.ppu_write_delay = 0;
         self.irq_line = false;
         self.irq_line_delayed = false;
     }
@@ -280,7 +291,21 @@ impl Bus {
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
         match addr {
             0x0000..=0x1FFF => self.cpu_ram[addr as usize & 0x07FF] = val,
-            0x2000..=0x3FFF => self.ppu.cpu_write(addr, val),
+            0x2000..=0x3FFF => {
+                // A store's register write happens on its last cycle, not
+                // before any of them. Hold it until then so a mid-scanline
+                // `$2001`/`$2006` write lands on the dot hardware puts it on.
+                if self.instr_cycles > 1 {
+                    debug_assert!(
+                        self.pending_ppu_write.is_none(),
+                        "one instruction cannot write two PPU registers"
+                    );
+                    self.pending_ppu_write = Some((addr, val));
+                    self.ppu_write_delay = (self.instr_cycles - 1) * 3;
+                } else {
+                    self.ppu.cpu_write(addr, val);
+                }
+            }
             0x4014 => self.oam_dma(val),
             // `$4000-$4013` are the APU's channels (`$4010-$4013` the DMC) and
             // `$4015`/`$4017` its status and frame counter.
@@ -505,6 +530,14 @@ impl Bus {
                 self.ppu.tick();
                 if self.ppu.take_a12_rise() {
                     self.cart.clock_irq();
+                }
+            }
+        }
+        if self.ppu_write_delay > 0 {
+            self.ppu_write_delay -= 1;
+            if self.ppu_write_delay == 0 {
+                if let Some((addr, val)) = self.pending_ppu_write.take() {
+                    self.ppu.cpu_write(addr, val);
                 }
             }
         }
@@ -1046,6 +1079,52 @@ mod tests {
             0x21,
             "$2006/$2007 writes never reached the PPU"
         );
+    }
+
+    /// A store to a PPU register belongs on the store's last cycle, not on the
+    /// first: `Cpu::step` performs the access before ticking the instruction,
+    /// but the 6502 drives `/WE` on that final cycle. Enabling rendering just
+    /// before dot 256 therefore must not enable it for dot 256 itself. Dizzy
+    /// the Adventurer writes `$2001` around that dot while setting up its
+    /// playfield split; landing one cycle early makes the PPU increment Y on
+    /// some frames and not others, shaking the picture by one pixel.
+    #[test]
+    fn a_ppu_register_write_lands_on_the_stores_last_cycle() {
+        let mut b = Bus::new(blank_cart());
+        // Ppu starts at (261, 0); this is (41, 254), with rendering off so the
+        // ticks do not move `v`.
+        for _ in 0..14_576 {
+            b.tick();
+        }
+        assert_eq!(b.ppu.position_for_test(), (41, 254));
+
+        // t = v = $0080: coarse Y 4, fine Y 0.
+        b.ppu.cpu_write(0x2006, 0x00);
+        b.ppu.cpu_write(0x2006, 0x80);
+
+        // A four-cycle store writes on cycle 4, at dot 263. Its dot 256 has
+        // already passed with rendering still off, so `v` must not increment.
+        b.instruction_cycles(4);
+        b.cpu_write(0x2001, 0x1E);
+        for _ in 0..12 {
+            b.tick();
+        }
+        assert_eq!(b.ppu.position_for_test(), (41, 266));
+        assert_eq!(
+            b.ppu.vram_addr(),
+            0x0080,
+            "the $2001 write took effect before dot 256 and incremented Y"
+        );
+        b.instruction_cycles(0);
+
+        // It did take effect, though: the next line's dot 256 increments Y.
+        // (Background fetches have also stepped coarse X, so compare only the
+        // vertical bits.)
+        while b.ppu.position_for_test() != (42, 256) {
+            b.tick();
+        }
+        b.tick();
+        assert_eq!(b.ppu.vram_addr() & 0x7BE0, 0x1080);
     }
 
     /// CHR RAM: when the cartridge carries no CHR bytes, pattern writes

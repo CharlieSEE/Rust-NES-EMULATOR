@@ -988,6 +988,11 @@ impl Ppu {
         self.frame_done
     }
 
+    #[cfg(test)]
+    pub(crate) fn position_for_test(&self) -> (u32, u32) {
+        (self.scanline, self.dot)
+    }
+
     /// Consume the filtered A12 rising edge, if one is pending. MMC3 uses
     /// exactly these edges; a synthetic once-per-line pulse would miss boards
     /// that run the background from `$1000` and sprites from `$0000`, and would
@@ -1305,7 +1310,7 @@ impl Ppu {
         self.status = val;
     }
 
-    fn vram_addr(&self) -> u16 {
+    pub(crate) fn vram_addr(&self) -> u16 {
         self.v
     }
 
