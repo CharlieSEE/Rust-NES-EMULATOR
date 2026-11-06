@@ -1053,6 +1053,7 @@ impl Ppu {
     pub fn cpu_write(&mut self, addr: u16, val: u8) {
         match addr & 7 {
             0 => {
+                let nmi_was_enabled = self.ctrl & 0x80 != 0;
                 self.ctrl = val;
                 // "$2000 (PPUCTRL) write: t: ...GH.. ........ <- d: ......GH".
                 // Nothing else in `t` moves, and SMB does write $2000 mid-frame
@@ -1060,8 +1061,11 @@ impl Ppu {
                 // the scroll here would lose it.
                 self.t = (self.t & !0x0C00) | ((val as u16 & 0x03) << 10);
                 // "Changing NMI enable from 0 to 1 while the vblank flag in
-                // PPUSTATUS is 1 will immediately trigger an NMI."
-                if val & 0x80 != 0 && self.status & 0x80 != 0 {
+                // PPUSTATUS is 1 will immediately trigger an NMI." Only the
+                // edge counts: rewriting 1 as 1 is a no-op. Games that rewrite
+                // $2000 inside their NMI handler would otherwise re-enter
+                // vblank for as long as the flag stays up.
+                if !nmi_was_enabled && val & 0x80 != 0 && self.status & 0x80 != 0 {
                     self.nmi = true;
                 }
             }
@@ -1301,8 +1305,12 @@ impl Ppu {
         self.status = val;
     }
 
-    fn vram_addr(&self) -> u16 {
+    pub(crate) fn vram_addr(&self) -> u16 {
         self.v
+    }
+
+    pub(crate) fn position_for_test(&self) -> (u32, u32) {
+        (self.scanline, self.dot)
     }
 
     /// The temporary address register `t`, where `$2005` and `$2006` park the
@@ -2390,6 +2398,35 @@ mod tests {
                 "$2000 = {ctrl:#04X}: vblank raised the NMI anyway"
             );
         }
+    }
+
+    /// Rewriting `$2000` with NMI already enabled must not retrigger the NMI;
+    /// hardware only reacts to the 0-to-1 edge. Dizzy the Adventurer rewrites
+    /// `$2000` inside its own NMI handler, and treating 1-to-1 as an edge feeds
+    /// it NMIs for the rest of vblank.
+    #[test]
+    fn rewriting_2000_with_nmi_already_enabled_does_not_retrigger() {
+        let mut p = Ppu::new();
+        p.cpu_write(0x2000, 0x80);
+        p.cpu_write(0x2001, 0x00); // rendering off: a full 89342-dot frame
+        while !p.frame_ready() {
+            p.tick();
+        }
+        assert!(p.nmi_pending(), "vblank must raise the first NMI");
+        p.take_nmi();
+
+        p.cpu_write(0x2000, 0x80);
+        assert!(
+            !p.nmi_pending(),
+            "an unchanged 1-to-1 write must not retrigger the NMI"
+        );
+
+        p.cpu_write(0x2000, 0x00); // a real disable
+        p.cpu_write(0x2000, 0x80); // and a real 0-to-1 edge while vblank is set
+        assert!(
+            p.nmi_pending(),
+            "a 0-to-1 edge during vblank still triggers an NMI"
+        );
     }
 
     /// Coarse X is five bits that count 0-31 across a nametable, and the increment
