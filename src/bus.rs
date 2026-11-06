@@ -296,10 +296,12 @@ impl Bus {
                 // before any of them. Hold it until then so a mid-scanline
                 // `$2001`/`$2006` write lands on the dot hardware puts it on.
                 if self.instr_cycles > 1 {
-                    debug_assert!(
-                        self.pending_ppu_write.is_none(),
-                        "one instruction cannot write two PPU registers"
-                    );
+                    // A 6502 store names one register, but a test or a future
+                    // caller may make a second write before the first lands.
+                    // Land the older one now rather than drop it.
+                    if let Some((addr, val)) = self.pending_ppu_write.take() {
+                        self.ppu.cpu_write(addr, val);
+                    }
                     self.pending_ppu_write = Some((addr, val));
                     self.ppu_write_delay = (self.instr_cycles - 1) * 3;
                 } else {
@@ -1090,32 +1092,32 @@ mod tests {
     /// some frames and not others, shaking the picture by one pixel.
     #[test]
     fn a_ppu_register_write_lands_on_the_stores_last_cycle() {
-        let mut b = Bus::new(blank_cart());
-        // Ppu starts at (261, 0); this is (41, 254), with rendering off so the
+        let mut b = Bus::new(cart_running(&[0xA9, 0x1E, 0x8D, 0x01, 0x20]));
+        let mut cpu = Cpu::new();
+        // Ppu starts at (261, 0); this is (41, 248), with rendering off so the
         // ticks do not move `v`.
-        for _ in 0..14_576 {
+        for _ in 0..14_570 {
             b.tick();
         }
-        assert_eq!(b.ppu.position_for_test(), (41, 254));
+        assert_eq!(b.ppu.position_for_test(), (41, 248));
 
         // t = v = $0080: coarse Y 4, fine Y 0.
         b.ppu.cpu_write(0x2006, 0x00);
         b.ppu.cpu_write(0x2006, 0x80);
 
-        // A four-cycle store writes on cycle 4, at dot 263. Its dot 256 has
-        // already passed with rendering still off, so `v` must not increment.
-        b.instruction_cycles(4);
-        b.cpu_write(0x2001, 0x1E);
-        for _ in 0..12 {
-            b.tick();
-        }
+        // LDA #$1E puts the store at dot 254; the four-cycle STA $2001 then
+        // writes on its last cycle, dot 263. The line's dot 256 has already
+        // passed with rendering still off, so `v` must not increment.
+        cpu.set_registers_for_test(0x8000, 0xFD, 0x24);
+        cpu.step(&mut b);
+        assert_eq!(b.ppu.position_for_test(), (41, 254));
+        cpu.step(&mut b);
         assert_eq!(b.ppu.position_for_test(), (41, 266));
         assert_eq!(
             b.ppu.vram_addr(),
             0x0080,
             "the $2001 write took effect before dot 256 and incremented Y"
         );
-        b.instruction_cycles(0);
 
         // It did take effect, though: the next line's dot 256 increments Y.
         // (Background fetches have also stepped coarse X, so compare only the
