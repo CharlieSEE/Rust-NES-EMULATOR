@@ -148,8 +148,10 @@ impl Bus {
         // The PPU fetches pattern memory every dot, so the CHR image the
         // cartridge parsed out of the file is loaded once, here. A cartridge
         // that carries no CHR bytes at all gets RAM instead, which is what
-        // blargg's 2005 suite uploads its tiles into.
-        bus.ppu.load_chr_rom(bus.cart.chr_rom());
+        // blargg's 2005 suite uploads its tiles into. A NES 2.0 header may
+        // declare a different RAM size; zero keeps the 8 KiB default.
+        let chr_ram_size = bus.cart.chr_ram_size() + bus.cart.chr_nvram_size();
+        bus.ppu.load_chr_rom(bus.cart.chr_rom(), chr_ram_size);
         bus.ppu.set_chr_map(bus.cart.chr_map());
         bus.ppu.set_mirroring(bus.cart.mirroring());
         bus
@@ -280,7 +282,10 @@ impl Bus {
             // disable the window; the standard CNROM board modeled here, SMB,
             // Contra, Camerica and AxROM map nothing below `$8000`, so for
             // them it is open bus.
-            0x6000..=0x7FFF if self.cart.prg_ram_enabled() => self.prg_ram[addr as usize - 0x6000],
+            0x6000..=0x7FFF if self.cart.prg_ram_enabled() => {
+                let offset = (addr as usize - 0x6000) % self.prg_ram_window();
+                self.prg_ram[offset]
+            }
             // Mappers 2, 7, 66 and 71 and this CNROM board map nothing below
             // $8000: no PRG RAM, no registers, so `$4020-$7FFF` is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
@@ -326,7 +331,8 @@ impl Bus {
             }
             // `$4020-$7FFF` is the mappers' unmapped window and drops.
             0x6000..=0x7FFF if self.cart.prg_ram_enabled() => {
-                self.prg_ram[addr as usize - 0x6000] = val;
+                let offset = (addr as usize - 0x6000) % self.prg_ram_window();
+                self.prg_ram[offset] = val;
             }
             0x8000..=0xFFFF => {
                 self.cart.cpu_write(addr, val);
@@ -397,6 +403,18 @@ impl Bus {
     /// instruction. `tick` is what drains it.
     pub fn dma_busy(&self) -> bool {
         self.dma_stall > 0 || self.dmc_stall > 0
+    }
+
+    /// How much of the `$6000-$7FFF` window is real RAM. NES 2.0 headers can
+    /// declare less than 8 KiB, and a short RAM mirrors across the window.
+    /// Plain iNES has no size field, so it keeps the full array.
+    fn prg_ram_window(&self) -> usize {
+        let declared = self.cart.prg_ram_size() + self.cart.prg_nvram_size();
+        if declared == 0 {
+            self.prg_ram.len()
+        } else {
+            declared.min(self.prg_ram.len())
+        }
     }
 
     /// The 8 KiB at `$6000-$7FFF`, for a battery-backed cartridge to write to
@@ -1190,6 +1208,23 @@ mod tests {
         let mut smb = Bus::new(blank_cart()); // mapper 66, synthesized
         smb.cpu_write(0x6000, 0x5A);
         assert_eq!(smb.cpu_read(0x6000), 0, "mapper 66 has no PRG RAM here");
+    }
+
+    /// A NES 2.0 header can declare less than the full 8 KiB window. The
+    /// hardware mirrors that smaller RAM across `$6000-$7FFF`.
+    #[test]
+    fn nes20_prg_ram_size_mirrors_within_the_six_thousand_window() {
+        let mut header = crate::rom::ines_header(1, 0, 0);
+        header[7] |= 0x08; // NES 2.0 signature
+        header[10] = 0x05; // 64 << 5 = 2 KiB
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 0x4000));
+        let cart = Cartridge::load(&bytes).expect("synthetic NES 2.0 image must load");
+        let mut bus = Bus::new(cart);
+        bus.cpu_write(0x6000, 0x5A);
+        assert_eq!(bus.cpu_read(0x6800), 0x5A, "2 KiB mirrors at $6800");
+        assert_eq!(bus.cpu_read(0x7000), 0x5A, "and again at $7000");
+        assert_eq!(bus.cpu_read(0x6001), 0, "only the written byte is set");
     }
 
     /// MMC3's 8 KiB PRG RAM is always enabled -- SMB3 saves its level state

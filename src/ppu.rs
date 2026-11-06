@@ -1168,9 +1168,19 @@ impl Ppu {
     /// The whole CHR image the `Cartridge` parsed out of the file, banked by
     /// the mapper. A short -- or absent -- image is zero-filled to at least the
     /// PPU's 8 KiB pattern window. With no image at all, the window is RAM:
-    /// every `$2007` write into pattern space lands there.
-    pub fn load_chr_rom(&mut self, data: &[u8]) {
-        self.chr = vec![0; data.len().max(8192)];
+    /// every `$2007` write into pattern space lands there. `ram_size` is the
+    /// NES 2.0 header's declared size; zero keeps the 8 KiB default.
+    pub fn load_chr_rom(&mut self, data: &[u8], ram_size: usize) {
+        let len = if data.is_empty() {
+            if ram_size == 0 {
+                8192
+            } else {
+                ram_size
+            }
+        } else {
+            data.len().max(8192)
+        };
+        self.chr = vec![0; len];
         self.chr[..data.len()].copy_from_slice(data);
         self.chr_ram = data.is_empty();
     }
@@ -1725,7 +1735,7 @@ mod tests {
         let mut chr = vec![0u8; 32 * 1024];
         chr[24 * 1024] = 0x5A;
         let mut p = Ppu::new();
-        p.load_chr_rom(&chr);
+        p.load_chr_rom(&chr, 0);
         p.set_chr_map([24, 25, 26, 27, 28, 29, 30, 31]);
         assert_eq!(p.crbank(0x0000), 24 * 1024);
         assert_eq!(p.ppu_bus_read(0x0000), 0x5A);
@@ -1733,19 +1743,28 @@ mod tests {
     }
 
     /// apu_reset's images carry 8 KiB of CHR, which is the PPU's whole pattern
-    /// window; a CHR RAM cart (no CHR bytes at all) gets the same 8 KiB zeroed.
+    /// window; a CHR RAM cart (no CHR bytes at all) gets the same 8 KiB zeroed
+    /// unless its NES 2.0 header declares a different size.
     #[test]
     fn an_8k_chr_image_loads_without_panicking() {
         let mut p = Ppu::new();
-        p.load_chr_rom(&[0xAA; 8192]); // apu_reset carries 8 KiB, not 16
+        p.load_chr_rom(&[0xAA; 8192], 0); // apu_reset carries 8 KiB, not 16
         assert_eq!(p.chr.len(), 8192, "the whole 8 KiB pattern window");
         assert_eq!(p.chr[0], 0xAA);
-        p.load_chr_rom(&[]); // the 2005 suite: no CHR bytes at all
-        assert_eq!(p.chr.len(), 8192, "CHR RAM is 8 KiB");
+        p.load_chr_rom(&[], 0); // the 2005 suite: no CHR bytes at all
+        assert_eq!(p.chr.len(), 8192, "CHR RAM defaults to 8 KiB");
         assert_eq!(
             p.chr[0], 0x00,
             "an empty image leaves a zeroed pattern space"
         );
+    }
+
+    #[test]
+    fn a_nes20_chr_ram_size_sets_the_pattern_window() {
+        let mut p = Ppu::new();
+        p.load_chr_rom(&[], 2048);
+        assert_eq!(p.chr.len(), 2048, "the header's declared CHR RAM size");
+        assert!(p.chr.iter().all(|&byte| byte == 0), "and it starts zeroed");
     }
 
     /// With CHR ROM in the file, a `$2007` write into pattern space must still
@@ -1773,7 +1792,7 @@ mod tests {
         chr[..8].fill(0xFF); // bank 0, tile 0 low plane: opaque, colour 1
         for bank in 0..2 {
             let mut p = Ppu::new();
-            p.load_chr_rom(&chr);
+            p.load_chr_rom(&chr, 0);
             p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
             p.write_vram_for_test(0x3F01, 0x30); // colour 1 = white
             p.upload_tile_for_test(0, 0x00, 0x00, 0); // tile 0 at (0, 0)
