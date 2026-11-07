@@ -251,6 +251,23 @@ enum Board {
     Mmc3,
 }
 
+/// Whether a PRG image of `len` bytes can be mapped by `board` without
+/// indexing outside it. NROM/CNROM mirror a power-of-two image; the banking
+/// boards need a whole number of their fixed bank window.
+fn prg_size_supported(board: Board, len: usize) -> bool {
+    match board {
+        Board::Nrom | Board::CnRom => len.is_power_of_two(),
+        Board::Mmc1 | Board::UxRom | Board::Camerica => {
+            len >= PRG_UNIT && len.is_multiple_of(PRG_UNIT)
+        }
+        Board::Mmc3 => len >= 0x2000 && len.is_multiple_of(0x2000),
+        // GxROM's register masks its bank number with the bank count minus
+        // one, so only a power-of-two number of 32 KiB banks wraps correctly.
+        Board::GxRom => len >= BANK && len.is_multiple_of(BANK) && (len / BANK).is_power_of_two(),
+        Board::AxRom => len >= BANK && len.is_multiple_of(BANK),
+    }
+}
+
 /// MMC3's write-only register file. Kept apart from the boards that do not use
 /// it so their state stays exactly as it was.
 #[derive(Clone, Default)]
@@ -373,6 +390,11 @@ impl Cartridge {
                 ));
             }
         };
+        if !prg_size_supported(board, prg_len) {
+            return Err(format!(
+                "mapper {mapper} cannot map {prg_len} bytes of PRG ROM"
+            ));
+        }
         // NROM, CNROM, MMC1, MMC3 and UxROM start with bank 0. GxROM's power-on
         // bank is measured, and `POWER_ON_BANK % (prg_len / BANK)` would divide
         // by zero for a 16 KiB image.
@@ -430,6 +452,19 @@ impl Cartridge {
     /// always enabled so MMC6 boards, which give `$A001` bit 7 a different
     /// meaning, still work under iNES.
     pub fn prg_ram_enabled(&self) -> bool {
+        // A NES 2.0 header names the RAM size, and zero means the board has
+        // none. Plain iNES has no size field, so its boards keep the historical
+        // defaults below.
+        if self.is_nes20() {
+            if self.prg_ram_size() + self.prg_nvram_size() == 0 {
+                return false;
+            }
+            return match self.board {
+                // MMC1B's register can still close the window at runtime.
+                Board::Mmc1 => self.prg_ram_enabled,
+                _ => true,
+            };
+        }
         match self.board {
             Board::Mmc3 => true,
             Board::Nrom | Board::Mmc1 => self.prg_ram_enabled,
@@ -445,6 +480,11 @@ impl Cartridge {
     /// The console timing the header selected.
     pub fn region(&self) -> Region {
         self.region
+    }
+
+    /// Whether the header carries the NES 2.0 signature.
+    pub fn is_nes20(&self) -> bool {
+        self.header[7] & 0x0C == 0x08
     }
 
     /// NES 2.0's RAM size fields. Zero means the memory is absent; plain iNES
@@ -467,7 +507,7 @@ impl Cartridge {
 
     /// A NES 2.0 RAM size nibble is a shift count: `64 << count` bytes.
     fn ram_size(&self, index: usize, upper: bool) -> usize {
-        if self.header[7] & 0x0C != 0x08 {
+        if !self.is_nes20() {
             return 0;
         }
         let shift = if upper {
@@ -2190,6 +2230,34 @@ mod tests {
         assert_eq!(rom_size(0b0010_1100, 0xF, CHR_BANK), Some(2048));
     }
 
+    /// A board can only map PRG sizes its bank window can address. Exponent
+    /// sizes that cannot fit are refused instead of panicking in `cpu_read`.
+    #[test]
+    fn nes20_prg_sizes_that_the_board_cannot_map_are_rejected() {
+        let cases = [
+            (8192, 0x34, 66, "GxROM under one 32 KiB bank"),
+            (8192, 0x34, 2, "UxROM under one 16 KiB bank"),
+            (24576, 0x35, 2, "UxROM half a 16 KiB bank"),
+            (24576, 0x35, 0, "NROM not a power of two"),
+            (98304, 0x3D, 66, "GxROM with three 32 KiB banks"),
+        ];
+        for (size, lsb, mapper, label) in cases {
+            let mut bytes = ines_header(0, 0, mapper).to_vec();
+            bytes[4] = lsb;
+            bytes[7] |= 0x08;
+            bytes[9] = 0x0F;
+            bytes.resize(16 + size, 0);
+            let err = match Cartridge::load(&bytes) {
+                Ok(_) => panic!("{label} must be refused"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(&size.to_string()),
+                "{label}: the error must name {size}: {err}"
+            );
+        }
+    }
+
     /// Byte 10 and byte 11 hold four shift counts. A non-zero count n means
     /// 64 << n bytes; zero means the memory is absent.
     #[test]
@@ -2204,6 +2272,33 @@ mod tests {
         assert_eq!(c.prg_nvram_size(), 32768);
         assert_eq!(c.chr_ram_size(), 8192);
         assert_eq!(c.chr_nvram_size(), 4096);
+    }
+
+    /// NES 2.0's PRG RAM fields are authoritative even on boards whose enum
+    /// historically had no RAM. Alwa's Awakening uses this to save 8 KiB of
+    /// NVRAM on mapper 2.
+    #[test]
+    fn nes20_declared_prg_ram_enables_a_ramless_board() {
+        let mut bytes = ines_header(1, 0, 2).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[10] = 0x70; // PRG NVRAM 64 << 7
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let c = Cartridge::load(&bytes).expect("NES 2.0 UxROM image must load");
+        assert!(
+            c.prg_ram_enabled(),
+            "declared NVRAM must enable the $6000-$7FFF window"
+        );
+    }
+
+    /// NES 2.0 zero means no PRG RAM, even on NROM/MMC1/MMC3 where plain
+    /// iNES has always provided 8 KiB.
+    #[test]
+    fn nes20_zero_prg_ram_disables_the_window() {
+        let mut bytes = ines_header(1, 0, 0).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature; byte 10 stays zero
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let c = Cartridge::load(&bytes).expect("NES 2.0 NROM image must load");
+        assert!(!c.prg_ram_enabled(), "NES 2.0 zero means absent");
     }
 
     /// Byte 7 bits 0-1 are the console type under NES 2.0. Value 3 asks for

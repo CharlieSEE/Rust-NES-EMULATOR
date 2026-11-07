@@ -146,11 +146,14 @@ impl Bus {
             irq_line_delayed: false,
         };
         // The PPU fetches pattern memory every dot, so the CHR image the
-        // cartridge parsed out of the file is loaded once, here. A cartridge
-        // that carries no CHR bytes at all gets RAM instead, which is what
-        // blargg's 2005 suite uploads its tiles into. A NES 2.0 header may
-        // declare a different RAM size; zero keeps the 8 KiB default.
-        let chr_ram_size = bus.cart.chr_ram_size() + bus.cart.chr_nvram_size();
+        // cartridge parsed out of the file is loaded once, here. A plain-iNES
+        // cartridge that carries no CHR bytes gets RAM, which is what blargg's
+        // 2005 suite uploads its tiles into. A NES 2.0 header names the RAM
+        // size explicitly, and zero means there is no pattern memory at all.
+        let chr_ram_size = bus
+            .cart
+            .is_nes20()
+            .then(|| bus.cart.chr_ram_size() + bus.cart.chr_nvram_size());
         bus.ppu.load_chr_rom(bus.cart.chr_rom(), chr_ram_size);
         bus.ppu.set_chr_map(bus.cart.chr_map());
         bus.ppu.set_mirroring(bus.cart.mirroring());
@@ -411,6 +414,9 @@ impl Bus {
     fn prg_ram_window(&self) -> usize {
         let declared = self.cart.prg_ram_size() + self.cart.prg_nvram_size();
         if declared == 0 {
+            // A NES 2.0 zero is caught by `prg_ram_enabled` before any access,
+            // so only plain iNES reaches this fallback.
+            debug_assert!(!self.cart.is_nes20(), "NES 2.0 zero RAM was mapped");
             self.prg_ram.len()
         } else {
             declared.min(self.prg_ram.len())
@@ -1225,6 +1231,37 @@ mod tests {
         assert_eq!(bus.cpu_read(0x6800), 0x5A, "2 KiB mirrors at $6800");
         assert_eq!(bus.cpu_read(0x7000), 0x5A, "and again at $7000");
         assert_eq!(bus.cpu_read(0x6001), 0, "only the written byte is set");
+    }
+
+    /// A NES 2.0 header can put PRG RAM on a board that plain iNES leaves
+    /// unmapped. Alwa's Awakening saves its 8 KiB of NVRAM through this window
+    /// on mapper 2.
+    #[test]
+    fn nes20_declared_prg_ram_maps_on_a_ramless_board() {
+        let mut header = crate::rom::ines_header(1, 0, 2);
+        header[7] |= 0x08; // NES 2.0 signature
+        header[10] = 0x70; // PRG NVRAM 64 << 7
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 0x4000));
+        let cart = Cartridge::load(&bytes).expect("synthetic NES 2.0 image must load");
+        let mut bus = Bus::new(cart);
+        bus.cpu_write(0x6000, 0x5A);
+        assert_eq!(bus.cpu_read(0x6000), 0x5A, "declared NVRAM is mapped");
+        assert_eq!(bus.prg_ram()[0], 0x5A, "and reaches the battery save");
+    }
+
+    /// NES 2.0 zero means no PRG RAM. NROM's plain-iNES default must not leak
+    /// into a header that explicitly declares none.
+    #[test]
+    fn nes20_zero_prg_ram_stays_open_bus() {
+        let mut header = crate::rom::ines_header(1, 0, 0);
+        header[7] |= 0x08; // NES 2.0 signature; byte 10 stays zero
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 0x4000));
+        let cart = Cartridge::load(&bytes).expect("synthetic NES 2.0 image must load");
+        let mut bus = Bus::new(cart);
+        bus.cpu_write(0x6000, 0x5A);
+        assert_eq!(bus.cpu_read(0x6000), 0, "no phantom PRG RAM");
     }
 
     /// MMC3's 8 KiB PRG RAM is always enabled -- SMB3 saves its level state

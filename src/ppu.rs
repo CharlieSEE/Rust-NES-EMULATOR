@@ -1166,23 +1166,26 @@ impl Ppu {
     }
 
     /// The whole CHR image the `Cartridge` parsed out of the file, banked by
-    /// the mapper. A short -- or absent -- image is zero-filled to at least the
-    /// PPU's 8 KiB pattern window. With no image at all, the window is RAM:
-    /// every `$2007` write into pattern space lands there. `ram_size` is the
-    /// NES 2.0 header's declared size; zero keeps the 8 KiB default.
-    pub fn load_chr_rom(&mut self, data: &[u8], ram_size: usize) {
+    /// the mapper. A short image is zero-filled to at least the PPU's 8 KiB
+    /// pattern window. With no image, `ram_size` says how much writable pattern
+    /// RAM to provide: `None` is a plain-iNES cartridge, which gets the
+    /// historical 8 KiB default, while `Some(0)` is a NES 2.0 header that
+    /// declares no pattern memory at all.
+    pub fn load_chr_rom(&mut self, data: &[u8], ram_size: Option<usize>) {
         let len = if data.is_empty() {
-            if ram_size == 0 {
-                8192
-            } else {
-                ram_size
+            match ram_size {
+                None => 8192,
+                Some(0) => 8192, // kept for indexing; not writable
+                Some(size) => size,
             }
         } else {
             data.len().max(8192)
         };
         self.chr = vec![0; len];
         self.chr[..data.len()].copy_from_slice(data);
-        self.chr_ram = data.is_empty();
+        // `Some(0)` keeps a zero-filled placeholder so reads stay in bounds,
+        // but no byte of it is writable pattern memory.
+        self.chr_ram = data.is_empty() && ram_size != Some(0);
     }
 
     /// Everything the PPU will still be using when the next dot arrives: the
@@ -1735,7 +1738,7 @@ mod tests {
         let mut chr = vec![0u8; 32 * 1024];
         chr[24 * 1024] = 0x5A;
         let mut p = Ppu::new();
-        p.load_chr_rom(&chr, 0);
+        p.load_chr_rom(&chr, None);
         p.set_chr_map([24, 25, 26, 27, 28, 29, 30, 31]);
         assert_eq!(p.crbank(0x0000), 24 * 1024);
         assert_eq!(p.ppu_bus_read(0x0000), 0x5A);
@@ -1748,10 +1751,10 @@ mod tests {
     #[test]
     fn an_8k_chr_image_loads_without_panicking() {
         let mut p = Ppu::new();
-        p.load_chr_rom(&[0xAA; 8192], 0); // apu_reset carries 8 KiB, not 16
+        p.load_chr_rom(&[0xAA; 8192], None); // apu_reset carries 8 KiB, not 16
         assert_eq!(p.chr.len(), 8192, "the whole 8 KiB pattern window");
         assert_eq!(p.chr[0], 0xAA);
-        p.load_chr_rom(&[], 0); // the 2005 suite: no CHR bytes at all
+        p.load_chr_rom(&[], None); // the 2005 suite: no CHR bytes at all
         assert_eq!(p.chr.len(), 8192, "CHR RAM defaults to 8 KiB");
         assert_eq!(
             p.chr[0], 0x00,
@@ -1762,9 +1765,22 @@ mod tests {
     #[test]
     fn a_nes20_chr_ram_size_sets_the_pattern_window() {
         let mut p = Ppu::new();
-        p.load_chr_rom(&[], 2048);
+        p.load_chr_rom(&[], Some(2048));
         assert_eq!(p.chr.len(), 2048, "the header's declared CHR RAM size");
         assert!(p.chr.iter().all(|&byte| byte == 0), "and it starts zeroed");
+        assert!(p.chr_ram, "declared CHR RAM is writable");
+    }
+
+    /// NES 2.0 zero means no CHR memory at all, not the plain-iNES 8 KiB RAM
+    /// default. Pattern writes must go nowhere.
+    #[test]
+    fn a_nes20_zero_chr_ram_is_not_writable_pattern_memory() {
+        let mut p = Ppu::new();
+        p.load_chr_rom(&[], Some(0));
+        p.cpu_write(0x2006, 0x00);
+        p.cpu_write(0x2006, 0x00);
+        p.cpu_write(0x2007, 0xAA);
+        assert_eq!(p.ppu_bus_read(0x0000), 0x00, "the write was ignored");
     }
 
     /// With CHR ROM in the file, a `$2007` write into pattern space must still
@@ -1792,7 +1808,7 @@ mod tests {
         chr[..8].fill(0xFF); // bank 0, tile 0 low plane: opaque, colour 1
         for bank in 0..2 {
             let mut p = Ppu::new();
-            p.load_chr_rom(&chr, 0);
+            p.load_chr_rom(&chr, None);
             p.write_vram_for_test(0x3F00, 0x0F); // backdrop black
             p.write_vram_for_test(0x3F01, 0x30); // colour 1 = white
             p.upload_tile_for_test(0, 0x00, 0x00, 0); // tile 0 at (0, 0)
