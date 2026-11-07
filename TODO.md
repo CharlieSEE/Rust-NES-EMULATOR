@@ -29,7 +29,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 - [ ] **Unstable CPU opcodes** — JAM, XAA, SHA, SHX, SHY, TAS, LAS and LXA still panic. Add only when a specific game needs one. *Effort: S; issue #59.*
 - [x] **DMC channel** — `$4010–$4013` registers, sample fetching through the CPU bus, 3/4-cycle DMA stalls, controller-read corruption, output level, sample-end IRQ, and `$4015` status bits. *Done.*
 - [x] **PAL support** — 50 Hz timing (312 scanlines, 5:16 CPU:PPU dots), 2A07 APU clock, noise and frame-counter tables, 2C07 palette, and region detection from NES 2.0 byte 12 or iNES flags 9/10. Dendy and dual-region headers fall back to NTSC. *Done.*
-- [ ] **NES 2.0 header support** — parse console type, mapper/submapper, PRG/CHR size exponents, RAM sizes. *Effort: S.*
+- [x] **NES 2.0 header support** — parse console type, mapper/submapper, PRG/CHR size exponents, RAM sizes. *Done; 12-bit and exponent-multiplier sizes, console-type refusal, NES 2.0 PRG/CHR RAM sizes; plain iNES fields stay ignored.*
 - [ ] **FDS support** — BIOS, disk I/O, disk IRQs, writable media, per-side saves. *Effort: XL.*
 - [ ] **MMC5 support** — expansion audio, ExRAM, split-screen mode, large PRG banking. Only if a specific MMC5 game is wanted. *Effort: XL.*
 

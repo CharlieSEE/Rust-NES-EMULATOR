@@ -7,6 +7,14 @@
 //! test ROMs -- NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM the
 //! tests need, and the 2005 suite with no CHR at all (the PPU gets RAM instead).
 //!
+//! NES 2.0 headers extend those fields: the mapper number and submapper reach
+//! 12 bits, byte 9 carries the high four bits of the PRG/CHR sizes, and the
+//! sizes can switch to exponent-multiplier form for odd images. The console
+//! type is parsed too; only a regular NES/Famicom is modelled, so Vs. System,
+//! PlayChoice-10 and extended Famiclone types are refused by name. Byte 10 and
+//! byte 11 declare the PRG and CHR RAM sizes, which the bus and PPU honour.
+//! Plain iNES ignores all of those bytes and keeps its 8 KiB defaults.
+//!
 //! Mapper 4 is MMC3: four 8 KiB PRG windows (two switchable, the second-last
 //! and last fixed, with bit 6 of `$8000` swapping the switchable pair), 2 KiB
 //! and 1 KiB CHR windows selected by R0-R5, runtime mirroring at `$A000`, and
@@ -119,6 +127,16 @@ pub fn read_rom(path: &std::path::Path) -> Result<Vec<u8>, String> {
     Err(format!("{display}: no .nes inside the zip"))
 }
 
+/// The console a NES 2.0 header names. Plain iNES has no console field, so
+/// those images are always `Nes`. Only a regular NES/Famicom is modelled.
+enum Console {
+    Nes,
+    VsSystem,
+    PlayChoice10,
+    /// Console type 3: byte 13's low nibble names the extended type.
+    Extended(u8),
+}
+
 /// The CPU window. NESdev "GxROM" says "CPU $8000-$FFFF: 32 KB switchable
 /// PRG ROM bank" -- ONE 32 KiB block over the whole window. There is no
 /// separately selectable `$C000-$FFFF` half; `$8000` and `$C000` are both
@@ -142,6 +160,21 @@ const POWER_ON_BANK: usize = 0;
 
 /// One 8 KiB CHR bank: the window at `$0000-$1FFF`, selected by bits 1-0.
 const CHR_BANK: usize = 0x2000;
+
+/// Bytes named by an iNES/NES 2.0 size field. `lsb` is the old 8-bit count in
+/// `unit`s and `msb` is byte 9's nibble. A nibble of `$F` selects NES 2.0's
+/// exponent-multiplier form, where `lsb` is `EEEE EEMM` and the size is
+/// `2^E * (2*M + 1)` bytes. `None` means the header's exponent does not fit in
+/// a `usize`, which no real file can satisfy anyway.
+fn rom_size(lsb: u8, msb: u8, unit: usize) -> Option<usize> {
+    if msb == 0x0F {
+        let exponent = (lsb >> 2) as u32;
+        let multiplier = usize::from(lsb & 0x03) * 2 + 1;
+        (1usize.checked_shl(exponent)?).checked_mul(multiplier)
+    } else {
+        Some(((usize::from(msb) << 8) | usize::from(lsb)) * unit)
+    }
+}
 
 /// PRG ROM, CHR ROM, and the mapper registers. The CHR bytes stay here
 /// because the file owns them; the PPU holds the banks because it fetches
@@ -218,6 +251,23 @@ enum Board {
     Mmc3,
 }
 
+/// Whether a PRG image of `len` bytes can be mapped by `board` without
+/// indexing outside it. NROM/CNROM mirror a power-of-two image; the banking
+/// boards need a whole number of their fixed bank window.
+fn prg_size_supported(board: Board, len: usize) -> bool {
+    match board {
+        Board::Nrom | Board::CnRom => len.is_power_of_two(),
+        Board::Mmc1 | Board::UxRom | Board::Camerica => {
+            len >= PRG_UNIT && len.is_multiple_of(PRG_UNIT)
+        }
+        Board::Mmc3 => len >= 0x2000 && len.is_multiple_of(0x2000),
+        // GxROM's register masks its bank number with the bank count minus
+        // one, so only a power-of-two number of 32 KiB banks wraps correctly.
+        Board::GxRom => len >= BANK && len.is_multiple_of(BANK) && (len / BANK).is_power_of_two(),
+        Board::AxRom => len >= BANK && len.is_multiple_of(BANK),
+    }
+}
+
 /// MMC3's write-only register file. Kept apart from the boards that do not use
 /// it so their state stays exactly as it was.
 #[derive(Clone, Default)]
@@ -246,16 +296,25 @@ impl Cartridge {
         // A trainer is 512 bytes between the header and PRG. Rare, but reading
         // it as PRG puts every bank off by 32 KiB, which looks like a bad ROM.
         let start = 16 + if flags6 & 0x04 != 0 { 512 } else { 0 };
-        let prg_len = bytes[4] as usize * PRG_UNIT;
+        let flags7 = bytes[7];
+        let nes20 = flags7 & 0x0C == 0x08;
+        // NES 2.0 puts the high four bits of each ROM size in byte 9 and
+        // allows exponent-multiplier sizes. Plain iNES ignores that byte.
+        let (prg_msb, chr_msb) = if nes20 {
+            (bytes[9] & 0x0F, bytes[9] >> 4)
+        } else {
+            (0, 0)
+        };
+        let prg_len = rom_size(bytes[4], prg_msb, PRG_UNIT)
+            .ok_or_else(|| "NES 2.0 header's PRG size is out of range".to_string())?;
         if prg_len == 0 || bytes.len() < start + prg_len {
             return Err(format!("truncated PRG: header claims {prg_len} bytes"));
         }
-        let chr_len = bytes[5] as usize * CHR_BANK;
+        let chr_len = rom_size(bytes[5], chr_msb, CHR_BANK)
+            .ok_or_else(|| "NES 2.0 header's CHR size is out of range".to_string())?;
         if bytes.len() < start + prg_len + chr_len {
             return Err(format!("truncated CHR: header claims {chr_len} bytes"));
         }
-        let flags7 = bytes[7];
-        let nes20 = flags7 & 0x0C == 0x08;
         // NES 2.0 marks itself in flags 7 bits 2-3 and puts the CPU/PPU timing
         // in byte 12: 0 NTSC, 1 licensed PAL, 2 multiple-region, 3 Dendy. A
         // plain iNES header only has flags 9 bit 0 and flags 10 bits 0-1, and
@@ -274,6 +333,34 @@ impl Cartridge {
             u16::from(flags7 & 0xF0 | bytes[6] >> 4)
         };
         let submapper = if nes20 { bytes[8] >> 4 } else { 0 };
+        // Byte 7 bits 0-1 name the console; value 3 moves the real type to
+        // byte 13. Vs. System and PlayChoice-10 have different PPU palettes
+        // and registers, and the extended types are Famiclones, so refuse
+        // them instead of running them as a stock NES.
+        let console = if nes20 {
+            match flags7 & 0x03 {
+                0 => Console::Nes,
+                1 => Console::VsSystem,
+                2 => Console::PlayChoice10,
+                _ => Console::Extended(bytes[13] & 0x0F),
+            }
+        } else {
+            Console::Nes
+        };
+        match console {
+            Console::Nes | Console::Extended(0) => {}
+            Console::VsSystem => {
+                return Err("NES 2.0 Vs. System console is not supported".to_string());
+            }
+            Console::PlayChoice10 => {
+                return Err("NES 2.0 PlayChoice-10 console is not supported".to_string());
+            }
+            Console::Extended(kind) => {
+                return Err(format!(
+                    "NES 2.0 extended console type {kind} is not supported"
+                ));
+            }
+        }
         // ponytail: Dendy and multiple-region fall back to NTSC. Both are a
         // mixed clock this emulator has no model for; add a Region variant
         // when a Dendy game turns up.
@@ -303,6 +390,11 @@ impl Cartridge {
                 ));
             }
         };
+        if !prg_size_supported(board, prg_len) {
+            return Err(format!(
+                "mapper {mapper} cannot map {prg_len} bytes of PRG ROM"
+            ));
+        }
         // NROM, CNROM, MMC1, MMC3 and UxROM start with bank 0. GxROM's power-on
         // bank is measured, and `POWER_ON_BANK % (prg_len / BANK)` would divide
         // by zero for a 16 KiB image.
@@ -360,6 +452,19 @@ impl Cartridge {
     /// always enabled so MMC6 boards, which give `$A001` bit 7 a different
     /// meaning, still work under iNES.
     pub fn prg_ram_enabled(&self) -> bool {
+        // A NES 2.0 header names the RAM size, and zero means the board has
+        // none. Plain iNES has no size field, so its boards keep the historical
+        // defaults below.
+        if self.is_nes20() {
+            if self.prg_ram_size() + self.prg_nvram_size() == 0 {
+                return false;
+            }
+            return match self.board {
+                // MMC1B's register can still close the window at runtime.
+                Board::Mmc1 => self.prg_ram_enabled,
+                _ => true,
+            };
+        }
         match self.board {
             Board::Mmc3 => true,
             Board::Nrom | Board::Mmc1 => self.prg_ram_enabled,
@@ -375,6 +480,46 @@ impl Cartridge {
     /// The console timing the header selected.
     pub fn region(&self) -> Region {
         self.region
+    }
+
+    /// Whether the header carries the NES 2.0 signature.
+    pub fn is_nes20(&self) -> bool {
+        self.header[7] & 0x0C == 0x08
+    }
+
+    /// NES 2.0's RAM size fields. Zero means the memory is absent; plain iNES
+    /// has no such fields, so all four are zero there.
+    pub fn prg_ram_size(&self) -> usize {
+        self.ram_size(10, false)
+    }
+
+    pub fn prg_nvram_size(&self) -> usize {
+        self.ram_size(10, true)
+    }
+
+    pub fn chr_ram_size(&self) -> usize {
+        self.ram_size(11, false)
+    }
+
+    pub fn chr_nvram_size(&self) -> usize {
+        self.ram_size(11, true)
+    }
+
+    /// A NES 2.0 RAM size nibble is a shift count: `64 << count` bytes.
+    fn ram_size(&self, index: usize, upper: bool) -> usize {
+        if !self.is_nes20() {
+            return 0;
+        }
+        let shift = if upper {
+            self.header[index] >> 4
+        } else {
+            self.header[index] & 0x0F
+        };
+        if shift == 0 {
+            0
+        } else {
+            64usize << shift
+        }
     }
 
     /// iNES mapper number, used in the save-state header so a state is never
@@ -2025,6 +2170,219 @@ mod tests {
             load(signature).region(),
             Region::Ntsc,
             "a signed header is not plain iNES"
+        );
+    }
+
+    /// NES 2.0 byte 9's low nibble is the PRG size's high four bits. $01 in
+    /// byte 9 turns byte 4's one 16 KiB unit into 256 units, 4 MiB.
+    #[test]
+    fn nes20_prg_size_uses_the_high_nibble_of_byte_nine() {
+        let mut bytes = ines_header(0, 0, 0).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[9] = 0x01;
+        let err = match Cartridge::load(&bytes) {
+            Ok(_) => panic!("4 MiB of PRG cannot fit in a 16-byte file"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("4194304"),
+            "the error must name the 12-bit size: {err}"
+        );
+    }
+
+    /// NES 2.0 byte 9's high nibble is the CHR size's high four bits.
+    #[test]
+    fn nes20_chr_size_uses_the_high_nibble_of_byte_nine() {
+        let mut bytes = ines_header(1, 0, 0).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[9] = 0x10;
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let err = match Cartridge::load(&bytes) {
+            Ok(_) => panic!("2 MiB of CHR cannot fit in a PRG-only file"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("2097152"),
+            "the error must name the 12-bit size: {err}"
+        );
+    }
+
+    /// Both size bytes use exponent-multiplier notation when their MSB nibble
+    /// is $F: size = 2^E * (2*M + 1). Byte 4 = %00110100 is E=13, M=0, so
+    /// 8 KiB; byte 5 = %00101100 is E=11, M=0, so 2 KiB.
+    #[test]
+    fn nes20_exponent_multiplier_sizes_are_loaded() {
+        let mut bytes = ines_header(0b0011_0100, 0b0010_1100, 0).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[9] = 0xFF; // both MSB nibbles select exponent-multiplier
+        bytes.extend(std::iter::repeat_n(0u8, 8192));
+        bytes.extend(std::iter::repeat_n(0u8, 2048));
+        let c = Cartridge::load(&bytes).expect("exponent-sized image must load");
+        assert_eq!(c.prg.len(), 8192, "byte 4 names 8 KiB of PRG");
+        assert_eq!(c.chr_rom().len(), 2048, "byte 5 names 2 KiB of CHR");
+    }
+
+    /// The multiplier in the exponent form allows sizes that are not powers of
+    /// two: %00110110 is E=13, M=2, so 8192 * 5 = 40 KiB.
+    #[test]
+    fn nes20_exponent_multiplier_covers_odd_sizes() {
+        assert_eq!(rom_size(0b0011_0110, 0xF, PRG_UNIT), Some(40960));
+        assert_eq!(rom_size(0b0010_1100, 0xF, CHR_BANK), Some(2048));
+    }
+
+    /// A board can only map PRG sizes its bank window can address. Exponent
+    /// sizes that cannot fit are refused instead of panicking in `cpu_read`.
+    #[test]
+    fn nes20_prg_sizes_that_the_board_cannot_map_are_rejected() {
+        let cases = [
+            (8192, 0x34, 66, "GxROM under one 32 KiB bank"),
+            (8192, 0x34, 2, "UxROM under one 16 KiB bank"),
+            (24576, 0x35, 2, "UxROM half a 16 KiB bank"),
+            (24576, 0x35, 0, "NROM not a power of two"),
+            (98304, 0x3D, 66, "GxROM with three 32 KiB banks"),
+        ];
+        for (size, lsb, mapper, label) in cases {
+            let mut bytes = ines_header(0, 0, mapper).to_vec();
+            bytes[4] = lsb;
+            bytes[7] |= 0x08;
+            bytes[9] = 0x0F;
+            bytes.resize(16 + size, 0);
+            let err = match Cartridge::load(&bytes) {
+                Ok(_) => panic!("{label} must be refused"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains(&size.to_string()),
+                "{label}: the error must name {size}: {err}"
+            );
+        }
+    }
+
+    /// Byte 10 and byte 11 hold four shift counts. A non-zero count n means
+    /// 64 << n bytes; zero means the memory is absent.
+    #[test]
+    fn nes20_ram_sizes_are_parsed_from_bytes_ten_and_eleven() {
+        let mut bytes = ines_header(1, 0, 0).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[10] = 0x97; // PRG RAM 64<<7, PRG NVRAM 64<<9
+        bytes[11] = 0x67; // CHR RAM 64<<7, CHR NVRAM 64<<6
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let c = Cartridge::load(&bytes).expect("NES 2.0 image must load");
+        assert_eq!(c.prg_ram_size(), 8192);
+        assert_eq!(c.prg_nvram_size(), 32768);
+        assert_eq!(c.chr_ram_size(), 8192);
+        assert_eq!(c.chr_nvram_size(), 4096);
+    }
+
+    /// NES 2.0's PRG RAM fields are authoritative even on boards whose enum
+    /// historically had no RAM. Alwa's Awakening uses this to save 8 KiB of
+    /// NVRAM on mapper 2.
+    #[test]
+    fn nes20_declared_prg_ram_enables_a_ramless_board() {
+        let mut bytes = ines_header(1, 0, 2).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[10] = 0x70; // PRG NVRAM 64 << 7
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let c = Cartridge::load(&bytes).expect("NES 2.0 UxROM image must load");
+        assert!(
+            c.prg_ram_enabled(),
+            "declared NVRAM must enable the $6000-$7FFF window"
+        );
+    }
+
+    /// NES 2.0 zero means no PRG RAM, even on NROM/MMC1/MMC3 where plain
+    /// iNES has always provided 8 KiB.
+    #[test]
+    fn nes20_zero_prg_ram_disables_the_window() {
+        let mut bytes = ines_header(1, 0, 0).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature; byte 10 stays zero
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let c = Cartridge::load(&bytes).expect("NES 2.0 NROM image must load");
+        assert!(!c.prg_ram_enabled(), "NES 2.0 zero means absent");
+    }
+
+    /// Byte 7 bits 0-1 are the console type under NES 2.0. Value 3 asks for
+    /// the extended type in byte 13's low nibble. Only a regular NES/Famicom
+    /// is modelled, so the other consoles are refused by name.
+    #[test]
+    fn nes20_console_type_is_parsed_and_unsupported_consoles_are_refused() {
+        let bytes = |console: u8, extended: u8| {
+            let mut h = ines_header(1, 0, 0);
+            h[7] = (h[7] & 0xF0) | 0x08 | console;
+            h[13] = extended;
+            let mut bytes = h.to_vec();
+            bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+            bytes
+        };
+        let load = |console: u8, extended: u8| Cartridge::load(&bytes(console, extended));
+
+        load(0, 0).expect("NES console must load");
+        load(3, 0).expect("extended type 0 is a regular NES/Famicom");
+
+        let err = match load(1, 0) {
+            Ok(_) => panic!("Vs. System is not modelled"),
+            Err(e) => e,
+        };
+        assert!(err.contains("Vs. System"), "the error must name it: {err}");
+
+        let err = match load(2, 0) {
+            Ok(_) => panic!("PlayChoice-10 is not modelled"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("PlayChoice-10"),
+            "the error must name it: {err}"
+        );
+
+        let err = match load(3, 6) {
+            Ok(_) => panic!("extended console type 6 is not modelled"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("extended console type 6"),
+            "the error must name it: {err}"
+        );
+
+        let mut plain = ines_header(1, 0, 0);
+        plain[7] |= 0x03;
+        let mut bytes = plain.to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        Cartridge::load(&bytes).expect("plain iNES has no console field to read");
+    }
+
+    /// Plain iNES keeps its byte 4/5 sizes and has no NES 2.0 RAM fields.
+    #[test]
+    fn plain_ines_ignores_the_nes20_size_and_ram_fields() {
+        let mut h = ines_header(1, 0, 0);
+        h[9] = 0x11; // would extend both sizes under NES 2.0
+        h[10] = 0x77; // would claim 8 KiB of each PRG RAM type
+        h[11] = 0x77; // would claim 8 KiB of each CHR RAM type
+        let mut bytes = h.to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let c = Cartridge::load(&bytes).expect("plain iNES image must load");
+        assert_eq!(c.prg.len(), PRG_UNIT, "byte 9 is not a size on iNES");
+        assert_eq!(c.prg_ram_size(), 0, "iNES has no PRG RAM size field");
+        assert_eq!(c.prg_nvram_size(), 0);
+        assert_eq!(c.chr_ram_size(), 0);
+        assert_eq!(c.chr_nvram_size(), 0);
+    }
+
+    /// The 12-bit mapper number includes byte 8's low nibble. Mapper $100 is
+    /// not supported, and the error must name the full number, not mapper 0.
+    #[test]
+    fn nes20_mapper_includes_the_high_nibble_from_byte_eight() {
+        let mut h = ines_header(1, 0, 0);
+        h[7] |= 0x08; // NES 2.0 signature
+        h[8] = 0x01; // mapper $100
+        let mut bytes = h.to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, PRG_UNIT));
+        let err = match Cartridge::load(&bytes) {
+            Ok(_) => panic!("mapper $100 is not supported"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("mapper 256"),
+            "the error must name the full 12-bit mapper: {err}"
         );
     }
 
