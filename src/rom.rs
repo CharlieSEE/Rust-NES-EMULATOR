@@ -47,9 +47,11 @@
 //! Mapper 3 is CNROM: fixed PRG, one 8 KiB switchable CHR window at
 //! `$0000-$1FFF`, and AND-type bus conflicts. The board's 74HC161 latch sees
 //! the written byte ANDed with the PRG byte it drives at the same address.
-//! Regular boards connect only two latch outputs for up to 32 KiB of CHR; the
-//! modulo over the image's real bank count also covers the 128 KiB Bandai
-//! variant, whose four outputs are all connected.
+//! NES 2.0 submapper 1 names mapper hacks with no bus conflicts and submapper
+//! 2 the original AND-type board; submapper 0 leaves the behavior unknown, so
+//! it keeps the conflict like plain iNES. Regular boards connect only two latch
+//! outputs for up to 32 KiB of CHR; the modulo over the image's real bank count
+//! also covers the 128 KiB Bandai variant, whose four outputs are all connected.
 //!
 //! Mapper 7 is AxROM: one 32 KiB PRG bank over the whole `$8000-$FFFF` window,
 //! selected by bits 0-3 of any write in that window (bit 3 only exists on the
@@ -188,8 +190,9 @@ pub struct Cartridge {
     header: [u8; 16],
     /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
     board: Board,
-    /// NES 2.0 submapper, 0 for plain iNES. Mapper 7 uses it to choose
-    /// AND-type bus conflicts (submapper 2).
+    /// NES 2.0 submapper, 0 for plain iNES. Mapper 3 uses it to choose
+    /// no bus conflicts (submapper 1) or AND-type (submapper 2), and mapper 7
+    /// to choose AND-type bus conflicts (submapper 2).
     submapper: u8,
     /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
     /// `$8000-$FFFF` on GxROM and AxROM, a 16 KiB bank at `$8000-$BFFF` on
@@ -229,8 +232,9 @@ enum Board {
     /// NROM, no banking: 16 KiB PRG mirrors across the window, 32 KiB maps
     /// both halves directly. Writes to the window go nowhere.
     Nrom,
-    /// CNROM, mapper 3: fixed PRG, one 8 KiB switchable CHR bank, and AND-type
-    /// bus conflicts on the register write.
+    /// CNROM, mapper 3: fixed PRG, one 8 KiB switchable CHR bank, and bus
+    /// conflicts on the register write (AND-type unless NES 2.0 submapper 1
+    /// names a mapper hack without them).
     CnRom,
     /// MMC1, the Zelda board: serial PRG/CHR banking, mirroring control, and
     /// battery-backed PRG RAM.
@@ -782,9 +786,12 @@ impl Cartridge {
     ///
     /// CNROM's register is one 8 KiB CHR bank latch over the whole
     /// `$8000-$FFFF` window. Its bus conflict is AND-type: the latch sees the
-    /// written byte ANDed with the PRG byte the cartridge drives there. The
-    /// 74HC161's four outputs select up to sixteen banks; regular 32 KiB boards
-    /// wire only two, which the modulo over the image's real bank count covers.
+    /// written byte ANDed with the PRG byte the cartridge drives there.
+    /// NES 2.0 submapper 1 names the mapper hacks with no bus conflicts, so
+    /// those take the written byte whole; submapper 2 and the unknown
+    /// submapper 0 keep the conflict. The 74HC161's four outputs select up to
+    /// sixteen banks; regular 32 KiB boards wire only two, which the modulo
+    /// over the image's real bank count covers.
     ///
     /// GxROM is a bus-conflict board: the bank register only moves when the
     /// byte written is already the byte the CPU reads at that address. Its
@@ -820,7 +827,15 @@ impl Cartridge {
                 if addr < 0x8000 {
                     return;
                 }
-                let value = val & self.cpu_read(addr);
+                // The original board ANDs the write with the PRG byte at that
+                // address. NES 2.0 submapper 1 names the mapper hacks that
+                // have no bus conflicts; submapper 2 (and the unknown
+                // submapper 0, like plain iNES) keeps the conflict.
+                let value = if self.submapper == 1 {
+                    val
+                } else {
+                    val & self.cpu_read(addr)
+                };
                 let banks = (self.chr.len() / CHR_BANK).max(1);
                 let bank = (value & 0x0F) as usize % banks;
                 self.chr_banks = [bank * 2, bank * 2 + 1];
@@ -1041,6 +1056,17 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0x22, PRG_UNIT));
         bytes.resize(bytes.len() + 4 * CHR_BANK, 0);
         Cartridge::load(&bytes).expect("synthetic CNROM image must load")
+    }
+
+    /// The same CNROM image with a NES 2.0 header naming `submapper`.
+    fn cnrom_nes20_cart(submapper: u8) -> Cartridge {
+        let mut bytes = ines_header(2, 4, 3).to_vec();
+        bytes[7] |= 0x08; // NES 2.0 signature
+        bytes[8] = submapper << 4;
+        bytes.extend(std::iter::repeat_n(0x11, PRG_UNIT));
+        bytes.extend(std::iter::repeat_n(0x22, PRG_UNIT));
+        bytes.resize(bytes.len() + 4 * CHR_BANK, 0);
+        Cartridge::load(&bytes).expect("synthetic NES 2.0 CNROM image must load")
     }
 
     /// Raw bytes for a synthesized AxROM image: `prg_banks` 32 KiB blocks,
@@ -1546,6 +1572,49 @@ mod tests {
             c.chr_map()[0],
             0,
             "a zero written against a nonzero ROM byte still selects bank 0"
+        );
+    }
+
+    /// NES 2.0 submapper 1 marks the mapper-3 hack boards with no bus
+    /// conflicts, so the latch takes the written value whole. The same write
+    /// that loses bits to a plain-iNES conflict must select bank 3 here.
+    #[test]
+    fn cnrom_nes20_submapper_one_has_no_bus_conflicts() {
+        let mut c = cnrom_nes20_cart(1);
+        c.prg[0x101] = 0x01; // $8101
+        c.cpu_write(0x8101, 0x03);
+        assert_eq!(
+            c.chr_map()[0],
+            24,
+            "submapper 1 must not AND the write with the ROM byte"
+        );
+    }
+
+    /// Submapper 2 names the original AND-type conflict board. A write keeps
+    /// only the bits the PRG ROM drives high there.
+    #[test]
+    fn cnrom_nes20_submapper_two_applies_and_type_bus_conflicts() {
+        let mut c = cnrom_nes20_cart(2);
+        c.prg[0x101] = 0x01; // $8101
+        c.cpu_write(0x8101, 0x03);
+        assert_eq!(
+            c.chr_map()[0],
+            8,
+            "submapper 2 must AND the write with the ROM byte"
+        );
+    }
+
+    /// Submapper 0 leaves the conflict behavior unknown, so the emulator
+    /// keeps the original AND-type behavior that plain iNES also uses.
+    #[test]
+    fn cnrom_nes20_submapper_zero_keeps_and_type_bus_conflicts() {
+        let mut c = cnrom_nes20_cart(0);
+        c.prg[0x101] = 0x01; // $8101
+        c.cpu_write(0x8101, 0x03);
+        assert_eq!(
+            c.chr_map()[0],
+            8,
+            "unknown submapper 0 keeps the AND-type conflict"
         );
     }
 
