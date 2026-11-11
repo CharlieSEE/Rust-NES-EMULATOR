@@ -29,7 +29,7 @@ use crate::region::Region;
 
 /// The only format this build writes and reads. A state from another version is
 /// refused with the version in the message, never reinterpreted.
-pub(crate) const STATE_VERSION: u16 = 1;
+pub(crate) const STATE_VERSION: u16 = 2;
 
 const MAGIC: &[u8; 8] = b"NESSTATE";
 
@@ -286,11 +286,11 @@ mod tests {
     fn a_state_from_another_version_mapper_region_or_rom_is_refused() {
         let bytes = wrapped();
         let mut wrong_version = bytes.clone();
-        wrong_version[8..10].copy_from_slice(&2u16.to_le_bytes());
+        wrong_version[8..10].copy_from_slice(&3u16.to_le_bytes());
         let err = unwrap(&wrong_version, 1, Region::Pal, 0x1234_5678_9abc_def0)
             .err()
-            .expect("version 2 must not load");
-        assert!(err.contains('2'), "error names the version: {err}");
+            .expect("version 3 must not load");
+        assert!(err.contains('3'), "error names the version: {err}");
 
         assert!(unwrap(&bytes, 2, Region::Pal, 0x1234_5678_9abc_def0).is_err());
         assert!(unwrap(&bytes, 1, Region::Ntsc, 0x1234_5678_9abc_def0).is_err());

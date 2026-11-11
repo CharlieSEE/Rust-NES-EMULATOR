@@ -1,12 +1,16 @@
 //! The 2A03's CPU: a 6502 core with the NES's own deviations.
 //!
-//! Documented opcodes plus the stable undocumented set games actually use
-//! (SLO, RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS and the NOP
-//! variants), and `$EB` as SBC because the golden log exercises it. The other
-//! unstable slots still panic with the address rather than pretending: no
-//! bundled game reaches them, and guessing at JAM's bus behaviour would hide a
-//! cartridge fault. Cycle counts are exact: one table of base counts plus the
-//! two standard penalties, never baked together.
+//! Documented opcodes, the stable undocumented set games actually use (SLO,
+//! RLA, SRE, RRA, SAX, LAX, DCP, ISC, ANC, ALR, ARR, AXS and the NOP variants),
+//! and every unstable slot: JAM, XAA, SHA, SHX, SHY, TAS, LAS and LXA. Cycle
+//! counts are exact: one table of base counts plus the two standard penalties,
+//! never baked together.
+//!
+//! The unstable group follows the conventional NMOS behaviour: JAM locks the
+//! CPU until reset; XAA and LXA use the usual `$EE` magic constant; and the
+//! SHA/SHX/SHY/TAS stores AND their value with the target's high byte + 1.
+//! The chip-dependent variants -- a dropped high-byte AND, the corrupted
+//! address on a page crossing, and XAA's dependence on RDY -- are not modelled.
 //!
 //! Two deliberate ceilings:
 //!
@@ -77,37 +81,34 @@ enum Mode {
     Rel,
 }
 
-/// Base cycles per opcode: the documented counts, the stable undocumented
-/// groups, and no page-cross or taken-branch penalty. Those two adjustments
-/// are added in `operand` and `branch`, never baked in here, so this table is
-/// the reference a human can check against a 6502 datasheet row by row. The
-/// remaining unstable slots still carry 1 because `step` panics before any of
-/// their modes is read.
+/// Base cycles per opcode: the documented counts and the undocumented groups,
+/// with no page-cross or taken-branch penalty. Those two adjustments are added
+/// in `operand` and `branch`, never baked in here, so this table is the
+/// reference a human can check against a 6502 datasheet row by row.
 #[rustfmt::skip]
 const CYCLES: [u8; 256] = [
 //    0    1    2    3    4    5    6    7    8    9    a    b    c    d    e    f
-      7,  6,  1,  8,  3,  3,  5,  5,  3,  2,  2,  2,  4,  4,  6,  6, // 00
-      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 10
-      6,  6,  1,  8,  3,  3,  5,  5,  4,  2,  2,  2,  4,  4,  6,  6, // 20
-      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 30
-      6,  6,  1,  8,  3,  3,  5,  5,  3,  2,  2,  2,  3,  4,  6,  6, // 40
-      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 50
-      6,  6,  1,  8,  3,  3,  5,  5,  4,  2,  2,  2,  5,  4,  6,  6, // 60
-      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 70
-      2,  6,  2,  6,  3,  3,  3,  3,  2,  2,  2,  1,  4,  4,  4,  4, // 80
-      2,  6,  1,  1,  4,  4,  4,  4,  2,  5,  2,  1,  1,  5,  1,  1, // 90
-      2,  6,  2,  6,  3,  3,  3,  3,  2,  2,  2,  1,  4,  4,  4,  4, // a0
-      2,  5,  1,  5,  4,  4,  4,  4,  2,  4,  2,  1,  4,  4,  4,  4, // b0
+      7,  6,  2,  8,  3,  3,  5,  5,  3,  2,  2,  2,  4,  4,  6,  6, // 00
+      2,  5,  2,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 10
+      6,  6,  2,  8,  3,  3,  5,  5,  4,  2,  2,  2,  4,  4,  6,  6, // 20
+      2,  5,  2,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 30
+      6,  6,  2,  8,  3,  3,  5,  5,  3,  2,  2,  2,  3,  4,  6,  6, // 40
+      2,  5,  2,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 50
+      6,  6,  2,  8,  3,  3,  5,  5,  4,  2,  2,  2,  5,  4,  6,  6, // 60
+      2,  5,  2,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // 70
+      2,  6,  2,  6,  3,  3,  3,  3,  2,  2,  2,  2,  4,  4,  4,  4, // 80
+      2,  6,  2,  6,  4,  4,  4,  4,  2,  5,  2,  5,  5,  5,  5,  5, // 90
+      2,  6,  2,  6,  3,  3,  3,  3,  2,  2,  2,  2,  4,  4,  4,  4, // a0
+      2,  5,  2,  5,  4,  4,  4,  4,  2,  4,  2,  4,  4,  4,  4,  4, // b0
       2,  6,  2,  8,  3,  3,  5,  5,  2,  2,  2,  2,  4,  4,  6,  6, // c0
-      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // d0
+      2,  5,  2,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // d0
       2,  6,  2,  8,  3,  3,  5,  5,  2,  2,  2,  2,  4,  4,  6,  6, // e0
-      2,  5,  1,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // f0
+      2,  5,  2,  8,  4,  4,  6,  6,  2,  4,  2,  7,  4,  4,  7,  7, // f0
 ];
 
 /// Addressing mode per opcode, indexed by the same opcode as `CYCLES`. `M` is
 /// just a short name for `Mode`, so a row of sixteen stays on one line and the
-/// table stays checkable against a datasheet by eye. Remaining unstable slots
-/// carry `Mode::Imp`; `step` panics on them before a mode is ever read.
+/// table stays checkable against a datasheet by eye.
 #[rustfmt::skip]
 const MODE: [Mode; 256] = [
     M::Imp,  M::IndX, M::Imp,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 00
@@ -118,10 +119,10 @@ const MODE: [Mode; 256] = [
     M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // 50
     M::Imp,  M::IndX, M::Imp,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  // 60
     M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // 70
-    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 80
-    M::Rel,  M::IndY, M::Imp,  M::Imp,  M::ZpX,  M::ZpX,  M::ZpY,  M::ZpY,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::Imp,  M::AbsX, M::Imp,  M::Imp,  // 90
-    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imp,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // a0
-    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpY,  M::ZpY,  M::Imp,  M::AbsY, M::Imp,  M::Imp,  M::AbsX, M::AbsX, M::AbsY, M::AbsY, // b0
+    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // 80
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpY,  M::ZpY,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsY, M::AbsY, // 90
+    M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // a0
+    M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpY,  M::ZpY,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsY, M::AbsY, // b0
     M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // c0
     M::Rel,  M::IndY, M::Imp,  M::IndY, M::ZpX,  M::ZpX,  M::ZpX,  M::ZpX,  M::Imp,  M::AbsY, M::Imp,  M::AbsY, M::AbsX, M::AbsX, M::AbsX, M::AbsX, // d0
     M::Imm,  M::IndX, M::Imm,  M::IndX, M::Zp,   M::Zp,   M::Zp,   M::Zp,   M::Imp,  M::Imm,  M::Acc,  M::Imm,  M::Abs,  M::Abs,  M::Abs,  M::Abs,  // e0
@@ -146,8 +147,8 @@ pub(crate) const DOCUMENTED: &[u8] = &[
 ];
 
 /// The stable undocumented opcodes, plus `$EB` (SBC), which the golden log
-/// exercises. The remaining unstable ones (JAM, XAA, SHA, SHX, SHY, TAS, LAS
-/// and LXA) still panic; see `an_undocumented_opcode_stops_the_cpu`.
+/// exercises. The unstable group lives in `UNSTABLE`; together the two lists
+/// and `DOCUMENTED` cover all 256 opcodes.
 #[cfg(test)]
 pub(crate) const UNOFFICIAL: &[u8] = &[
     0x03, 0x07, 0x0F, 0x13, 0x17, 0x1B, 0x1F, // SLO
@@ -171,11 +172,30 @@ pub(crate) const UNOFFICIAL: &[u8] = &[
     0x1C, 0x3C, 0x5C, 0x7C, 0xDC, 0xFC, // NOP absolute,X
 ];
 
+/// The unstable undocumented opcodes. Their real behaviour varies by chip, so
+/// these use the conventional NMOS values described at the top of the module.
+#[cfg(test)]
+pub(crate) const UNSTABLE: &[u8] = &[
+    0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xD2, 0xF2, // JAM
+    0x8B, 0xAB, // XAA, LXA
+    0x93, 0x9F, // SHA
+    0x9C, // SHY
+    0x9E, // SHX
+    0x9B, // TAS
+    0xBB, // LAS
+];
+
 /// Base address plus an index register, and whether that crosses a page -- the
 /// extra cycle an indexed *read* owes. Stores and read-modify-writes ignore it.
 fn index(base: u16, reg: u8) -> (u16, bool) {
     let ea = base.wrapping_add(reg as u16);
     (ea, ea & 0xFF00 != base & 0xFF00)
+}
+
+/// The `H + 1` term in the unstable SHA/SHX/SHY/TAS stores. The high byte is
+/// the effective address's, and the add wraps at `$FF`.
+fn high_plus_one(addr: u16) -> u8 {
+    ((addr >> 8) as u8).wrapping_add(1)
 }
 
 #[derive(Clone)]
@@ -187,6 +207,9 @@ pub struct Cpu {
     pc: u16,
     /// Processor status, bit 5 forced high. `B` is never stored: see `B`.
     p: u8,
+    /// A JAM locks the CPU: instructions still re-fetch the JAM, but no
+    /// interrupt may vector away and only reset clears this.
+    halted: bool,
 }
 
 impl Cpu {
@@ -201,6 +224,7 @@ impl Cpu {
             sp: 0xFD,
             pc: 0,
             p: U,
+            halted: false,
         }
     }
 
@@ -211,6 +235,7 @@ impl Cpu {
     pub fn reset<B: BusLike>(&mut self, bus: &mut B) {
         self.sp = 0xFD;
         self.p = U | I;
+        self.halted = false;
         self.pc = self.fetch16(bus, 0xFFFC);
     }
 
@@ -230,6 +255,7 @@ impl Cpu {
         writer.u8(self.sp);
         writer.u16(self.pc);
         writer.u8(self.p);
+        writer.bool(self.halted);
     }
 
     pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
@@ -239,6 +265,7 @@ impl Cpu {
         self.sp = reader.u8()?;
         self.pc = reader.u16()?;
         self.p = reader.u8()?;
+        self.halted = reader.bool()?;
         Ok(())
     }
 
@@ -576,6 +603,66 @@ impl Cpu {
                 self.nz(self.x);
                 cycles += crossed as u8;
             }
+            // --- unstable undocumented opcodes ---
+            //
+            // These are the slots whose behaviour varies between NMOS parts.
+            // They use the conventional values: JAM halts, the magic constant
+            // is $EE, and the stores AND with the target's high byte + 1.
+            0x02 | 0x12 | 0x22 | 0x32 | 0x42 | 0x52 | 0x62 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 => {
+                // JAM: the CPU locks up until reset. Rewinding PC makes every
+                // later step re-fetch this opcode, so the clock keeps running;
+                // `halted` stops any interrupt from vectoring away.
+                self.pc = self.pc.wrapping_sub(1);
+                self.halted = true;
+            }
+            0x8B => {
+                // XAA: A = (A | magic) & X & operand. The magic constant is
+                // chip- and RDY-dependent; $EE is the usual value.
+                let (v, crossed) = self.fetch(bus, mode);
+                self.a = (self.a | 0xEE) & self.x & v;
+                self.nz(self.a);
+                cycles += crossed as u8;
+            }
+            0xAB => {
+                // LXA: A = X = (A | magic) & operand.
+                let (v, crossed) = self.fetch(bus, mode);
+                let r = (self.a | 0xEE) & v;
+                self.a = r;
+                self.x = r;
+                self.nz(r);
+                cycles += crossed as u8;
+            }
+            0x93 | 0x9F => {
+                // SHA: store A & X & (H + 1).
+                let ea = self.operand(bus, mode).0;
+                bus.write(ea, self.a & self.x & high_plus_one(ea));
+            }
+            0x9C => {
+                // SHY: store Y & (H + 1).
+                let ea = self.operand(bus, mode).0;
+                bus.write(ea, self.y & high_plus_one(ea));
+            }
+            0x9E => {
+                // SHX: store X & (H + 1).
+                let ea = self.operand(bus, mode).0;
+                bus.write(ea, self.x & high_plus_one(ea));
+            }
+            0x9B => {
+                // TAS: SP = A & X, then store SP & (H + 1).
+                let ea = self.operand(bus, mode).0;
+                self.sp = self.a & self.x;
+                bus.write(ea, self.sp & high_plus_one(ea));
+            }
+            0xBB => {
+                // LAS: load A, X and SP with the operand & SP.
+                let (v, crossed) = self.fetch(bus, mode);
+                let r = v & self.sp;
+                self.a = r;
+                self.x = r;
+                self.sp = r;
+                self.nz(r);
+                cycles += crossed as u8;
+            }
             // The NOP variants only fetch their operand (and pay the page
             // cross when an indexed one has to). Implied NOPs fetch nothing.
             0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => {}
@@ -585,10 +672,6 @@ impl Cpu {
                 let _ = bus.read(ea);
                 cycles += crossed as u8;
             }
-            _ => panic!(
-                "unimplemented opcode ${op:02X} at ${:04X}: unsupported undocumented opcode",
-                self.pc.wrapping_sub(1)
-            ),
         }
         for _ in 0..cycles * 3 {
             bus.tick();
@@ -602,16 +685,19 @@ impl Cpu {
 
     /// Non-maskable interrupt: the game can't prevent it, so the PPU vblank
     /// flag reaching it gets the CPU here. Pushes PC as it stands -- the
-    /// address of the next instruction -- then vectors through `$FFFA`.
+    /// address of the next instruction -- then vectors through `$FFFA`. A
+    /// jammed CPU ignores it: only reset leaves a JAM.
     pub fn nmi<B: BusLike>(&mut self, bus: &mut B) {
-        self.interrupt(bus, 0xFFFA);
+        if !self.halted {
+            self.interrupt(bus, 0xFFFA);
+        }
     }
 
-    /// Maskable interrupt from `$FFFE`, ignored while `I` is set. An APU that
-    /// wants level-triggered IRQs has to keep asking until this lands, because
-    /// a request dropped here is dropped for good.
+    /// Maskable interrupt from `$FFFE`, ignored while `I` is set or the CPU is
+    /// jammed. An APU that wants level-triggered IRQs has to keep asking until
+    /// this lands, because a request dropped here is dropped for good.
     pub fn irq<B: BusLike>(&mut self, bus: &mut B) {
-        if !self.flag(I) {
+        if !self.halted && !self.flag(I) {
             self.interrupt(bus, 0xFFFE);
         }
     }
@@ -1474,12 +1560,12 @@ mod tests {
         }
     }
 
-    /// Every unofficial opcode this CPU claims is dispatched. The nestest
-    /// golden log validates their per-mode lengths and cycle counts; this only
-    /// catches a missing match arm.
+    /// Every undocumented opcode this CPU claims is dispatched. The nestest
+    /// golden log validates the stable group's per-mode lengths and cycle
+    /// counts; this catches a missing match arm in either group.
     #[test]
     fn every_unofficial_opcode_runs() {
-        for &op in UNOFFICIAL {
+        for &op in UNOFFICIAL.iter().chain(UNSTABLE) {
             let mut bus = TestBus::new();
             load(&mut bus, PROG, &[op]);
             let mut c = Cpu::new();
@@ -1488,13 +1574,162 @@ mod tests {
         }
     }
 
+    /// The three lists are the CPU's claim about which opcodes it handles. They
+    /// must partition the opcode space, or the dispatcher's exhaustive match
+    /// would not compile.
     #[test]
-    #[should_panic(expected = "unimplemented opcode $02")]
-    fn an_undocumented_opcode_stops_the_cpu() {
+    fn every_opcode_is_claimed_by_exactly_one_list() {
+        let mut claimed = [false; 256];
+        for &op in DOCUMENTED.iter().chain(UNOFFICIAL).chain(UNSTABLE) {
+            assert!(!claimed[op as usize], "opcode ${op:02X} is listed twice");
+            claimed[op as usize] = true;
+        }
+        for (op, claimed) in claimed.iter().enumerate() {
+            assert!(*claimed, "opcode ${op:02X} is not in any list");
+        }
+    }
+
+    #[test]
+    fn jam_locks_the_cpu_until_reset() {
         let mut bus = TestBus::new();
-        load(&mut bus, PROG, &[0x02]); // a JAM on the NMOS 6502: not stable
+        load(&mut bus, PROG, &[0x02]); // JAM
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80); // reset vector $8000
+        let mut c = Cpu::new();
+        c.pc = PROG;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.pc, PROG, "PC stays on the JAM so it executes forever");
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.pc, PROG);
+        assert_eq!(bus.dots, 12, "both JAMs kept the PPU clocked");
+        assert!(c.halted);
+        let sp = c.sp;
+        c.nmi(&mut bus);
+        c.irq(&mut bus);
+        assert_eq!(c.pc, PROG, "an interrupt cannot leave the jam");
+        assert_eq!(c.sp, sp);
+        assert_eq!(bus.dots, 12, "a refused interrupt costs no cycles");
+        c.reset(&mut bus);
+        assert_eq!(c.pc, 0x8000, "only reset leaves the jam");
+        assert!(!c.halted);
+    }
+
+    #[test]
+    fn a_jam_survives_a_state_round_trip() {
+        let mut bus = TestBus::new();
+        load(&mut bus, PROG, &[0x02]);
         let mut c = Cpu::new();
         c.pc = PROG;
         c.step(&mut bus);
+
+        let mut writer = StateWriter::new();
+        c.save_state(&mut writer);
+        let bytes = writer.finish();
+        let mut reader = StateReader::new(&bytes);
+        let mut restored = Cpu::new();
+        restored
+            .load_state(&mut reader)
+            .expect("CPU state must load");
+        reader.expect_end().expect("exactly the CPU state");
+
+        assert!(restored.halted);
+        restored.nmi(&mut bus);
+        assert_eq!(restored.pc, PROG);
+    }
+
+    #[test]
+    fn unstable_immediates_use_the_magic_constant() {
+        // XAA #$0F: A = ($00 | $EE) & $FF & $0F = $0E. A plain X & operand
+        // gives $0F, and A & X & operand gives $00.
+        let mut bus = TestBus::new();
+        load(&mut bus, PROG, &[0x8B, 0x0F]);
+        let mut c = Cpu::new();
+        c.pc = PROG;
+        c.a = 0x00;
+        c.x = 0xFF;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!(c.a, 0x0E);
+        assert_eq!(c.pc, PROG + 2);
+
+        // LXA #$0F: A = X = ($00 | $EE) & $0F = $0E.
+        load(&mut bus, PROG, &[0xAB, 0x0F]);
+        c.pc = PROG;
+        c.a = 0x00;
+        c.x = 0x00;
+        assert_eq!(c.step(&mut bus), 2);
+        assert_eq!((c.a, c.x), (0x0E, 0x0E));
+        assert_eq!(c.pc, PROG + 2);
+    }
+
+    #[test]
+    fn unstable_stores_and_high_byte_ops_match_their_parts() {
+        let mut bus = TestBus::new();
+        let mut c = Cpu::new();
+        c.p = C | V;
+
+        // SHA $3000,Y with A = X = $FF: store $FF & $FF & ($30 + 1) = $31.
+        load(&mut bus, 0x2000, &[0x9F, 0x00, 0x30]);
+        c.pc = 0x2000;
+        c.a = 0xFF;
+        c.x = 0xFF;
+        c.y = 0x10;
+        assert_eq!(c.step(&mut bus), 5);
+        assert_eq!(bus.read(0x3010), 0x31);
+        assert_eq!(c.p, C | V, "SHA changes no flags");
+        assert_eq!(c.pc, 0x2003);
+
+        // SHA ($40),Y takes the pointer's high byte from the zero page.
+        bus.write(0x0040, 0x00);
+        bus.write(0x0041, 0x30);
+        load(&mut bus, 0x2000, &[0x93, 0x40]);
+        c.pc = 0x2000;
+        assert_eq!(c.step(&mut bus), 6);
+        assert_eq!(bus.read(0x3010), 0x31);
+        assert_eq!(c.pc, 0x2002);
+
+        // SHX $3000,Y with X = $FF.
+        load(&mut bus, 0x2000, &[0x9E, 0x00, 0x30]);
+        c.pc = 0x2000;
+        assert_eq!(c.step(&mut bus), 5);
+        assert_eq!(bus.read(0x3010), 0x31);
+
+        // SHY $3000,X with Y = $FF.
+        load(&mut bus, 0x2000, &[0x9C, 0x00, 0x30]);
+        c.pc = 0x2000;
+        c.x = 0x10;
+        c.y = 0xFF;
+        assert_eq!(c.step(&mut bus), 5);
+        assert_eq!(bus.read(0x3010), 0x31);
+
+        // TAS $3000,Y: SP = A & X, then store SP & ($30 + 1).
+        load(&mut bus, 0x2000, &[0x9B, 0x00, 0x30]);
+        c.pc = 0x2000;
+        c.a = 0xFF;
+        c.x = 0xFF;
+        c.y = 0x10;
+        c.sp = 0xFD;
+        assert_eq!(c.step(&mut bus), 5);
+        assert_eq!(c.sp, 0xFF);
+        assert_eq!(bus.read(0x3010), 0x31);
+
+        // LAS $3000,Y: A = X = SP = operand & SP.
+        bus.write(0x3010, 0x8F);
+        load(&mut bus, 0x2000, &[0xBB, 0x00, 0x30]);
+        c.pc = 0x2000;
+        c.sp = 0xBF;
+        c.p = 0;
+        assert_eq!(c.step(&mut bus), 4);
+        assert_eq!((c.a, c.x, c.sp), (0x8F, 0x8F, 0x8F));
+        assert!(c.flag(N));
+        assert!(!c.flag(Z));
+
+        // LAS pays the page-cross cycle an indexed read owes.
+        bus.write(0x3100, 0x7F);
+        load(&mut bus, 0x2000, &[0xBB, 0xFF, 0x30]);
+        c.pc = 0x2000;
+        c.y = 0x01;
+        c.sp = 0xFF;
+        assert_eq!(c.step(&mut bus), 5);
+        assert_eq!(c.a, 0x7F);
     }
 }
