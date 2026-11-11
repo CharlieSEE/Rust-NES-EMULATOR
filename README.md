@@ -103,9 +103,9 @@ the cartridge runs but cannot be aimed.
   Adventure, Mega Man 3–6 and most of the TxROM library; mapper 3 covers
   Arkanoid, Adventure Island and other standard CNROM titles; mapper 7 covers
   Battletoads, R.C. Pro-Am and other AxROM titles, including the 512 KiB
-  variant; mapper 71 covers MiG 29, Bee 52, Dizzy the Adventurer and other
-  Camerica titles, with Fire Hawk's one-screen mirroring. Games on other
-  mappers still exit with a mapper error.
+  variant; mapper 71 covers MiG 29, Bee 52, Dizzy the Adventurer, the 256 KiB
+  Fantastic Adventures of Dizzy and other Camerica titles, with Fire Hawk's
+  one-screen mirroring. Games on other mappers still exit with a mapper error.
 - Save states live in `saves/<game>/` beside the binary, one folder per game:
   `state1`–`state9` plus a small `latest` file naming the newest. `<game>` is
   the ROM filename without its extension, so a game's `.nes` and `.zip` share
