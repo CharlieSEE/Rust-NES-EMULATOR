@@ -2436,9 +2436,10 @@ mod tests {
     }
 
     /// Rewriting `$2000` with NMI already enabled must not retrigger the NMI;
-    /// hardware only reacts to the 0-to-1 edge. Dizzy the Adventurer rewrites
-    /// `$2000` inside its own NMI handler, and treating 1-to-1 as an edge feeds
-    /// it NMIs for the rest of vblank.
+    /// hardware only reacts to the 0-to-1 edge. Dizzy the Adventurer and
+    /// Fantastic Adventures of Dizzy rewrite `$2000` inside their own NMI
+    /// handlers, so treating 1-to-1 as an edge feeds them NMIs for the rest of
+    /// vblank, starves the main loop and lets the CPU run garbage.
     #[test]
     fn rewriting_2000_with_nmi_already_enabled_does_not_retrigger() {
         let mut p = Ppu::new();
