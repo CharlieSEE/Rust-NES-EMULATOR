@@ -1,6 +1,6 @@
 # Feature backlog
 
-Current state: mappers 0/1/2/3/4/7/66/71, cycle-based PPU with scanline IRQ support in
+Current state: mappers 0/1/2/3/4/7/66/71/185, cycle-based PPU with scanline IRQ support in
 the cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
 serialization with quicksave slots and an in-game slot picker, launcher,
 scripted input and frame dumps.
@@ -18,7 +18,7 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 - [x] **Mapper 4 (MMC3)** — SMB3, Kirby, Mega Man 3–6, TMNT, Batman. Bank registers, 8 KiB CHR banking, PRG/CHR modes, scanline IRQ counter, mirroring control. *Done; filtered PPU A12 edge tracking, always-enabled PRG RAM for MMC6 compatibility, battery saves, mapper state in save states.*
 - [x] **Mapper 3 (CNROM)** — CHR bank register with bus conflicts. *Done; fixed PRG, 8 KiB CHR banking with AND-type bus conflicts, CHR bank in save states.*
-- [ ] **Mapper 185 (CNROM variant)** — 8 KiB CHR gated by chip-select bits; needs the correct submapper value or the first-two-reads heuristic. *Effort: S; issue #57.*
+- [x] **Mapper 185 (CNROM variant)** — 8 KiB CHR gated by chip-select bits; needs the correct submapper value or the first-two-reads heuristic. *Done; NES 2.0 submappers 4-7 select the enabling latch value, plain iNES uses the two-`$2007`-read heuristic, disabled CHR reads open bus, AND-type bus conflicts, protection state in save states; issue #57.*
 - [x] **CNROM NES 2.0 submappers** — submapper 1 disables bus conflicts; parse the NES 2.0 mapper/submapper fields. *Done; submapper 1 takes the written CHR bank whole, submapper 2 and unknown submapper 0 keep AND-type conflicts, plain iNES unchanged.*
 - [ ] **CNROM Namcot PRG RAM** — 2 KiB at `$6000-$7FFF`, mirrored three times, for Hayauchi Super Igo. *Effort: S; issue #56.*
 - [x] **Mapper 7 (AxROM)** — 32 KiB PRG banking, one-screen mirroring. *Done; 32 KiB PRG bank from bits 0-3 (512 KiB variant included), one-screen page from bit 4, CHR RAM, NES 2.0 submapper 2 bus conflicts, bank and mirroring in save states.*

@@ -31,6 +31,12 @@ const VBLANK_FIRST: u32 = 241;
 /// falling edges of M2, about ten PPU dots.
 const A12_FILTER_DOTS: u32 = 10;
 
+/// What a pattern read returns when the cartridge's CHR chip is disabled.
+/// Mapper 185 tri-states the chip and pulls D0 high; `$FF` is the NESdev
+/// heuristic's value and satisfies every known protection check, which only
+/// requires "not the byte the enabled chip would drive".
+pub(crate) const CHR_OPEN_BUS: u8 = 0xFF;
+
 /// The 2C02 master palette, verbatim from the NESdev wiki page "PPU palettes",
 /// file `2C02G_U_wiki.pal` (generated with pally v0.23.0, `--cld -phd 4 -e`),
 /// downloaded from
@@ -259,6 +265,9 @@ pub struct Ppu {
     /// switch 4 KiB (MMC1) or 1 KiB (MMC3) windows without the PPU knowing
     /// which board it is running.
     chr_map: [usize; 8],
+    /// Whether the cartridge's CHR chip is driving the pattern bus. Only
+    /// mapper 185 can turn it off; every other board leaves it true.
+    chr_enabled: bool,
     /// How the board wires the four logical nametables onto the 2 KiB of RAM.
     mirroring: Mirroring,
     /// Which console timing this PPU is: the scanline count and the palette.
@@ -423,6 +432,7 @@ impl Ppu {
             palette: [0; 32],
             chr: vec![0; 16384],
             chr_map: [0, 1, 2, 3, 4, 5, 6, 7],
+            chr_enabled: true,
             mirroring: Mirroring::Vertical,
             region,
             chr_ram: false,
@@ -606,12 +616,12 @@ impl Ppu {
                 5 => {
                     let addr = self.pattern_address(0);
                     self.observe_a12(addr);
-                    self.fetch.lo = self.chr[self.crbank(addr)];
+                    self.fetch.lo = self.pattern_read(addr);
                 }
                 7 => {
                     let addr = self.pattern_address(8);
                     self.observe_a12(addr);
-                    self.fetch.hi = self.chr[self.crbank(addr)];
+                    self.fetch.hi = self.pattern_read(addr);
                     // The group is complete; it becomes the low half of the
                     // shifters one reload from now.
                     self.prev = self.cur;
@@ -831,7 +841,7 @@ impl Ppu {
                 fine
             };
             let addr = self.sprite_pattern_address(tile, row);
-            let (lo, hi) = (self.chr[self.crbank(addr)], self.chr[self.crbank(addr + 8)]);
+            let (lo, hi) = (self.pattern_read(addr), self.pattern_read(addr + 8));
             let (lo, hi) = if attr & 0x40 != 0 {
                 (lo.reverse_bits(), hi.reverse_bits())
             } else {
@@ -1133,9 +1143,19 @@ impl Ppu {
     /// `$2000`, nametable RAM above it (palette RAM is handled by the caller).
     fn ppu_bus_read(&self, addr: u16) -> u8 {
         if addr < 0x2000 {
-            self.chr[self.crbank(addr)]
+            self.pattern_read(addr)
         } else {
             self.vram[vram_index(addr, self.mirroring)]
+        }
+    }
+
+    /// One byte of pattern memory, or open bus when the cartridge's CHR chip is
+    /// disabled (mapper 185's copy protection).
+    fn pattern_read(&self, addr: u16) -> u8 {
+        if self.chr_enabled {
+            self.chr[self.crbank(addr)]
+        } else {
+            CHR_OPEN_BUS
         }
     }
 
@@ -1157,6 +1177,12 @@ impl Ppu {
     /// windows and MMC3 maps 1 KiB windows; both are just assignments here.
     pub fn set_chr_map(&mut self, map: [usize; 8]) {
         self.chr_map = map;
+    }
+
+    /// Turn the cartridge's CHR chip on or off. Only mapper 185's copy
+    /// protection does; disabled pattern reads return open bus.
+    pub fn set_chr_enabled(&mut self, enabled: bool) {
+        self.chr_enabled = enabled;
     }
 
     /// Rewire the logical nametables. MMC1 changes this at runtime; simpler
@@ -1743,6 +1769,25 @@ mod tests {
         assert_eq!(p.crbank(0x0000), 24 * 1024);
         assert_eq!(p.ppu_bus_read(0x0000), 0x5A);
         assert_eq!(p.crbank(0x1FFF), 31 * 1024 + 0x03FF);
+    }
+
+    /// Mapper 185's copy protection tri-states the CHR chip, so both `$2007`
+    /// reads and the rendering fetches see open bus until the latch selects
+    /// the chip.
+    #[test]
+    fn disabled_chr_pattern_reads_are_open_bus() {
+        let mut p = Ppu::new();
+        p.load_chr_rom(&[0xAA; 8192], None);
+        p.set_chr_enabled(false);
+        assert_eq!(p.ppu_bus_read(0x0000), CHR_OPEN_BUS);
+        assert_eq!(p.ppu_bus_read(0x1FFF), CHR_OPEN_BUS);
+
+        p.set_chr_enabled(true);
+        assert_eq!(
+            p.ppu_bus_read(0x0000),
+            0xAA,
+            "the enabled chip drives again"
+        );
     }
 
     /// apu_reset's images carry 8 KiB of CHR, which is the PPU's whole pattern

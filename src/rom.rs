@@ -3,7 +3,9 @@
 //! large library, mapper 4 (MMC3) for the TxROM library, mapper 7 (AxROM) for
 //! "Battletoads" and its siblings, mapper 71 (Camerica/Codemasters) for its
 //! unlicensed library, mapper 66 (UxROM variant with bus conflicts) for
-//! "Super Mario Bros. + Duck Hunt", and mapper 0 (NROM) for blargg's APU
+//! "Super Mario Bros. + Duck Hunt", mapper 185 (CNROM with CHR-ROM disabled
+//! until the copy-protection latch names the chip's select value) for titles
+//! such as B-Wings and Mighty Bomb Jack, and mapper 0 (NROM) for blargg's APU
 //! test ROMs -- NROM-128 and NROM-256, both with the `$6000-$7FFF` PRG RAM the
 //! tests need, and the 2005 suite with no CHR at all (the PPU gets RAM instead).
 //!
@@ -52,6 +54,16 @@
 //! it keeps the conflict like plain iNES. Regular boards connect only two latch
 //! outputs for up to 32 KiB of CHR; the modulo over the image's real bank count
 //! also covers the 128 KiB Bandai variant, whose four outputs are all connected.
+//!
+//! Mapper 185 is CNROM with only 8 KiB of CHR-ROM, whose pins 26 and 27 are
+//! chip selects instead of address bits. The latch's low two bits must match
+//! the board's wired select value or the CHR chip tri-states: pattern reads are
+//! then open bus, which this emulator models as `$FF`, the pulled-up data lines
+//! the protection checks expect. NES 2.0 submappers 4-7 name that value as 0-3;
+//! every other header (including plain iNES) is unknown, so the board follows
+//! NESdev's heuristic: CHR stays disabled for the first two `$2007` reads after
+//! reset, then turns on for good. Writes always take the AND-type bus conflict,
+//! and there is no CHR banking: all four select values address the same 8 KiB.
 //!
 //! Mapper 7 is AxROM: one 32 KiB PRG bank over the whole `$8000-$FFFF` window,
 //! selected by bits 0-3 of any write in that window (bit 3 only exists on the
@@ -191,8 +203,9 @@ pub struct Cartridge {
     /// Which board this image is, and therefore how `$8000-$FFFF` decodes.
     board: Board,
     /// NES 2.0 submapper, 0 for plain iNES. Mapper 3 uses it to choose
-    /// no bus conflicts (submapper 1) or AND-type (submapper 2), and mapper 7
-    /// to choose AND-type bus conflicts (submapper 2).
+    /// no bus conflicts (submapper 1) or AND-type (submapper 2), mapper 7
+    /// to choose AND-type bus conflicts (submapper 2), and mapper 185 to name
+    /// the CHR chip's select value (submappers 4-7 mean 0-3).
     submapper: u8,
     /// Which PRG bank is mapped at the switchable window: a 32 KiB bank over
     /// `$8000-$FFFF` on GxROM and AxROM, a 16 KiB bank at `$8000-$BFFF` on
@@ -204,6 +217,16 @@ pub struct Cartridge {
     /// `$1000-$1FFF`. GxROM's and CNROM's 8 KiB value fills both; MMC1 selects
     /// them separately in 4 KiB mode.
     chr_banks: [usize; 2],
+    /// Mapper 185's copy-protection latch. Its low two bits are the CHR chip's
+    /// select inputs; every other board leaves it 0.
+    latch: u8,
+    /// Whether the pattern memory may drive the PPU data bus. True everywhere
+    /// except mapper 185, whose CHR chip tri-states until the latch names the
+    /// wired select value or the unknown-submapper heuristic has run.
+    chr_enabled: bool,
+    /// Mapper 185's unknown-submapper heuristic: `$2007` reads since reset,
+    /// capped at 2. The second read turns CHR on for the rest of the session.
+    ppu_reads: u8,
     /// MMC1 control register. Power-on/reset value is PRG mode 3 (switch at
     /// `$8000`, last bank fixed), 8 KiB CHR mode, and one-screen lower
     /// nametable mirroring (control bits 0-1 are 0).
@@ -236,6 +259,10 @@ enum Board {
     /// conflicts on the register write (AND-type unless NES 2.0 submapper 1
     /// names a mapper hack without them).
     CnRom,
+    /// CNROM with a copy-protected 8 KiB CHR chip, mapper 185: the latch's low
+    /// two bits must match the board's select value or pattern reads are open
+    /// bus (see the module docs).
+    CnRom185,
     /// MMC1, the Zelda board: serial PRG/CHR banking, mirroring control, and
     /// battery-backed PRG RAM.
     Mmc1,
@@ -260,7 +287,7 @@ enum Board {
 /// boards need a whole number of their fixed bank window.
 fn prg_size_supported(board: Board, len: usize) -> bool {
     match board {
-        Board::Nrom | Board::CnRom => len.is_power_of_two(),
+        Board::Nrom | Board::CnRom | Board::CnRom185 => len.is_power_of_two(),
         Board::Mmc1 | Board::UxRom | Board::Camerica => {
             len >= PRG_UNIT && len.is_multiple_of(PRG_UNIT)
         }
@@ -388,9 +415,10 @@ impl Cartridge {
             7 => Board::AxRom,
             66 => Board::GxRom,
             71 => Board::Camerica,
+            185 => Board::CnRom185,
             other => {
                 return Err(format!(
-                    "mapper {other}, only 0, 1, 2, 3, 4, 7, 66 and 71 are supported"
+                    "mapper {other}, only 0, 1, 2, 3, 4, 7, 66, 71 and 185 are supported"
                 ));
             }
         };
@@ -405,6 +433,7 @@ impl Cartridge {
         let bank = match board {
             Board::Nrom
             | Board::CnRom
+            | Board::CnRom185
             | Board::Mmc1
             | Board::Mmc3
             | Board::UxRom
@@ -420,14 +449,29 @@ impl Cartridge {
         let mirroring = match board {
             Board::Mmc1 | Board::AxRom => Mirroring::SingleLower,
             Board::GxRom => Mirroring::Vertical,
-            Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom | Board::Camerica
+            Board::Nrom
+            | Board::CnRom
+            | Board::CnRom185
+            | Board::Mmc3
+            | Board::UxRom
+            | Board::Camerica
                 if flags6 & 0x01 != 0 =>
             {
                 Mirroring::Vertical
             }
-            Board::Nrom | Board::CnRom | Board::Mmc3 | Board::UxRom | Board::Camerica => {
-                Mirroring::Horizontal
-            }
+            Board::Nrom
+            | Board::CnRom
+            | Board::CnRom185
+            | Board::Mmc3
+            | Board::UxRom
+            | Board::Camerica => Mirroring::Horizontal,
+        };
+        // Mapper 185's 74HC161 powers up at 0, so only the board whose select
+        // value is 0 (NES 2.0 submapper 4) has CHR enabled before the game
+        // writes the latch. Every other board always drives its pattern data.
+        let chr_enabled = match board {
+            Board::CnRom185 => submapper == 4,
+            _ => true,
         };
         Ok(Cartridge {
             prg: bytes[start..start + prg_len].to_vec(),
@@ -437,6 +481,9 @@ impl Cartridge {
             submapper,
             bank,
             chr_banks: [0, 1],
+            latch: 0,
+            chr_enabled,
+            ppu_reads: 0,
             control: 0x0C,
             shift: 0,
             shift_count: 0,
@@ -472,7 +519,12 @@ impl Cartridge {
         match self.board {
             Board::Mmc3 => true,
             Board::Nrom | Board::Mmc1 => self.prg_ram_enabled,
-            Board::UxRom | Board::Camerica | Board::GxRom | Board::CnRom | Board::AxRom => false,
+            Board::UxRom
+            | Board::Camerica
+            | Board::GxRom
+            | Board::CnRom
+            | Board::CnRom185
+            | Board::AxRom => false,
         }
     }
 
@@ -538,6 +590,7 @@ impl Cartridge {
             Board::AxRom => 7,
             Board::GxRom => 66,
             Board::Camerica => 71,
+            Board::CnRom185 => 185,
         }
     }
 
@@ -571,6 +624,13 @@ impl Cartridge {
             writer.bool(self.mmc3.irq_enabled);
             writer.bool(self.mmc3.irq_pending);
         }
+        // The copy-protection latch and the heuristic's read count are state,
+        // not ROM identity: a quicksave made during the check must resume it.
+        if matches!(self.board, Board::CnRom185) {
+            writer.u8(self.latch);
+            writer.bool(self.chr_enabled);
+            writer.u8(self.ppu_reads);
+        }
     }
 
     pub(crate) fn load_state(&mut self, reader: &mut StateReader) -> Result<(), String> {
@@ -578,7 +638,7 @@ impl Cartridge {
         let banks = match self.board {
             // NROM and CNROM have no PRG bank register; bank 0 is the only
             // legal state.
-            Board::Nrom | Board::CnRom => 1,
+            Board::Nrom | Board::CnRom | Board::CnRom185 => 1,
             // MMC1's PRG register is four bits, and a value past the ROM's
             // count wraps in `mmc1_prg_banks`, exactly as on hardware.
             Board::Mmc1 => 16,
@@ -629,12 +689,74 @@ impl Cartridge {
             self.mmc3.irq_enabled = reader.bool()?;
             self.mmc3.irq_pending = reader.bool()?;
         }
+        if matches!(self.board, Board::CnRom185) {
+            let latch = reader.u8()?;
+            if latch & 0xF0 != 0 {
+                return Err(format!(
+                    "save state has mapper 185 latch ${latch:02X}; the register is four bits"
+                ));
+            }
+            self.latch = latch;
+            self.chr_enabled = reader.bool()?;
+            let reads = reader.u8()?;
+            if reads > 2 {
+                return Err(format!(
+                    "save state has {reads} mapper 185 CHR reads; the heuristic stops at two"
+                ));
+            }
+            self.ppu_reads = reads;
+        }
         Ok(())
     }
 
     /// The CHR ROM image, for the PPU to hold. Borrowed, not copied.
     pub fn chr_rom(&self) -> &[u8] {
         &self.chr
+    }
+
+    /// Whether the board's CHR chip is currently driving the PPU data bus.
+    /// True everywhere except mapper 185, where the copy-protection latch
+    /// tri-states it until the correct select value is written (or the
+    /// unknown-submapper heuristic completes).
+    pub fn chr_enabled(&self) -> bool {
+        self.chr_enabled
+    }
+
+    /// Mapper 185's wired CHR select value, when NES 2.0 names it. Submappers
+    /// 4-7 mean 0-3; plain iNES and every other value leave it unknown.
+    fn chr_select(&self) -> Option<u8> {
+        match self.submapper {
+            4..=7 => Some(self.submapper - 4),
+            _ => None,
+        }
+    }
+
+    /// One CPU `$2007` read. With an unknown mapper-185 select value, NESdev's
+    /// heuristic returns open bus for the first two reads after reset and
+    /// enables CHR for good afterwards. Returns true when this read is one of
+    /// those two open-bus reads. Every other board ignores the read.
+    pub fn note_ppu_read(&mut self) -> bool {
+        if !matches!(self.board, Board::CnRom185) || self.chr_select().is_some() {
+            return false;
+        }
+        if self.ppu_reads < 2 {
+            self.ppu_reads += 1;
+            self.chr_enabled = self.ppu_reads == 2;
+            return true;
+        }
+        false
+    }
+
+    /// Power-on/reset state for the register boards. The 74HC161 latch powers
+    /// up cleared, so mapper 185 has CHR enabled only when the board's select
+    /// value is 0 (NES 2.0 submapper 4), and its read heuristic restarts.
+    /// Every other board is unaffected by a reset.
+    pub fn reset(&mut self) {
+        if matches!(self.board, Board::CnRom185) {
+            self.latch = 0;
+            self.ppu_reads = 0;
+            self.chr_enabled = self.chr_select() == Some(0);
+        }
     }
 
     /// The eight 1 KiB CHR slots at `$0000-$1FFF`. Slots 0-3 are the first
@@ -721,15 +843,17 @@ impl Cartridge {
         matches!(self.board, Board::Mmc3) && self.mmc3.irq_pending
     }
 
-    /// The CPU's `$8000-$FFFF` window. NROM and CNROM have no PRG bank
-    /// register: 16 KiB images mirror their single block, 32 KiB ones map both
-    /// halves directly, and `& (len - 1)` does both. GxROM and AxROM map one
-    /// 32 KiB bank across the whole window. UxROM and Camerica map a 16 KiB
-    /// bank at `$8000-$BFFF` and pin the last 16 KiB of the file at
-    /// `$C000-$FFFF`. MMC1 follows its PRG mode.
+    /// The CPU's `$8000-$FFFF` window. NROM, CNROM and its mapper-185 variant
+    /// have no PRG bank register: 16 KiB images mirror their single block, 32
+    /// KiB ones map both halves directly, and `& (len - 1)` does both. GxROM
+    /// and AxROM map one 32 KiB bank across the whole window. UxROM and
+    /// Camerica map a 16 KiB bank at `$8000-$BFFF` and pin the last 16 KiB of
+    /// the file at `$C000-$FFFF`. MMC1 follows its PRG mode.
     pub fn cpu_read(&self, addr: u16) -> u8 {
         match self.board {
-            Board::Nrom | Board::CnRom => self.prg[addr as usize & (self.prg.len() - 1)],
+            Board::Nrom | Board::CnRom | Board::CnRom185 => {
+                self.prg[addr as usize & (self.prg.len() - 1)]
+            }
             Board::GxRom | Board::AxRom => self.prg[self.bank * BANK + (addr as usize - 0x8000)],
             Board::UxRom | Board::Camerica if addr < 0xC000 => {
                 self.prg[self.bank * PRG_UNIT + (addr as usize - 0x8000)]
@@ -793,6 +917,13 @@ impl Cartridge {
     /// sixteen banks; regular 32 KiB boards wire only two, which the modulo
     /// over the image's real bank count covers.
     ///
+    /// Mapper 185 is the same latch, always with AND-type bus conflicts, but
+    /// its low two outputs are the CHR chip's select inputs instead of address
+    /// bits. NES 2.0 submappers 4-7 name the one value that enables CHR; an
+    /// unknown value leaves CHR disabled until the first-two-$2007-reads
+    /// heuristic in `note_ppu_read` enables it. The latch itself never selects
+    /// a CHR bank: the board mounts exactly one 8 KiB bank.
+    ///
     /// GxROM is a bus-conflict board: the bank register only moves when the
     /// byte written is already the byte the CPU reads at that address. Its
     /// register is `xxPPxxCC`, so PRG is BITS 5-4 (NESdev "GxROM": "the board
@@ -839,6 +970,18 @@ impl Cartridge {
                 let banks = (self.chr.len() / CHR_BANK).max(1);
                 let bank = (value & 0x0F) as usize % banks;
                 self.chr_banks = [bank * 2, bank * 2 + 1];
+            }
+            Board::CnRom185 => {
+                if addr < 0x8000 {
+                    return;
+                }
+                // The copy-protected board always wires the AND-type conflict:
+                // the 74HC161 sees the written byte ANDed with the byte the
+                // fixed PRG ROM drives at that address.
+                self.latch = (val & self.cpu_read(addr)) & 0x0F;
+                if let Some(select) = self.chr_select() {
+                    self.chr_enabled = self.latch & 0x03 == select;
+                }
             }
             Board::Mmc1 => self.mmc1_write(addr, val),
             Board::GxRom => {
@@ -1067,6 +1210,23 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0x22, PRG_UNIT));
         bytes.resize(bytes.len() + 4 * CHR_BANK, 0);
         Cartridge::load(&bytes).expect("synthetic NES 2.0 CNROM image must load")
+    }
+
+    /// A synthesized mapper-185 image: two 16 KiB PRG blocks filled with
+    /// `0x11` and `0x22`, and one 8 KiB CHR bank whose bytes count up. `None`
+    /// leaves a plain iNES header, whose unknown select value must use the
+    /// two-read heuristic.
+    fn cnrom185_cart(submapper: Option<u8>) -> Cartridge {
+        let mut header = ines_header(2, 1, 185);
+        if let Some(submapper) = submapper {
+            header[7] |= 0x08; // NES 2.0 signature
+            header[8] = submapper << 4;
+        }
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0x11, PRG_UNIT));
+        bytes.extend(std::iter::repeat_n(0x22, PRG_UNIT));
+        bytes.extend((0..CHR_BANK).map(|i| i as u8));
+        Cartridge::load(&bytes).expect("synthetic mapper-185 image must load")
     }
 
     /// Raw bytes for a synthesized AxROM image: `prg_banks` 32 KiB blocks,
@@ -1639,6 +1799,180 @@ mod tests {
             .load_state(&mut StateReader::new(&bytes))
             .expect("CNROM mapper state must load");
         assert_eq!(restored.chr_map(), before, "the CHR bank must come back");
+    }
+
+    /// Mapper 185 is CNROM's fixed-PRG side with one 8 KiB CHR bank. Its
+    /// protection latch is not a bank register: all four select values point
+    /// at the same pattern data.
+    #[test]
+    fn cnrom185_loads_as_mapper_185_with_fixed_prg_and_one_chr_bank() {
+        let c = cnrom185_cart(Some(5));
+        assert_eq!(c.mapper_id(), 185, "cnrom185_cart must load as mapper 185");
+        assert!(matches!(c.board, Board::CnRom185), "mapper 185 is CnRom185");
+        assert_eq!(
+            (c.cpu_read(0x8000), c.cpu_read(0xC000)),
+            (0x11, 0x22),
+            "32 KiB PRG is mapped directly, not banked"
+        );
+        assert!(!c.prg_ram_enabled(), "mapper 185 has no $6000-$7FFF RAM");
+        assert_eq!(
+            c.chr_map(),
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            "the 8 KiB bank fills the whole pattern window"
+        );
+        assert_eq!(
+            c.mirroring(),
+            Mirroring::Horizontal,
+            "the header mirroring bit is fixed on the board"
+        );
+    }
+
+    /// NES 2.0 submappers 4-7 wire the CHR chip's select inputs to 0-3. The
+    /// board's 74HC161 powers up at 0, so only submapper 4 starts enabled.
+    /// Every other latch value tri-states the chip.
+    #[test]
+    fn cnrom185_submappers_name_the_chr_select_value() {
+        for (submapper, select) in [(4, 0), (5, 1), (6, 2), (7, 3)] {
+            let mut c = cnrom185_cart(Some(submapper));
+            assert_eq!(
+                c.chr_enabled(),
+                select == 0,
+                "submapper {submapper}: power-on latch 0 {} select {select}",
+                if select == 0 {
+                    "matches"
+                } else {
+                    "does not match"
+                }
+            );
+
+            // The ROM byte drives $0F, so a write with the select value in its
+            // low two bits latches exactly that value.
+            c.prg[0x100] = 0x0F; // $8100
+            c.cpu_write(0x8100, 0xF0 | select);
+            assert!(c.chr_enabled(), "submapper {submapper}: the wired value");
+
+            // A different low nibble must disable the chip again.
+            c.prg[0x101] = 0x0F; // $8101
+            c.cpu_write(0x8101, 0xF0 | ((select + 1) & 0x03));
+            assert!(!c.chr_enabled(), "submapper {submapper}: the wrong value");
+        }
+    }
+
+    /// Mapper 185 always takes the CNROM AND-type bus conflict, even for a
+    /// NES 2.0 header. Only the bits the PRG ROM drives high reach the latch.
+    #[test]
+    fn cnrom185_writes_are_anded_with_the_rom_byte() {
+        let mut c = cnrom185_cart(Some(5)); // select 1
+        c.prg[0x100] = 0x03; // $8100
+        c.cpu_write(0x8100, 0x03);
+        assert_eq!(c.latch & 0x03, 3, "the latch sees val & ROM");
+        assert!(!c.chr_enabled(), "$03 is not the wired select value 1");
+
+        c.prg[0x101] = 0x01; // $8101
+        c.cpu_write(0x8101, 0x03);
+        assert_eq!(c.latch & 0x03, 1, "only the ROM-driven bit survives");
+        assert!(c.chr_enabled(), "$01 is the wired select value");
+    }
+
+    /// Without a NES 2.0 select value, NESdev's heuristic returns open bus for
+    /// the first two `$2007` reads after reset and then enables CHR for good.
+    /// A known select value ignores the read count entirely.
+    #[test]
+    fn cnrom185_unknown_select_uses_the_two_read_heuristic() {
+        let mut c = cnrom185_cart(None);
+        assert!(!c.chr_enabled(), "the unknown-select board starts disabled");
+        assert!(c.note_ppu_read(), "the first read is open bus");
+        assert!(!c.chr_enabled());
+        assert!(c.note_ppu_read(), "the second read is open bus");
+        assert!(c.chr_enabled(), "the second read enables CHR");
+        assert!(!c.note_ppu_read(), "later reads are not overridden");
+        assert!(c.chr_enabled());
+
+        // A latch write does not disable the chip once the heuristic completed,
+        // because the unknown board cannot know which value would be wrong.
+        c.prg[0x100] = 0xFF;
+        c.cpu_write(0x8100, 0xFF);
+        assert!(
+            c.chr_enabled(),
+            "the heuristic stays enabled for the session"
+        );
+
+        for submapper in 4..=7 {
+            let mut known = cnrom185_cart(Some(submapper));
+            assert!(
+                !known.note_ppu_read(),
+                "submapper {submapper} has no heuristic"
+            );
+            assert_eq!(
+                known.chr_enabled(),
+                submapper == 4,
+                "submapper {submapper} keeps its power-on select state"
+            );
+        }
+    }
+
+    /// RESET clears the latch and restarts the unknown-select heuristic.
+    #[test]
+    fn cnrom185_reset_restores_the_power_on_protection_state() {
+        let mut known = cnrom185_cart(Some(5)); // select 1
+        known.prg[0x100] = 0x01;
+        known.cpu_write(0x8100, 0x01);
+        assert!(known.chr_enabled());
+        known.reset();
+        assert_eq!(known.latch, 0, "the 74HC161 powers up cleared");
+        assert!(!known.chr_enabled(), "latch 0 is not select 1");
+
+        let mut unknown = cnrom185_cart(None);
+        assert!(unknown.note_ppu_read());
+        assert!(unknown.note_ppu_read());
+        assert!(unknown.chr_enabled());
+        unknown.reset();
+        assert!(!unknown.chr_enabled(), "reset disables the unknown board");
+        assert!(unknown.note_ppu_read(), "the first read is open bus again");
+        assert!(!unknown.chr_enabled());
+        assert!(unknown.note_ppu_read(), "the second read enables CHR again");
+        assert!(unknown.chr_enabled());
+    }
+
+    /// The latch, enable state and read count are mapper state: a state saved
+    /// during the startup check must resume it, not restart it.
+    #[test]
+    fn a_saved_cnrom185_state_restores_the_protection_state() {
+        use crate::state::{StateReader, StateWriter};
+
+        let mut known = cnrom185_cart(Some(5)); // select 1
+        known.prg[0x100] = 0x01;
+        known.cpu_write(0x8100, 0x01);
+        let before = (known.latch, known.chr_enabled(), known.ppu_reads);
+        assert!(before.1, "test setup enabled CHR");
+
+        let mut writer = StateWriter::new();
+        known.save_state(&mut writer);
+        let bytes = writer.finish();
+        let mut restored = cnrom185_cart(Some(5));
+        restored
+            .load_state(&mut StateReader::new(&bytes))
+            .expect("mapper 185 state must load");
+        assert_eq!(
+            (restored.latch, restored.chr_enabled(), restored.ppu_reads),
+            before,
+            "the latch and enable state must come back"
+        );
+
+        // A state saved after one heuristic read must still need exactly one
+        // more read before CHR turns on.
+        let mut unknown = cnrom185_cart(None);
+        assert!(unknown.note_ppu_read());
+        let mut writer = StateWriter::new();
+        unknown.save_state(&mut writer);
+        let bytes = writer.finish();
+        let mut restored = cnrom185_cart(None);
+        restored
+            .load_state(&mut StateReader::new(&bytes))
+            .expect("mapper 185 heuristic state must load");
+        assert!(!restored.chr_enabled());
+        assert!(restored.note_ppu_read(), "the interrupted second read");
+        assert!(restored.chr_enabled());
     }
 
     /// AxROM maps one 32 KiB bank over the whole `$8000-$FFFF` window, and the
