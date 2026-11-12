@@ -98,14 +98,18 @@ the cartridge runs but cannot be aimed.
   a `.sav` file beside the ROM periodically while playing and on exit.
 - iNES **mapper 0 (NROM)**, **mapper 1 (MMC1)**, **mapper 2 (UxROM)**,
   **mapper 3 (CNROM)**, **mapper 4 (MMC3/TxROM)**, **mapper 7 (AxROM)**,
-  **mapper 66** (the SMB/Duck Hunt board) and **mapper 71**
-  (Camerica/Codemasters) are supported. Mapper 4 covers SMB3, Kirby's
+  **mapper 66** (the SMB/Duck Hunt board), **mapper 71**
+  (Camerica/Codemasters) and **mapper 185** (CNROM with a copy-protected
+  8 KiB CHR chip) are supported. Mapper 4 covers SMB3, Kirby's
   Adventure, Mega Man 3–6 and most of the TxROM library; mapper 3 covers
   Arkanoid, Adventure Island and other standard CNROM titles; mapper 7 covers
   Battletoads, R.C. Pro-Am and other AxROM titles, including the 512 KiB
   variant; mapper 71 covers MiG 29, Bee 52, Dizzy the Adventurer, the 256 KiB
   Fantastic Adventures of Dizzy and other Camerica titles, with Fire Hawk's
-  one-screen mirroring. Games on other mappers still exit with a mapper error.
+  one-screen mirroring; mapper 185 covers Mighty Bomb Jack, Bird Week and
+  other CNROM titles whose CHR chip is disabled until the copy-protection
+  latch names its select value. Games on other mappers still exit with a
+  mapper error.
 - Save states live in `saves/<game>/` beside the binary, one folder per game:
   `state1`–`state9` plus a small `latest` file naming the newest. `<game>` is
   the ROM filename without its extension, so a game's `.nes` and `.zip` share

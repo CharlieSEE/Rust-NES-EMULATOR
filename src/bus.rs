@@ -155,9 +155,18 @@ impl Bus {
             .is_nes20()
             .then(|| bus.cart.chr_ram_size() + bus.cart.chr_nvram_size());
         bus.ppu.load_chr_rom(bus.cart.chr_rom(), chr_ram_size);
-        bus.ppu.set_chr_map(bus.cart.chr_map());
-        bus.ppu.set_mirroring(bus.cart.mirroring());
+        bus.sync_mapper();
         bus
+    }
+
+    /// Push the mapper's visible state into the PPU: CHR window, nametables and
+    /// the mapper-185 CHR chip enable. Called after every PRG-window write and
+    /// after a `$2007` read, because mapper 185's read heuristic can turn the
+    /// CHR chip on between the PPU fetch and the next CPU access.
+    fn sync_mapper(&mut self) {
+        self.ppu.set_chr_map(self.cart.chr_map());
+        self.ppu.set_mirroring(self.cart.mirroring());
+        self.ppu.set_chr_enabled(self.cart.chr_enabled());
     }
 
     /// Power-on state. The 2A03's RAM comes up undefined and the game's own
@@ -200,6 +209,10 @@ impl Bus {
     pub fn reset(&mut self) {
         self.clear_clock();
         self.apu.reset();
+        // The 74HC161 latch survives RESET; only mapper 185's unknown-select
+        // first-two-reads heuristic restarts. No other board has state here.
+        self.cart.reset();
+        self.ppu.set_chr_enabled(self.cart.chr_enabled());
     }
 
     /// Put an APU-register or controller access on the cycle it really
@@ -272,7 +285,19 @@ impl Bus {
             0x0000..=0x1FFF => self.cpu_ram[addr as usize & 0x07FF],
             // "$2000-$2007 ... $2008-$3FFF: mirrors of $2000-$2007 (repeats
             // every 8 bytes)"; the PPU does the `& 7` itself.
-            0x2000..=0x3FFF => self.ppu.cpu_read(addr),
+            0x2000..=0x3FFF => {
+                let mut value = self.ppu.cpu_read(addr);
+                // Mapper 185's unknown-select heuristic returns open bus for
+                // the first two CPU `$2007` reads after reset, then enables the
+                // CHR chip for good.
+                if addr & 7 == 7 {
+                    if self.cart.note_ppu_read() {
+                        value = crate::ppu::CHR_OPEN_BUS;
+                    }
+                    self.ppu.set_chr_enabled(self.cart.chr_enabled());
+                }
+                value
+            }
             0x4015 => {
                 self.apu_advance_ahead(self.instr_cycles);
                 self.apu.cpu_read(addr)
@@ -289,8 +314,9 @@ impl Bus {
                 let offset = (addr as usize - 0x6000) % self.prg_ram_window();
                 self.prg_ram[offset]
             }
-            // Mappers 2, 7, 66 and 71 and this CNROM board map nothing below
-            // $8000: no PRG RAM, no registers, so `$4020-$7FFF` is open bus.
+            // Mappers 2, 7, 66 and 71, plus both CNROM boards, map nothing
+            // below $8000: no PRG RAM, no registers, so `$4020-$7FFF` is open
+            // bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
             _ => 0,
         }
@@ -343,8 +369,7 @@ impl Bus {
                 // GxROM's and CNROM's CHR bits live in their PRG-window
                 // registers. Push whatever the mapper now reports on every
                 // write.
-                self.ppu.set_chr_map(self.cart.chr_map());
-                self.ppu.set_mirroring(self.cart.mirroring());
+                self.sync_mapper();
             }
             _ => {}
         }
@@ -494,6 +519,9 @@ impl Bus {
         next.cpu_ram = reader.array()?;
         next.prg_ram = reader.array()?;
         next.ppu.load_state(&mut reader)?;
+        // The PPU's CHR-enable mirror is derived from the cartridge, so restore
+        // it rather than trusting the PPU payload alone.
+        next.ppu.set_chr_enabled(next.cart.chr_enabled());
         next.apu.load_state(&mut reader)?;
         for controller in &mut next.controllers {
             controller.load_state(&mut reader)?;
@@ -761,6 +789,22 @@ mod tests {
         let mut bytes = crate::rom::ines_header(1, 0, 0).to_vec(); // 16 KiB PRG
         bytes.resize(16 + 0x4000, 0);
         Cartridge::load(&bytes).expect("synthetic NROM image must load")
+    }
+
+    /// A mapper-185 image whose PRG is all `$0F` and whose 8 KiB CHR is all
+    /// `$A5`. The PRG fill means the AND bus conflict passes the low nibble of
+    /// a write through, so a latch value can be selected without patching.
+    /// `None` leaves a plain iNES header, which uses the two-read heuristic.
+    fn cnrom185_cart(submapper: Option<u8>) -> Cartridge {
+        let mut header = crate::rom::ines_header(2, 1, 185);
+        if let Some(submapper) = submapper {
+            header[7] |= 0x08; // NES 2.0 signature
+            header[8] = submapper << 4;
+        }
+        let mut bytes = header.to_vec();
+        bytes.extend(std::iter::repeat_n(0x0F, 0x8000));
+        bytes.extend(std::iter::repeat_n(0xA5, 0x2000));
+        Cartridge::load(&bytes).expect("synthetic mapper-185 image must load")
     }
 
     /// A cartridge with a real interrupt layout: `$8000` runs `CLI; JMP $8000`,
@@ -1321,6 +1365,80 @@ mod tests {
         // blindly. Bank 1 reads 1 at $8000, so $EE does not match.
         b.cpu_write(0x8000, 0xEE);
         assert_eq!(b.cpu_read(0x8001), 1, "a non-matching write must not bank");
+    }
+
+    /// NESdev's unknown-select heuristic: the first two CPU `$2007` reads
+    /// after reset are `$FF`, then the CHR chip is enabled for good. The PPU's
+    /// one-byte-late read buffer means one more `$FF` can surface before the
+    /// real pattern byte.
+    #[test]
+    fn mapper_185_unknown_select_returns_ff_for_the_first_two_2007_reads() {
+        let mut b = Bus::new(cnrom185_cart(None));
+        b.cpu_write(0x2006, 0x00);
+        b.cpu_write(0x2006, 0x00);
+        assert_eq!(b.cpu_read(0x2007), 0xFF);
+        assert!(!b.cart.chr_enabled(), "the chip is off for the first read");
+        assert_eq!(b.cpu_read(0x2007), 0xFF);
+        assert!(b.cart.chr_enabled(), "the second read enables the chip");
+
+        assert_eq!(b.cpu_read(0x2007), 0xFF, "the stale disabled refill");
+        assert_eq!(b.cpu_read(0x2007), 0xA5, "real CHR follows");
+    }
+
+    /// A known NES 2.0 select value does not use the read heuristic: only the
+    /// latch write matching the board's wiring enables the CHR chip.
+    #[test]
+    fn mapper_185_submapper_5_enables_chr_only_for_latch_one() {
+        let mut b = Bus::new(cnrom185_cart(Some(5)));
+        assert!(!b.cart.chr_enabled(), "power-on latch 0 is not select 1");
+
+        b.cpu_write(0x8000, 0x01); // PRG $0F -> latch 1
+        assert!(b.cart.chr_enabled(), "the wired select value enables CHR");
+        b.cpu_write(0x8000, 0x02);
+        assert!(!b.cart.chr_enabled(), "another latch value tri-states CHR");
+        b.cpu_write(0x8000, 0x01);
+        assert!(b.cart.chr_enabled(), "the wired value enables it again");
+
+        b.reset();
+        assert!(b.cart.chr_enabled(), "RESET keeps the matching latch");
+        b.cpu_write(0x8000, 0x02);
+        b.reset();
+        assert!(!b.cart.chr_enabled(), "RESET keeps the non-matching latch");
+    }
+
+    #[test]
+    fn mapper_185_reset_restarts_the_two_read_heuristic() {
+        let mut b = Bus::new(cnrom185_cart(None));
+        let _ = b.cpu_read(0x2007);
+        assert_eq!(b.cpu_read(0x2007), 0xFF);
+        assert!(b.cart.chr_enabled());
+
+        b.reset();
+        assert!(!b.cart.chr_enabled(), "reset must disable the CHR chip");
+        assert_eq!(b.cpu_read(0x2007), 0xFF);
+        assert!(!b.cart.chr_enabled(), "the first read is open bus again");
+        assert_eq!(b.cpu_read(0x2007), 0xFF);
+        assert!(b.cart.chr_enabled(), "the second read enables it again");
+    }
+
+    /// The read count is in the save state, so restoring after the first read
+    /// must need only one more read to enable CHR.
+    #[test]
+    fn a_restored_mapper_185_state_resumes_the_two_read_heuristic() {
+        let mut b = Bus::new(cnrom185_cart(None));
+        let cpu = Cpu::new();
+        assert_eq!(b.cpu_read(0x2007), 0xFF);
+        assert!(!b.cart.chr_enabled());
+        let saved = b.save_state(&cpu);
+
+        let mut restored = Bus::new(cnrom185_cart(None));
+        let mut restored_cpu = Cpu::new();
+        restored
+            .load_state(&mut restored_cpu, &saved)
+            .expect("mapper 185 state must load");
+        assert!(!restored.cart.chr_enabled(), "one read is still owed");
+        assert_eq!(restored.cpu_read(0x2007), 0xFF);
+        assert!(restored.cart.chr_enabled(), "the second read enables CHR");
     }
 
     #[test]
