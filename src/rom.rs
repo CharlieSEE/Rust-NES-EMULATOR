@@ -220,10 +220,6 @@ pub struct Cartridge {
     /// Mapper 185's copy-protection latch. Its low two bits are the CHR chip's
     /// select inputs; every other board leaves it 0.
     latch: u8,
-    /// Whether the pattern memory may drive the PPU data bus. True everywhere
-    /// except mapper 185, whose CHR chip tri-states until the latch names the
-    /// wired select value or the unknown-submapper heuristic has run.
-    chr_enabled: bool,
     /// Mapper 185's unknown-submapper heuristic: `$2007` reads since reset,
     /// capped at 2. The second read turns CHR on for the rest of the session.
     ppu_reads: u8,
@@ -466,13 +462,6 @@ impl Cartridge {
             | Board::UxRom
             | Board::Camerica => Mirroring::Horizontal,
         };
-        // Mapper 185's 74HC161 powers up at 0, so only the board whose select
-        // value is 0 (NES 2.0 submapper 4) has CHR enabled before the game
-        // writes the latch. Every other board always drives its pattern data.
-        let chr_enabled = match board {
-            Board::CnRom185 => submapper == 4,
-            _ => true,
-        };
         Ok(Cartridge {
             prg: bytes[start..start + prg_len].to_vec(),
             chr: bytes[start + prg_len..start + prg_len + chr_len].to_vec(),
@@ -482,7 +471,6 @@ impl Cartridge {
             bank,
             chr_banks: [0, 1],
             latch: 0,
-            chr_enabled,
             ppu_reads: 0,
             control: 0x0C,
             shift: 0,
@@ -628,7 +616,6 @@ impl Cartridge {
         // not ROM identity: a quicksave made during the check must resume it.
         if matches!(self.board, Board::CnRom185) {
             writer.u8(self.latch);
-            writer.bool(self.chr_enabled);
             writer.u8(self.ppu_reads);
         }
     }
@@ -697,7 +684,6 @@ impl Cartridge {
                 ));
             }
             self.latch = latch;
-            self.chr_enabled = reader.bool()?;
             let reads = reader.u8()?;
             if reads > 2 {
                 return Err(format!(
@@ -719,7 +705,13 @@ impl Cartridge {
     /// tri-states it until the correct select value is written (or the
     /// unknown-submapper heuristic completes).
     pub fn chr_enabled(&self) -> bool {
-        self.chr_enabled
+        if !matches!(self.board, Board::CnRom185) {
+            return true;
+        }
+        match self.chr_select() {
+            Some(select) => self.latch & 0x03 == select,
+            None => self.ppu_reads == 2,
+        }
     }
 
     /// Mapper 185's wired CHR select value, when NES 2.0 names it. Submappers
@@ -736,15 +728,14 @@ impl Cartridge {
     /// enables CHR for good afterwards. Returns true when this read is one of
     /// those two open-bus reads. Every other board ignores the read.
     pub fn note_ppu_read(&mut self) -> bool {
-        if !matches!(self.board, Board::CnRom185) || self.chr_select().is_some() {
+        if !matches!(self.board, Board::CnRom185)
+            || self.chr_select().is_some()
+            || self.ppu_reads >= 2
+        {
             return false;
         }
-        if self.ppu_reads < 2 {
-            self.ppu_reads += 1;
-            self.chr_enabled = self.ppu_reads == 2;
-            return true;
-        }
-        false
+        self.ppu_reads += 1;
+        true
     }
 
     /// RESET state for the register boards. The 74HC161's `/MR` is tied high on
@@ -754,10 +745,6 @@ impl Cartridge {
     pub fn reset(&mut self) {
         if matches!(self.board, Board::CnRom185) {
             self.ppu_reads = 0;
-            self.chr_enabled = match self.chr_select() {
-                Some(select) => self.latch & 0x03 == select,
-                None => false,
-            };
         }
     }
 
@@ -981,9 +968,6 @@ impl Cartridge {
                 // the 74HC161 sees the written byte ANDed with the byte the
                 // fixed PRG ROM drives at that address.
                 self.latch = (val & self.cpu_read(addr)) & 0x0F;
-                if let Some(select) = self.chr_select() {
-                    self.chr_enabled = self.latch & 0x03 == select;
-                }
             }
             Board::Mmc1 => self.mmc1_write(addr, val),
             Board::GxRom => {
@@ -1839,12 +1823,7 @@ mod tests {
             assert_eq!(
                 c.chr_enabled(),
                 select == 0,
-                "submapper {submapper}: power-on latch 0 {} select {select}",
-                if select == 0 {
-                    "matches"
-                } else {
-                    "does not match"
-                }
+                "submapper {submapper}: latch 0 against select {select}"
             );
 
             // The ROM byte drives $0F, so a write with the select value in its
