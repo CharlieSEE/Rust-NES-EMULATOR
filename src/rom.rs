@@ -747,15 +747,17 @@ impl Cartridge {
         false
     }
 
-    /// Power-on/reset state for the register boards. The 74HC161 latch powers
-    /// up cleared, so mapper 185 has CHR enabled only when the board's select
-    /// value is 0 (NES 2.0 submapper 4), and its read heuristic restarts.
-    /// Every other board is unaffected by a reset.
+    /// RESET state for the register boards. The 74HC161's `/MR` is tied high on
+    /// CNROM boards, so the latch survives the RESET button; a known select
+    /// keeps whatever enable state that latch names. Only the unknown-select
+    /// heuristic restarts. Every other board is unaffected by a reset.
     pub fn reset(&mut self) {
         if matches!(self.board, Board::CnRom185) {
-            self.latch = 0;
             self.ppu_reads = 0;
-            self.chr_enabled = self.chr_select() == Some(0);
+            self.chr_enabled = match self.chr_select() {
+                Some(select) => self.latch & 0x03 == select,
+                None => false,
+            };
         }
     }
 
@@ -1911,16 +1913,23 @@ mod tests {
         }
     }
 
-    /// RESET clears the latch and restarts the unknown-select heuristic.
+    /// RESET keeps the latch and only restarts the unknown-select heuristic.
     #[test]
-    fn cnrom185_reset_restores_the_power_on_protection_state() {
+    fn cnrom185_reset_keeps_the_latch_and_restarts_the_unknown_heuristic() {
         let mut known = cnrom185_cart(Some(5)); // select 1
         known.prg[0x100] = 0x01;
         known.cpu_write(0x8100, 0x01);
         assert!(known.chr_enabled());
         known.reset();
-        assert_eq!(known.latch, 0, "the 74HC161 powers up cleared");
-        assert!(!known.chr_enabled(), "latch 0 is not select 1");
+        assert_eq!(known.latch, 1, "the 74HC161 latch survives RESET");
+        assert!(known.chr_enabled(), "latch 1 still names select 1");
+
+        known.prg[0x101] = 0x02;
+        known.cpu_write(0x8101, 0x02);
+        assert!(!known.chr_enabled());
+        known.reset();
+        assert_eq!(known.latch, 2, "the wrong latch survives RESET too");
+        assert!(!known.chr_enabled(), "latch 2 is not select 1");
 
         let mut unknown = cnrom185_cart(None);
         assert!(unknown.note_ppu_read());

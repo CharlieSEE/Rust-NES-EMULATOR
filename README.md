@@ -106,10 +106,10 @@ the cartridge runs but cannot be aimed.
   Battletoads, R.C. Pro-Am and other AxROM titles, including the 512 KiB
   variant; mapper 71 covers MiG 29, Bee 52, Dizzy the Adventurer, the 256 KiB
   Fantastic Adventures of Dizzy and other Camerica titles, with Fire Hawk's
-  one-screen mirroring; mapper 185 covers B-Wings, Mighty Bomb Jack and other
-  CNROM titles whose CHR chip is disabled until the copy-protection latch
-  names its select value. Games on other mappers still exit with a mapper
-  error.
+  one-screen mirroring; mapper 185 covers Mighty Bomb Jack, Bird Week and
+  other CNROM titles whose CHR chip is disabled until the copy-protection
+  latch names its select value. Games on other mappers still exit with a
+  mapper error.
 - Save states live in `saves/<game>/` beside the binary, one folder per game:
   `state1`–`state9` plus a small `latest` file naming the newest. `<game>` is
   the ROM filename without its extension, so a game's `.nes` and `.zip` share

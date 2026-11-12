@@ -209,8 +209,8 @@ impl Bus {
     pub fn reset(&mut self) {
         self.clear_clock();
         self.apu.reset();
-        // The mapper's power-on latch clears too. Only mapper 185 has state
-        // here, and its first-two-reads heuristic restarts with a reset.
+        // The 74HC161 latch survives RESET; only mapper 185's unknown-select
+        // first-two-reads heuristic restarts. No other board has state here.
         self.cart.reset();
         self.ppu.set_chr_enabled(self.cart.chr_enabled());
     }
@@ -314,8 +314,9 @@ impl Bus {
                 let offset = (addr as usize - 0x6000) % self.prg_ram_window();
                 self.prg_ram[offset]
             }
-            // Mappers 2, 7, 66 and 71 and this CNROM board map nothing below
-            // $8000: no PRG RAM, no registers, so `$4020-$7FFF` is open bus.
+            // Mappers 2, 7, 66 and 71, plus both CNROM boards, map nothing
+            // below $8000: no PRG RAM, no registers, so `$4020-$7FFF` is open
+            // bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
             _ => 0,
         }
@@ -1397,6 +1398,12 @@ mod tests {
         assert!(!b.cart.chr_enabled(), "another latch value tri-states CHR");
         b.cpu_write(0x8000, 0x01);
         assert!(b.cart.chr_enabled(), "the wired value enables it again");
+
+        b.reset();
+        assert!(b.cart.chr_enabled(), "RESET keeps the matching latch");
+        b.cpu_write(0x8000, 0x02);
+        b.reset();
+        assert!(!b.cart.chr_enabled(), "RESET keeps the non-matching latch");
     }
 
     #[test]
