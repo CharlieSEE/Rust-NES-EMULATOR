@@ -307,16 +307,15 @@ impl Bus {
             // The cartridge may populate this window with PRG RAM. Both NROM
             // test images do -- blargg's ROMs report their results here -- and
             // MMC1 exposes its battery save here. MMC1's PRG register can
-            // disable the window; the standard CNROM board modeled here, SMB,
-            // Contra, Camerica and AxROM map nothing below `$8000`, so for
-            // them it is open bus.
+            // disable the window. Plain-iNES SMB, Contra, Camerica and AxROM
+            // map nothing below `$8000`, but a NES 2.0 header can declare RAM
+            // for any board; Hayauchi Super Igo's CNROM names 2 KiB.
             0x6000..=0x7FFF if self.cart.prg_ram_enabled() => {
                 let offset = (addr as usize - 0x6000) % self.prg_ram_window();
                 self.prg_ram[offset]
             }
-            // Mappers 2, 7, 66 and 71, plus both CNROM boards, map nothing
-            // below $8000: no PRG RAM, no registers, so `$4020-$7FFF` is open
-            // bus.
+            // Mappers 2, 7, 66 and 71, plus plain-iNES CNROM, have no registers
+            // below `$8000`; without declared PRG RAM the window is open bus.
             0x8000..=0xFFFF => self.cart.cpu_read(addr),
             _ => 0,
         }
@@ -1260,21 +1259,25 @@ mod tests {
         assert_eq!(smb.cpu_read(0x6000), 0, "mapper 66 has no PRG RAM here");
     }
 
-    /// A NES 2.0 header can declare less than the full 8 KiB window. The
-    /// hardware mirrors that smaller RAM across `$6000-$7FFF`.
+    /// A CNROM board can declare 2 KiB of PRG RAM in a NES 2.0 header, as
+    /// Hayauchi Super Igo does. The hardware mirrors that smaller RAM three
+    /// times across the full `$6000-$7FFF` window.
     #[test]
-    fn nes20_prg_ram_size_mirrors_within_the_six_thousand_window() {
-        let mut header = crate::rom::ines_header(1, 0, 0);
+    fn nes20_cnrom_two_kib_prg_ram_mirrors_across_the_six_thousand_window() {
+        let mut header = crate::rom::ines_header(2, 4, 3); // 32 KiB PRG, 32 KiB CHR
         header[7] |= 0x08; // NES 2.0 signature
         header[10] = 0x05; // 64 << 5 = 2 KiB
         let mut bytes = header.to_vec();
-        bytes.extend(std::iter::repeat_n(0u8, 0x4000));
-        let cart = Cartridge::load(&bytes).expect("synthetic NES 2.0 image must load");
+        bytes.resize(header.len() + 0x8000 + 4 * 0x2000, 0);
+        let cart = Cartridge::load(&bytes).expect("synthetic NES 2.0 CNROM image must load");
         let mut bus = Bus::new(cart);
         bus.cpu_write(0x6000, 0x5A);
-        assert_eq!(bus.cpu_read(0x6800), 0x5A, "2 KiB mirrors at $6800");
-        assert_eq!(bus.cpu_read(0x7000), 0x5A, "and again at $7000");
+        for addr in [0x6000, 0x6800, 0x7000, 0x7800] {
+            assert_eq!(bus.cpu_read(addr), 0x5A, "2 KiB mirrors at ${addr:04X}");
+        }
         assert_eq!(bus.cpu_read(0x6001), 0, "only the written byte is set");
+        bus.cpu_write(0x7800, 0xA5);
+        assert_eq!(bus.cpu_read(0x6000), 0xA5, "writes mirror too");
     }
 
     /// A NES 2.0 header can put PRG RAM on a board that plain iNES leaves
