@@ -120,14 +120,11 @@ pub struct Bus {
     /// older one.
     irq_line: bool,
     irq_line_delayed: bool,
-    /// Bus ticks since `instruction_cycles` announced the instruction in
-    /// progress. `tick` adds one per dot; compared against `instr_total_ticks`
-    /// to place an NMI rise within the instruction.
-    instr_ticks: u16,
-    /// The announced instruction's length in bus ticks (`instr_cycles *
-    /// DOTS_PER_CPU_CYCLE`), or 0 when the bus has not been told. The final
-    /// CPU cycle is the last `DOTS_PER_CPU_CYCLE` ticks.
-    instr_total_ticks: u16,
+    /// Bus ticks the announced instruction still owes: `instr_cycles *
+    /// DOTS_PER_CPU_CYCLE` at the start, one spent per `tick`. Below
+    /// `DOTS_PER_CPU_CYCLE` the final CPU cycle is under way, after hardware's
+    /// penultimate-cycle `/NMI` sample.
+    instr_ticks_left: u16,
     /// `ppu.nmi_pending()` as of the previous tick: the rise detector that
     /// decides whether an NMI landed too late for this instruction's sample.
     nmi_prev: bool,
@@ -162,8 +159,7 @@ impl Bus {
             ppu_write_delay: 0,
             irq_line: false,
             irq_line_delayed: false,
-            instr_ticks: 0,
-            instr_total_ticks: 0,
+            instr_ticks_left: 0,
             nmi_prev: false,
             nmi_late: false,
         };
@@ -221,8 +217,7 @@ impl Bus {
         self.ppu_write_delay = 0;
         self.irq_line = false;
         self.irq_line_delayed = false;
-        self.instr_ticks = 0;
-        self.instr_total_ticks = 0;
+        self.instr_ticks_left = 0;
         self.nmi_prev = false;
         self.nmi_late = false;
     }
@@ -612,7 +607,7 @@ impl Bus {
                 }
             }
         }
-        self.instr_ticks = self.instr_ticks.saturating_add(1);
+        self.instr_ticks_left = self.instr_ticks_left.saturating_sub(1);
         if self.ppu_write_delay > 0 {
             self.ppu_write_delay -= 1;
             if self.ppu_write_delay == 0 {
@@ -625,14 +620,13 @@ impl Bus {
         // any of the final cycle's `DOTS_PER_CPU_CYCLE` ticks is too late for
         // this instruction. The held register write above lands first, so an
         // NMI enabled by a final-cycle `$2000` write counts as late as well.
+        // `instr_cycles` is nonzero only inside an instruction, which is what
+        // keeps an idle bus's zero count from looking like a final cycle.
         let nmi = self.ppu.nmi_pending();
-        if nmi
+        self.nmi_late |= nmi
             && !self.nmi_prev
-            && self.instr_total_ticks > 0
-            && self.instr_ticks + u16::from(DOTS_PER_CPU_CYCLE) > self.instr_total_ticks
-        {
-            self.nmi_late = true;
-        }
+            && self.instr_cycles > 0
+            && self.instr_ticks_left < u16::from(DOTS_PER_CPU_CYCLE);
         self.nmi_prev = nmi;
         self.dot += 1;
         if self.dot < 3 {
@@ -681,13 +675,9 @@ impl Bus {
                 cpu.irq(self);
             }
             cpu.step(self);
-            if self.ppu.nmi_pending() {
-                if self.nmi_late {
-                    self.nmi_late = false;
-                } else {
-                    self.ppu.take_nmi();
-                    cpu.nmi(self);
-                }
+            if self.ppu.nmi_pending() && !std::mem::take(&mut self.nmi_late) {
+                self.ppu.take_nmi();
+                cpu.nmi(self);
             }
         }
     }
@@ -737,8 +727,7 @@ impl BusLike for Bus {
 
     fn instruction_cycles(&mut self, cycles: u8) {
         self.instr_cycles = cycles;
-        self.instr_ticks = 0;
-        self.instr_total_ticks = u16::from(cycles) * u16::from(DOTS_PER_CPU_CYCLE);
+        self.instr_ticks_left = u16::from(cycles) * u16::from(DOTS_PER_CPU_CYCLE);
         self.dmc_controller_extra = false;
         self.in_instruction = cycles != 0;
     }
@@ -2337,39 +2326,26 @@ mod tests {
 
     #[test]
     fn bwings_reaches_its_mapper_writes_and_draws_its_title_screen() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("NES_ROMS/B-Wings (Japan).zip");
-        // The commercial ROM cannot live in CI; an existing file that fails to
-        // read is a broken fixture, not a reason to pass silently.
-        if !path.exists() {
+        let Some(bytes) = crate::rom::test_rom("NES_ROMS/B-Wings (Japan).zip") else {
             return;
-        }
-        let bytes = crate::rom::read_rom(&path).expect("the B-Wings ROM must read");
-        let mut bus = Bus::new(Cartridge::load(&bytes).expect("B-Wings must load"));
-        bus.power_on();
-        let mut cpu = Cpu::new();
-        cpu.reset(&mut bus);
+        };
+        let mut machine = crate::apu_rom_test::Machine::boot(&bytes);
         for _ in 0..600 {
-            bus.run_frame(&mut cpu);
-            bus.ppu.take_frame();
+            machine.frame();
         }
         assert!(
-            bus.cart.chr_enabled(),
+            machine.bus.cart.chr_enabled(),
             "the boot loop must reach the $B69E/$B69F mapper writes"
         );
         // The title logo is the green "B-WINGS" lettering across the top; a
         // frame that never reached the mapper writes is blank. This is the
         // RGB the PPU emits for that palette entry.
         const LOGO: u32 = 0x0078_C400;
-        let logo_pixels = bus
+        let logo_pixels = machine
+            .bus
             .ppu
             .framebuffer()
-            .as_chunks::<256>()
-            .0
             .iter()
-            .skip(20)
-            .take(80)
-            .flatten()
             .filter(|&&pixel| pixel & 0x00FF_FFFF == LOGO)
             .count();
         assert!(
