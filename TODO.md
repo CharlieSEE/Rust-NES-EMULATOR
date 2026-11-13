@@ -10,7 +10,61 @@ Effort: S = hours, M = a day, L = a few days, XL = a week or more.
 
 ## Suggested order
 
-1. Zapper — makes the bundled Duck Hunt fully playable.
+Rule: correctness first, then a regression net, then cheap high-frequency
+wins, then features in dependency order. XL and conditional projects stay
+last. Each entry names its issue and effort.
+
+### 1. Correctness and safety net
+
+1. **B-Wings (Japan) black screen** (#67, M) — the only open bug. Execution
+   reaches `$B6A0` without its mapper writes, so this points at a core
+   CPU/PPU/boot-path defect, not just mapper 185. Fix before adding features.
+2. **Golden-frame CI tests** (#33, M) — lock current rendering before Zapper,
+   filters and mapper work can regress it.
+
+### 2. Cheap player wins
+
+All S and built on machinery that already exists; batch them.
+
+3. **Two-player input** (#23) — controller 2 and the gamepad path already exist.
+4. **Fast-forward** (#20).
+5. **Frame advance** (#21) — the pause/step loop also seeds the debugger and TAS.
+6. **Volume control** (#25) — mute already exists.
+7. **Auto-save state on quit** (#43) — save-state format and folder layout exist.
+8. **Recent ROM list** (#27) — launcher config already persists the last folder.
+9. **Live screenshot hotkey** (#28) — reuse the `--dump` writer.
+
+### 3. Headline features
+
+10. **Zapper + mouse** (#22, M) — completes the bundled Duck Hunt.
+11. **Rewind** (#19, M) — save states already serialize everything needed.
+12. **Mapper 9/10 (MMC2/MMC4)** (#9, M) — Punch-Out!! and Fire Emblem; the next
+    compatibility unlock.
+13. **Remappable controls** (#24, M) — gamepad already works; this adds the
+    config layer that volume and per-game settings reuse.
+
+Zapper is the visible payoff, rewind is broadly useful, mapper 9/10 adds games.
+
+### 4. State and tooling
+
+14. **TAS movie playback** (#32, M) — deterministic input already seeded by
+    `--play`.
+15. **Per-game configuration** (#26, M) — after bindings and volume exist.
+16. **Game Genie cheats** (#29, M).
+17. **IPS/BPS patch support** (#30, M) — shares the ROM patching path with
+    Game Genie.
+18. **Debugger** (#31, XL, incremental) — pull a minimal CPU/PPU trace forward
+    when #67 or the next compatibility bug resists `--dump`.
+
+### 5. Polish and optional breadth
+
+19. **Audio low-pass filter** (#36, S).
+20. **Dynamic rate control** (#37, M).
+21. **NTSC composite filter** (#34, M).
+22. **CRT shader / integer scaling** (#35, M).
+23. **NSF player** (#38, M).
+24. **FDS support** (#15, XL).
+25. **MMC5 support** (#16, XL) — only with a target game.
 
 ---
 
