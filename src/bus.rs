@@ -41,6 +41,9 @@ use crate::region::Region;
 use crate::rom::Cartridge;
 use crate::state::StateWriter;
 
+/// Bus ticks per CPU cycle: `tick` advances one dot and three dots make one
+/// CPU cycle. PAL adds its extra dot to the PPU only, so this holds there too.
+const DOTS_PER_CPU_CYCLE: u8 = 3;
 /// CPU cycles an OAM DMA costs on an even cycle: one dummy read/write cycle,
 /// 256 read cycles and 256 write cycles (NESdev "PPU programmer reference").
 const DMA_STALL: u16 = 513;
@@ -117,6 +120,18 @@ pub struct Bus {
     /// older one.
     irq_line: bool,
     irq_line_delayed: bool,
+    /// Bus ticks the announced instruction still owes: `instr_cycles *
+    /// DOTS_PER_CPU_CYCLE` at the start, one spent per `tick`. Below
+    /// `DOTS_PER_CPU_CYCLE` the final CPU cycle is under way, after hardware's
+    /// penultimate-cycle `/NMI` sample.
+    instr_ticks_left: u16,
+    /// `ppu.nmi_pending()` as of the previous tick: the rise detector that
+    /// decides whether an NMI landed too late for this instruction's sample.
+    nmi_prev: bool,
+    /// An NMI rose on the instruction's final cycle. Hardware samples `/NMI`
+    /// on the penultimate cycle, so `run_frame` skips one delivery and lets
+    /// the boundary ahead pass without interrupting.
+    nmi_late: bool,
 }
 
 impl Bus {
@@ -144,6 +159,9 @@ impl Bus {
             ppu_write_delay: 0,
             irq_line: false,
             irq_line_delayed: false,
+            instr_ticks_left: 0,
+            nmi_prev: false,
+            nmi_late: false,
         };
         // The PPU fetches pattern memory every dot, so the CHR image the
         // cartridge parsed out of the file is loaded once, here. A plain-iNES
@@ -199,6 +217,9 @@ impl Bus {
         self.ppu_write_delay = 0;
         self.irq_line = false;
         self.irq_line_delayed = false;
+        self.instr_ticks_left = 0;
+        self.nmi_prev = false;
+        self.nmi_late = false;
     }
 
     /// The RESET button: both RAMs keep their contents -- hardware does not
@@ -336,7 +357,7 @@ impl Bus {
                         self.ppu.cpu_write(addr, val);
                     }
                     self.pending_ppu_write = Some((addr, val));
-                    self.ppu_write_delay = (self.instr_cycles - 1) * 3;
+                    self.ppu_write_delay = (self.instr_cycles - 1) * DOTS_PER_CPU_CYCLE;
                 } else {
                     self.ppu.cpu_write(addr, val);
                 }
@@ -586,6 +607,7 @@ impl Bus {
                 }
             }
         }
+        self.instr_ticks_left = self.instr_ticks_left.saturating_sub(1);
         if self.ppu_write_delay > 0 {
             self.ppu_write_delay -= 1;
             if self.ppu_write_delay == 0 {
@@ -594,6 +616,18 @@ impl Bus {
                 }
             }
         }
+        // Hardware samples `/NMI` during the penultimate cycle, so a rise on
+        // any of the final cycle's `DOTS_PER_CPU_CYCLE` ticks is too late for
+        // this instruction. The held register write above lands first, so an
+        // NMI enabled by a final-cycle `$2000` write counts as late as well.
+        // `instr_cycles` is nonzero only inside an instruction, which is what
+        // keeps an idle bus's zero count from looking like a final cycle.
+        let nmi = self.ppu.nmi_pending();
+        self.nmi_late |= nmi
+            && !self.nmi_prev
+            && self.instr_cycles > 0
+            && self.instr_ticks_left < u16::from(DOTS_PER_CPU_CYCLE);
+        self.nmi_prev = nmi;
         self.dot += 1;
         if self.dot < 3 {
             return;
@@ -641,7 +675,7 @@ impl Bus {
                 cpu.irq(self);
             }
             cpu.step(self);
-            if self.ppu.nmi_pending() {
+            if self.ppu.nmi_pending() && !std::mem::take(&mut self.nmi_late) {
                 self.ppu.take_nmi();
                 cpu.nmi(self);
             }
@@ -693,6 +727,7 @@ impl BusLike for Bus {
 
     fn instruction_cycles(&mut self, cycles: u8) {
         self.instr_cycles = cycles;
+        self.instr_ticks_left = u16::from(cycles) * u16::from(DOTS_PER_CPU_CYCLE);
         self.dmc_controller_extra = false;
         self.in_instruction = cycles != 0;
     }
@@ -2254,6 +2289,68 @@ mod tests {
             bus.save_state(&cpu),
             before,
             "every refused load must leave the machine exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_vblank_raised_on_the_final_cycle_is_seen_by_the_next_instruction() {
+        let mut bytes = ines_header().to_vec();
+        for fill in 0..2u8 {
+            bytes.extend(std::iter::repeat_n(fill, BANK));
+        }
+        let at = 16 + POWER_ON_BANK * BANK;
+        let code = [
+            0x78, 0xAD, 0x02, 0x20, 0x10, 0xFB, 0xA9, 0x80, 0x8D, 0x00, 0x20, 0xEA, 0xEA, 0xAD,
+            0x02, 0x20, 0x10, 0xFB, 0xE6, 0x10, 0x4C, 0x0D, 0x80,
+        ];
+        bytes[at..at + code.len()].copy_from_slice(&code);
+        let handler = [0xE6, 0x11, 0xAD, 0x02, 0x20, 0x40];
+        bytes[at + 0x100..at + 0x100 + handler.len()].copy_from_slice(&handler);
+        let vectors = at + (0xFFFC - 0x8000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        bytes[vectors - 2..vectors].copy_from_slice(&0x8100u16.to_le_bytes());
+        let cart = Cartridge::load(&bytes).expect("synthetic image must load");
+        let mut bus = Bus::new(cart);
+        bus.power_on();
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut bus);
+        for _ in 0..10 {
+            bus.run_frame(&mut cpu);
+            bus.ppu.take_frame();
+        }
+        assert!(
+            bus.cpu_read(0x0010) > 0,
+            "the poll loop must see vblank the NMI handler clears"
+        );
+    }
+
+    #[test]
+    fn bwings_reaches_its_mapper_writes_and_draws_its_title_screen() {
+        let Some(bytes) = crate::rom::test_rom("NES_ROMS/B-Wings (Japan).zip") else {
+            return;
+        };
+        let mut machine = crate::apu_rom_test::Machine::boot(&bytes);
+        for _ in 0..600 {
+            machine.frame();
+        }
+        assert!(
+            machine.bus.cart.chr_enabled(),
+            "the boot loop must reach the $B69E/$B69F mapper writes"
+        );
+        // The title logo is the green "B-WINGS" lettering across the top; a
+        // frame that never reached the mapper writes is blank. This is the
+        // RGB the PPU emits for that palette entry.
+        const LOGO: u32 = 0x0078_C400;
+        let logo_pixels = machine
+            .bus
+            .ppu
+            .framebuffer()
+            .iter()
+            .filter(|&&pixel| pixel & 0x00FF_FFFF == LOGO)
+            .count();
+        assert!(
+            logo_pixels > 2_000,
+            "the title logo must be drawn, got {logo_pixels} green pixels"
         );
     }
 }

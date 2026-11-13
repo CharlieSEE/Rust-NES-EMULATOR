@@ -1141,17 +1141,16 @@ pub(crate) fn ines_header(prg_banks: u8, chr_banks: u8, mapper: u8) -> [u8; 16] 
 
 /// A ROM under the manifest directory, or `None` when it is not on disk. The
 /// ROM images are gitignored, so every test that needs one must be able to skip
-/// on a clean checkout.
+/// on a clean checkout. A file that is present but unreadable is a broken
+/// fixture, so it panics instead of skipping.
 #[cfg(test)]
 pub(crate) fn test_rom(rel: &str) -> Option<Vec<u8>> {
-    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), rel);
-    match std::fs::read(&path) {
-        Ok(b) => Some(b),
-        Err(_) => {
-            println!("note: {path} not present, skipping");
-            None
-        }
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    if !path.exists() {
+        println!("note: {} not present, skipping", path.display());
+        return None;
     }
+    Some(read_rom(&path).expect("test ROM must read"))
 }
 
 #[cfg(test)]
