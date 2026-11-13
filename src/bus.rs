@@ -117,6 +117,10 @@ pub struct Bus {
     /// older one.
     irq_line: bool,
     irq_line_delayed: bool,
+    instr_ticks: u16,
+    instr_total_ticks: u16,
+    nmi_prev: bool,
+    nmi_late: bool,
 }
 
 impl Bus {
@@ -144,6 +148,10 @@ impl Bus {
             ppu_write_delay: 0,
             irq_line: false,
             irq_line_delayed: false,
+            instr_ticks: 0,
+            instr_total_ticks: 0,
+            nmi_prev: false,
+            nmi_late: false,
         };
         // The PPU fetches pattern memory every dot, so the CHR image the
         // cartridge parsed out of the file is loaded once, here. A plain-iNES
@@ -199,6 +207,10 @@ impl Bus {
         self.ppu_write_delay = 0;
         self.irq_line = false;
         self.irq_line_delayed = false;
+        self.instr_ticks = 0;
+        self.instr_total_ticks = 0;
+        self.nmi_prev = false;
+        self.nmi_late = false;
     }
 
     /// The RESET button: both RAMs keep their contents -- hardware does not
@@ -586,6 +598,16 @@ impl Bus {
                 }
             }
         }
+        self.instr_ticks = self.instr_ticks.saturating_add(1);
+        let nmi = self.ppu.nmi_pending();
+        if nmi
+            && !self.nmi_prev
+            && self.instr_total_ticks > 0
+            && self.instr_ticks + 2 >= self.instr_total_ticks
+        {
+            self.nmi_late = true;
+        }
+        self.nmi_prev = nmi;
         if self.ppu_write_delay > 0 {
             self.ppu_write_delay -= 1;
             if self.ppu_write_delay == 0 {
@@ -642,8 +664,12 @@ impl Bus {
             }
             cpu.step(self);
             if self.ppu.nmi_pending() {
-                self.ppu.take_nmi();
-                cpu.nmi(self);
+                if self.nmi_late {
+                    self.nmi_late = false;
+                } else {
+                    self.ppu.take_nmi();
+                    cpu.nmi(self);
+                }
             }
         }
     }
@@ -693,6 +719,8 @@ impl BusLike for Bus {
 
     fn instruction_cycles(&mut self, cycles: u8) {
         self.instr_cycles = cycles;
+        self.instr_ticks = 0;
+        self.instr_total_ticks = cycles as u16 * 3;
         self.dmc_controller_extra = false;
         self.in_instruction = cycles != 0;
     }
@@ -2254,6 +2282,38 @@ mod tests {
             bus.save_state(&cpu),
             before,
             "every refused load must leave the machine exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_vblank_raised_on_the_final_cycle_is_seen_by_the_next_instruction() {
+        let mut bytes = ines_header().to_vec();
+        for fill in 0..2u8 {
+            bytes.extend(std::iter::repeat_n(fill, BANK));
+        }
+        let at = 16 + POWER_ON_BANK * BANK;
+        let code = [
+            0x78, 0xAD, 0x02, 0x20, 0x10, 0xFB, 0xA9, 0x80, 0x8D, 0x00, 0x20, 0xEA, 0xEA, 0xAD,
+            0x02, 0x20, 0x10, 0xFB, 0xE6, 0x10, 0x4C, 0x0D, 0x80,
+        ];
+        bytes[at..at + code.len()].copy_from_slice(&code);
+        let handler = [0xE6, 0x11, 0xAD, 0x02, 0x20, 0x40];
+        bytes[at + 0x100..at + 0x100 + handler.len()].copy_from_slice(&handler);
+        let vectors = at + (0xFFFC - 0x8000);
+        bytes[vectors..vectors + 2].copy_from_slice(&0x8000u16.to_le_bytes());
+        bytes[vectors - 2..vectors].copy_from_slice(&0x8100u16.to_le_bytes());
+        let cart = Cartridge::load(&bytes).expect("synthetic image must load");
+        let mut bus = Bus::new(cart);
+        bus.power_on();
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut bus);
+        for _ in 0..10 {
+            bus.run_frame(&mut cpu);
+            bus.ppu.take_frame();
+        }
+        assert!(
+            bus.cpu_read(0x0010) > 0,
+            "the poll loop must see vblank the NMI handler clears"
         );
     }
 }
