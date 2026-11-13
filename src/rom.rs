@@ -484,8 +484,9 @@ impl Cartridge {
     }
 
     /// Whether the CPU can reach PRG RAM right now. NROM's test images and
-    /// MMC1's battery save both use the window; the standard CNROM board
-    /// modeled here, SMB, Contra and AxROM do not. NROM has no register, while
+    /// MMC1's battery save both use the window; plain-iNES CNROM, SMB, Contra
+    /// and AxROM do not, though a NES 2.0 header can declare RAM for any board
+    /// (Hayauchi Super Igo's CNROM names 2 KiB). NROM has no register, while
     /// MMC1's PRG register bit 4 is MMC1B's disable bit: writes with it set make
     /// `$6000-$7FFF` open bus until the game clears it again. MMC3's window is
     /// always enabled so MMC6 boards, which give `$A001` bit 7 a different
