@@ -2316,4 +2316,35 @@ mod tests {
             "the poll loop must see vblank the NMI handler clears"
         );
     }
+
+    #[test]
+    fn bwings_reaches_its_mapper_writes_and_draws_its_title_screen() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("NES_ROMS/B-Wings (Japan).zip");
+        let Ok(bytes) = crate::rom::read_rom(&path) else {
+            return;
+        };
+        let mut bus = Bus::new(Cartridge::load(&bytes).expect("B-Wings must load"));
+        bus.power_on();
+        let mut cpu = Cpu::new();
+        cpu.reset(&mut bus);
+        for _ in 0..600 {
+            bus.run_frame(&mut cpu);
+            bus.ppu.take_frame();
+        }
+        assert!(
+            bus.cart.chr_enabled(),
+            "the boot loop must reach the $B69E/$B69F mapper writes"
+        );
+        let lit = bus
+            .ppu
+            .framebuffer()
+            .iter()
+            .filter(|&&pixel| pixel & 0x00FF_FFFF != 0)
+            .count();
+        assert!(
+            lit > 50_000,
+            "the title screen must be drawn, got {lit} pixels"
+        );
+    }
 }
