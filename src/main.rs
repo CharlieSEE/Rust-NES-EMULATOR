@@ -8,6 +8,8 @@ mod apu_rom_test;
 mod bus;
 mod controller;
 mod cpu;
+#[cfg(test)]
+mod golden_frame_test;
 mod launcher;
 #[cfg(test)]
 mod nestest_test;

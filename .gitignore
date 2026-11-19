@@ -5,6 +5,8 @@ target/
 *.sav
 *.state*
 *.tmp
+# Local game ROMs used by the optional golden-frame tests. Never commit them.
+NES_ROMS/
 # Freely redistributable test ROMs are the one exception: they make the
 # integration tests run on a clean checkout and in CI. Game ROMs stay ignored.
 !test_roms/**/*.nes
