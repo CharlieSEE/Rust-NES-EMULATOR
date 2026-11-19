@@ -140,4 +140,7 @@ Button names are `A`, `B`, `SELECT`, `START`, `UP`, `DOWN`, `LEFT`, `RIGHT`,
 plus the aliases `JUMP` (A), `RUN` (B), and `FIRE` (B). Join buttons with `+`
 to hold several at once (`RIGHT+A30`), and append a frame count to any step.
 
-Run the test suite with `cargo test`.
+Run the test suite with `cargo test`. `src/golden_frame_test.rs` pins the
+picture at selected frames for the bundled test ROMs and, when present, a few
+real games under `NES_ROMS/`; a mismatch prints the actual hash to paste back
+into the table when the new rendering is intended.

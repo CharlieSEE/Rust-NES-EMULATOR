@@ -115,7 +115,7 @@ Zapper is the visible payoff, rewind is broadly useful, mapper 9/10 adds games.
 
 - [ ] **Debugger** — pause/step, breakpoints, CPU registers and disassembly, PPU state, nametable/OAM/palette viewers, memory watch, APU channel state. *Effort: XL; build incrementally on the existing headless harness.*
 - [ ] **TAS movie playback** — `.fm2` input format, deterministic emulation, record and replay. *Effort: M, after save states; `--play` is the seed.*
-- [ ] **Golden-frame CI tests** — hash selected frames for bundled test ROMs and real games, fail on rendering regressions. *Effort: M.*
+- [x] **Golden-frame CI tests** — hash selected frames for bundled test ROMs and real games, fail on rendering regressions. *Done; FNV-1a of the framebuffer at chosen frames for the blargg PPU ROMs, nestest and, when the ROM is present locally, SMB/Duck Hunt, Zelda and Mega Man 2. A mismatch prints the actual hash to paste back into `GOLDENS`.*
 - [ ] **NTSC composite filter** — optional RGB→NTSC→RGB shader for authentic color fringing. *Effort: M.*
 - [ ] **CRT shader / integer scaling** — optional scaling mode with scanlines and aspect correction. *Effort: M.*
 - [ ] **Audio low-pass filter** — tame the APU's harsh high frequencies, optional and off by default. *Effort: S.*
