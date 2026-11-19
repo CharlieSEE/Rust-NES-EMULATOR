@@ -608,6 +608,7 @@ fn p2_button_for(key: Keycode) -> Option<u8> {
 /// another game's line is ignored, so it cannot discard this game's setting.
 fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
     let mut players = None;
+    let mut malformed = None;
     for (index, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -615,13 +616,15 @@ fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
         }
         let Some((name, count)) = line.split_once('=') else {
             // No `=` can only be this game's broken line when it starts with
-            // the game's name; otherwise it belongs to some other game.
-            if !game.is_empty()
+            // the game's name; otherwise it belongs to some other game. Keep
+            // looking: a valid override below it still wins.
+            if malformed.is_none()
+                && !game.is_empty()
                 && line
                     .get(..game.len())
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case(game))
             {
-                return Err(format!("line {}: expected `<game> = <1|2>`", index + 1));
+                malformed = Some(format!("line {}: expected `<game> = <1|2>`", index + 1));
             }
             continue;
         };
@@ -637,7 +640,23 @@ fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
         }
         players = Some(count);
     }
-    Ok(players)
+    match (players, malformed) {
+        (Some(players), _) => Ok(Some(players)),
+        (None, Some(e)) => Err(e),
+        (None, None) => Ok(None),
+    }
+}
+
+/// The player count in `path` for `game`. A missing file or a game with no
+/// line is `None`; an unreadable file or a broken line is an error naming the
+/// file. No logging here, so the caller decides what a broken config costs.
+fn players_from_file(path: &::std::path::Path, game: &str) -> Result<Option<u8>, String> {
+    let text = match ::std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    players_for_game(&text, game).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The configured player count for `rom`, or two when there is no override.
@@ -654,19 +673,11 @@ fn load_players(rom: &::std::path::Path) -> u8 {
             return DEFAULT_PLAYERS;
         }
     };
-    let text = match ::std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return DEFAULT_PLAYERS,
-        Err(e) => {
-            report::log_error(&format!("cannot read {}: {e}", path.display()));
-            return DEFAULT_PLAYERS;
-        }
-    };
-    match players_for_game(&text, &game) {
+    match players_from_file(&path, &game) {
         Ok(Some(players)) => players,
         Ok(None) => DEFAULT_PLAYERS,
         Err(e) => {
-            report::log_error(&format!("{}: {e}", path.display()));
+            report::log_error(&e);
             DEFAULT_PLAYERS
         }
     }
@@ -1484,11 +1495,11 @@ mod tests {
         age_label, audio_sleep, button_for, draw_toast, dump_list_ends_run, finish_load,
         frame_budget, frame_sleep, game_save_dir, latest_state_path, load_latest_state,
         load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps, move_selection,
-        p2_button_for, pad_bit, parse_script, picker_command, players_for_game, read_latest_slot,
-        resume_after_load, resume_audio, save_state_slot, slot_for, slot_line, state_slot_path,
-        wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker, PickerCommand, Play, Region,
-        Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H,
-        P2_BUTTONS, TOAST_BG, TOAST_FG, W,
+        p2_button_for, pad_bit, parse_script, picker_command, players_for_game, players_from_file,
+        read_latest_slot, resume_after_load, resume_audio, save_state_slot, slot_for, slot_line,
+        state_slot_path, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
+        PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::controller::Button;
     use sdl2::event::{Event, WindowEvent};
@@ -2369,6 +2380,55 @@ mod tests {
             players_for_game("Mario = three\nZelda = 1\n", "Zelda"),
             Ok(Some(1))
         );
+    }
+
+    /// A no-`=` line for a game whose name starts with this one (`Zelda II`)
+    /// must not discard a valid `Zelda` override, in either order.
+    #[test]
+    fn a_broken_prefix_line_does_not_hide_a_valid_override() {
+        for text in ["Zelda II 1\nZelda = 1\n", "Zelda = 1\nZelda II 1\n"] {
+            assert_eq!(
+                players_for_game(text, "Zelda"),
+                Ok(Some(1)),
+                "{text:?} must keep the valid override"
+            );
+        }
+        assert!(
+            players_for_game("Zelda II 1\n", "Zelda").is_err(),
+            "a broken line with no valid override is still reported"
+        );
+    }
+
+    /// The file wrapper: a found line applies, while a missing file, a game
+    /// with no line, and a broken line all fall back instead of stopping play.
+    #[test]
+    fn the_player_config_file_applies_found_lines_and_defaults_on_trouble() {
+        let dir = std::env::temp_dir().join(format!("nes-players-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nes-players.conf");
+
+        assert_eq!(
+            players_from_file(&path, "Zelda"),
+            Ok(None),
+            "a missing file is the default"
+        );
+
+        std::fs::write(&path, "Zelda = 1\n").unwrap();
+        assert_eq!(players_from_file(&path, "Zelda"), Ok(Some(1)));
+        assert_eq!(
+            players_from_file(&path, "Mario"),
+            Ok(None),
+            "no line for the game is the default"
+        );
+
+        std::fs::write(&path, "Zelda = 0\n").unwrap();
+        assert!(
+            players_from_file(&path, "Zelda").is_err(),
+            "a broken line is an error the caller logs"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
