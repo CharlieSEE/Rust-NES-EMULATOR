@@ -2,9 +2,11 @@
 //! and compared with values checked into this file, so a rendering change
 //! fails `cargo test` instead of being spotted by eye.
 //!
-//! The bundled blargg PPU ROMs always run. The real-game entries need ROMs
-//! that are not committed, so they skip on a clean checkout and in CI; a local
-//! `cargo test` still catches mapper and PPU regressions in them.
+//! The bundled ROMs always run: one blargg PPU result screen, nestest's full
+//! text screen, and a hand-built fixture with background, sprites and scrolling.
+//! The real-game entries need ROMs that are not committed, so they skip on a
+//! clean checkout and in CI; a local `cargo test` still catches mapper and PPU
+//! regressions in them.
 //!
 //! A mismatch prints the actual hash. When the new picture is intended, paste
 //! it into `GOLDENS`.
@@ -37,19 +39,14 @@ const GOLDENS: &[Golden] = &[
         frames: &[60, 300],
         hashes: &[0x5d76_5893_1a2b_0cdc, 0x5d76_5893_1a2b_0cdc],
     },
+    // Mapper 0 fixture with a scrolled background, four tiles and two sprites,
+    // so CI covers more than text screens. Built by `make_graphics.py`.
     Golden {
-        rom: "test_roms/blargg_ppu_tests/sprite_ram.nes",
+        rom: "test_roms/golden/graphics.nes",
         bundled: true,
         script: None,
         frames: &[60, 300],
-        hashes: &[0x5d76_5893_1a2b_0cdc, 0x5d76_5893_1a2b_0cdc],
-    },
-    Golden {
-        rom: "test_roms/blargg_ppu_tests/vram_access.nes",
-        bundled: true,
-        script: None,
-        frames: &[60, 300],
-        hashes: &[0x5d76_5893_1a2b_0cdc, 0x5d76_5893_1a2b_0cdc],
+        hashes: &[0xc5b1_eb9f_dc80_3732, 0xc5b1_eb9f_dc80_3732],
     },
     // A full screen of text, so a tile or palette change moves the hash.
     Golden {
@@ -133,9 +130,15 @@ fn golden_frames_are_unchanged() {
             assert!(!golden.bundled, "{} ships with the test suite", golden.rom);
             continue;
         };
+        assert!(
+            golden.frames.windows(2).all(|pair| pair[0] < pair[1]),
+            "{}: golden frames must be strictly increasing",
+            golden.rom
+        );
         let last = *golden
             .frames
-            .last()
+            .iter()
+            .max()
             .expect("a golden entry names at least one frame");
         let mut play = golden.script.map(|script| {
             Play::new(
