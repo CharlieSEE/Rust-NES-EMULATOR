@@ -603,29 +603,17 @@ fn p2_button_for(key: Keycode) -> Option<u8> {
 }
 
 /// The player count for `game` from the config text. Lines are
-/// `<game> = <1|2>`; blank lines and `#` comments are ignored, and the last
-/// matching line wins. A malformed line for this game is an error; a typo on
-/// another game's line is ignored, so it cannot discard this game's setting.
+/// `<game> = <1|2>`; blank lines, `#` comments, and lines without `=` are
+/// ignored, and the last matching line wins. A matching line with a bad value
+/// is an error.
 fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
     let mut players = None;
-    let mut malformed = None;
     for (index, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
         let Some((name, count)) = line.split_once('=') else {
-            // No `=` can only be this game's broken line when it starts with
-            // the game's name; otherwise it belongs to some other game. Keep
-            // looking: a valid override below it still wins.
-            if malformed.is_none()
-                && !game.is_empty()
-                && line
-                    .get(..game.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(game))
-            {
-                malformed = Some(format!("line {}: expected `<game> = <1|2>`", index + 1));
-            }
             continue;
         };
         if !name.trim().eq_ignore_ascii_case(game) {
@@ -640,11 +628,7 @@ fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
         }
         players = Some(count);
     }
-    match (players, malformed) {
-        (Some(players), _) => Ok(Some(players)),
-        (None, Some(e)) => Err(e),
-        (None, None) => Ok(None),
-    }
+    Ok(players)
 }
 
 /// The player count in `path` for `game`. A missing file or a game with no
@@ -705,6 +689,7 @@ fn pad_bit(button: Button) -> Option<u8> {
 /// apart so releasing one source cannot clear a button the other still holds.
 /// `pad_ids` names the game controller in each player's slot, so a button
 /// event from the second pad reaches the second port.
+#[derive(Default)]
 struct Input {
     keys: [u8; 2],
     pads: [u8; 2],
@@ -712,14 +697,6 @@ struct Input {
 }
 
 impl Input {
-    fn new() -> Input {
-        Input {
-            keys: [0; 2],
-            pads: [0; 2],
-            pad_ids: [None; 2],
-        }
-    }
-
     /// Fold one SDL event into the held masks, returning whether the run
     /// continues. `false` quits.
     fn apply_event(&mut self, ev: Event) -> bool {
@@ -1126,7 +1103,7 @@ fn run() -> Result<(), String> {
     // alive for their button events to keep arriving, so they live in this
     // array for the whole run even though nothing reads it directly.
     let controller_subsystem = sdl.game_controller().ok();
-    let mut input = Input::new();
+    let mut input = Input::default();
     let mut pad_handles: [Option<GameController>; 2] = [None, None];
     if let Some(controllers) = &controller_subsystem {
         for index in 0..controllers.num_joysticks().unwrap_or(0) {
@@ -1839,9 +1816,11 @@ mod tests {
     #[test]
     fn a_loaded_state_drops_held_input() {
         let mut paused = true;
-        let mut input = Input::new();
-        input.keys = [0xFF, 0xFF];
-        input.pads = [0xFF, 0xFF];
+        let mut input = Input {
+            keys: [0xFF, 0xFF],
+            pads: [0xFF, 0xFF],
+            ..Default::default()
+        };
         finish_load(&mut paused, false, None, &mut input);
         assert!(!paused, "a load must render the state it just restored");
         assert_eq!(
@@ -2226,7 +2205,7 @@ mod tests {
 
     #[test]
     fn player_two_keys_hold_their_own_mask() {
-        let mut input = Input::new();
+        let mut input = Input::default();
         assert!(input.apply_event(key_event(Keycode::G, true)));
         assert_eq!(input.keys, [0, 0x01], "G is player 2's A");
         assert!(input.apply_event(key_event(Keycode::G, false)));
@@ -2254,7 +2233,7 @@ mod tests {
 
     #[test]
     fn a_key_up_clears_only_its_own_bit() {
-        let mut input = Input::new();
+        let mut input = Input::default();
         for key in [Keycode::Z, Keycode::Right, Keycode::Return] {
             assert!(input.apply_event(key_event(key, true)), "{key:?} down");
         }
@@ -2283,7 +2262,7 @@ mod tests {
     /// release a button the other still holds.
     #[test]
     fn keyboard_and_gamepad_hold_the_same_bits_independently() {
-        let mut input = Input::new();
+        let mut input = Input::default();
         input.add_pad(0);
         input.apply_event(key_event(Keycode::Z, true));
         input.apply_event(pad_event(0, Button::A, true));
@@ -2301,7 +2280,7 @@ mod tests {
     /// reachable at all, not a real alt-tab.
     #[test]
     fn a_focus_loss_clears_both_players_but_remembers_the_pads() {
-        let mut input = Input::new();
+        let mut input = Input::default();
         input.add_pad(7);
         input.add_pad(9);
         input.keys = [0xFF, 0xFF];
@@ -2324,9 +2303,11 @@ mod tests {
 
     #[test]
     fn a_two_player_game_keeps_the_players_apart() {
-        let mut input = Input::new();
-        input.keys = [0x01, 0x02];
-        input.pads = [0x04, 0x08];
+        let input = Input {
+            keys: [0x01, 0x02],
+            pads: [0x04, 0x08],
+            ..Default::default()
+        };
         assert_eq!(input.controller_masks(2), [0x05, 0x0A]);
     }
 
@@ -2334,15 +2315,17 @@ mod tests {
     /// second keyboard set or the second pad can play it alone.
     #[test]
     fn a_one_player_game_folds_both_input_sets_into_controller_one() {
-        let mut input = Input::new();
-        input.keys = [0x01, 0x02];
-        input.pads = [0x04, 0x08];
+        let input = Input {
+            keys: [0x01, 0x02],
+            pads: [0x04, 0x08],
+            ..Default::default()
+        };
         assert_eq!(input.controller_masks(1), [0x0F, 0]);
     }
 
     #[test]
     fn gamepads_take_the_first_free_player_slot_and_leave_it_on_removal() {
-        let mut input = Input::new();
+        let mut input = Input::default();
         assert_eq!(input.add_pad(7), Some(0), "the first pad is player 1");
         assert_eq!(input.add_pad(9), Some(1), "the second pad is player 2");
         assert_eq!(input.add_pad(11), None, "a third pad has no player");
@@ -2355,7 +2338,7 @@ mod tests {
 
     #[test]
     fn a_gamepad_button_reaches_the_player_whose_slot_holds_it() {
-        let mut input = Input::new();
+        let mut input = Input::default();
         input.add_pad(7);
         input.add_pad(9);
         input.apply_event(pad_event(9, Button::A, true));
@@ -2380,22 +2363,10 @@ mod tests {
             players_for_game("Mario = three\nZelda = 1\n", "Zelda"),
             Ok(Some(1))
         );
-    }
-
-    /// A no-`=` line for a game whose name starts with this one (`Zelda II`)
-    /// must not discard a valid `Zelda` override, in either order.
-    #[test]
-    fn a_broken_prefix_line_does_not_hide_a_valid_override() {
-        for text in ["Zelda II 1\nZelda = 1\n", "Zelda = 1\nZelda II 1\n"] {
-            assert_eq!(
-                players_for_game(text, "Zelda"),
-                Ok(Some(1)),
-                "{text:?} must keep the valid override"
-            );
-        }
-        assert!(
-            players_for_game("Zelda II 1\n", "Zelda").is_err(),
-            "a broken line with no valid override is still reported"
+        assert_eq!(
+            players_for_game("Zelda 1\n", "Zelda"),
+            Ok(None),
+            "a line without `=` is ignored, not guessed"
         );
     }
 
@@ -2459,7 +2430,6 @@ Zelda = 1   # solo
     #[test]
     fn a_broken_player_override_is_an_error() {
         for (text, needle) in [
-            ("Zelda 1\n", "expected"),
             ("Zelda = 0\n", "1 or 2"),
             ("Zelda = 3\n", "1 or 2"),
             ("Zelda = one\n", "one"),
