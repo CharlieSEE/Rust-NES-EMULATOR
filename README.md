@@ -5,8 +5,9 @@ A from-scratch NES emulator. It boots a real cartridge image and plays
 sound, and keyboard controls.
 
 One binary. Run it with no arguments for a small ROM launcher, or point it
-straight at a `.nes` file. The launcher's only setting, its last folder, lives
-in `nes-launcher.conf` beside the binary.
+straight at a `.nes` file. The launcher remembers its last folder in
+`nes-launcher.conf` beside the binary; `nes-players.conf` holds optional
+per-game player counts.
 
 ## Requirements
 
@@ -68,13 +69,16 @@ repository.
 
 ## Controls
 
-| NES | Keyboard |
+| NES | Player 1 | Player 2 |
+| --- | --- | --- |
+| D-pad | Arrow keys | `W` `A` `S` `D` |
+| A | `Z` | `G` |
+| B | `X` | `H` |
+| Select | `Right Shift` | `T` |
+| Start | `Enter` | `Y` |
+
+| System | Keyboard |
 | --- | --- |
-| D-pad | Arrow keys |
-| A | `Z` |
-| B | `X` |
-| Select | `Right Shift` |
-| Start | `Enter` |
 | Pause | `P` |
 | Reset | `R` |
 | Quicksave slot 1–9 | `1`–`9` |
@@ -85,10 +89,25 @@ repository.
 | Mute | `M` |
 | Quit | `Esc` |
 
-An SDL2 game controller works too: its D-pad, A, B, Back and Start map to the
-same buttons (A is the bottom face button, B the right one). One player,
-standard controller only. The Zapper is not emulated, so the Duck Hunt half of
-the cartridge runs but cannot be aimed.
+Two SDL2 game controllers work too: the first pad is player 1 and the second
+is player 2, each with its D-pad, A, B, Back and Start mapped to the same
+buttons (A is the bottom face button, B the right one). Pads can be plugged in
+while a game runs; unplugging one frees its player slot. Only two pads are
+used. The Zapper is not emulated, so the Duck Hunt half of the cartridge runs
+but cannot be aimed.
+
+Games are two-player by default. To make one playable from either keyboard set
+or either pad, create `nes-players.conf` beside the binary with one line per
+game:
+
+```text
+Zelda = 1
+Contra (USA) = 2
+```
+
+The name is the ROM file name without its extension, the same key the save
+folder uses. Lines starting with `#` are comments. A missing file or entry
+means two players.
 
 ## What runs
 
