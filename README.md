@@ -106,8 +106,7 @@ Contra (USA) = 2
 ```
 
 The name is the ROM file name without its extension, the same key the save
-folder uses. Lines starting with `#` are comments. A missing file or entry
-means two players.
+folder uses. A `#` starts a comment. A missing file or entry means two players.
 
 ## What runs
 

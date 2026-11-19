@@ -438,6 +438,18 @@ fn resume_after_load(paused: &mut bool, muted: bool, audio: Option<&sdl2::audio:
     }
 }
 
+/// A load replaces the machine; held input belongs to the old run and must not
+/// press a button on the restored first frame.
+fn finish_load(
+    paused: &mut bool,
+    muted: bool,
+    audio: Option<&sdl2::audio::AudioQueue<i16>>,
+    input: &mut Input,
+) {
+    resume_after_load(paused, muted, audio);
+    input.forget();
+}
+
 /// A save or load writes no message of its own, so a short confirmation is
 /// the only sign it happened. Long enough to read, short enough to get out of
 /// the way.
@@ -592,8 +604,8 @@ fn p2_button_for(key: Keycode) -> Option<u8> {
 
 /// The player count for `game` from the config text. Lines are
 /// `<game> = <1|2>`; blank lines and `#` comments are ignored, and the last
-/// matching line wins. A malformed line is an error rather than a silently
-/// ignored setting.
+/// matching line wins. A malformed line for this game is an error; a typo on
+/// another game's line is ignored, so it cannot discard this game's setting.
 fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
     let mut players = None;
     for (index, line) in text.lines().enumerate() {
@@ -602,7 +614,16 @@ fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
             continue;
         }
         let Some((name, count)) = line.split_once('=') else {
-            return Err(format!("line {}: expected `<game> = <1|2>`", index + 1));
+            // No `=` can only be this game's broken line when it starts with
+            // the game's name; otherwise it belongs to some other game.
+            if !game.is_empty()
+                && line
+                    .get(..game.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(game))
+            {
+                return Err(format!("line {}: expected `<game> = <1|2>`", index + 1));
+            }
+            continue;
         };
         if !name.trim().eq_ignore_ascii_case(game) {
             continue;
@@ -627,7 +648,9 @@ fn load_players(rom: &::std::path::Path) -> u8 {
     let path = match report::exe_dir() {
         Ok(dir) => dir.join(PLAYERS_CONFIG),
         Err(e) => {
-            report::log_error(&format!("cannot find {PLAYERS_CONFIG}: {e}"));
+            report::log_error(&format!(
+                "cannot locate the executable directory for {PLAYERS_CONFIG}: {e}"
+            ));
             return DEFAULT_PLAYERS;
         }
     };
@@ -1169,8 +1192,7 @@ fn run() -> Result<(), String> {
                                 picker = None;
                                 // A load replaces the paused frame with the
                                 // restored one, so the game resumes either way.
-                                resume_after_load(&mut paused, muted, audio.as_ref());
-                                input.forget();
+                                finish_load(&mut paused, muted, audio.as_ref(), &mut input);
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1266,7 +1288,7 @@ fn run() -> Result<(), String> {
                     if keymod.contains(Mod::LSHIFTMOD) {
                         match load_state_slot(&save_dir, slot, &mut bus, &mut cpu) {
                             Ok(()) => {
-                                resume_after_load(&mut paused, muted, audio.as_ref());
+                                finish_load(&mut paused, muted, audio.as_ref(), &mut input);
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1288,7 +1310,7 @@ fn run() -> Result<(), String> {
                     ..
                 } => match load_latest_state(&save_dir, &mut bus, &mut cpu) {
                     Ok(slot) => {
-                        resume_after_load(&mut paused, muted, audio.as_ref());
+                        finish_load(&mut paused, muted, audio.as_ref(), &mut input);
                         toast = Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                     }
                     Err(e) => toast_error(&mut toast, &e),
@@ -1459,14 +1481,14 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        age_label, audio_sleep, button_for, draw_toast, dump_list_ends_run, frame_budget,
-        frame_sleep, game_save_dir, latest_state_path, load_latest_state, load_state_slot,
-        mask_for_name, migrate_legacy_states, missed_dumps, move_selection, p2_button_for,
-        parse_script, picker_command, players_for_game, read_latest_slot, resume_after_load,
-        resume_audio, save_state_slot, slot_for, slot_line, state_slot_path, wrap_text,
-        write_atomic, Bus, Cartridge, Cpu, Input, Picker, PickerCommand, Play, Region, Slot, Toast,
-        AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG,
-        TOAST_FG, W,
+        age_label, audio_sleep, button_for, draw_toast, dump_list_ends_run, finish_load,
+        frame_budget, frame_sleep, game_save_dir, latest_state_path, load_latest_state,
+        load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps, move_selection,
+        p2_button_for, pad_bit, parse_script, picker_command, players_for_game, read_latest_slot,
+        resume_after_load, resume_audio, save_state_slot, slot_for, slot_line, state_slot_path,
+        wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker, PickerCommand, Play, Region,
+        Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H,
+        P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::controller::Button;
     use sdl2::event::{Event, WindowEvent};
@@ -1799,6 +1821,23 @@ mod tests {
         let mut paused = true;
         resume_after_load(&mut paused, false, None);
         assert!(!paused, "a load must render the state it just restored");
+    }
+
+    /// A quickload replaces the machine; a button held during the old run must
+    /// not press on the restored first frame.
+    #[test]
+    fn a_loaded_state_drops_held_input() {
+        let mut paused = true;
+        let mut input = Input::new();
+        input.keys = [0xFF, 0xFF];
+        input.pads = [0xFF, 0xFF];
+        finish_load(&mut paused, false, None, &mut input);
+        assert!(!paused, "a load must render the state it just restored");
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0, 0], [0, 0]),
+            "the old run's held buttons are gone"
+        );
     }
 
     #[test]
@@ -2135,12 +2174,43 @@ mod tests {
     /// both players -- a shared key would press two buttons at once.
     #[test]
     fn player_two_keys_are_a_second_distinct_pad() {
+        assert_eq!(
+            P2_BUTTONS,
+            [
+                (Keycode::G, 0x01),
+                (Keycode::H, 0x02),
+                (Keycode::T, 0x04),
+                (Keycode::Y, 0x08),
+                (Keycode::W, 0x10),
+                (Keycode::S, 0x20),
+                (Keycode::A, 0x40),
+                (Keycode::D, 0x80),
+            ],
+            "the agreed player 2 keys, in report order"
+        );
         for (index, (key, bit)) in P2_BUTTONS.iter().enumerate() {
             assert_eq!(*bit, 0x01 << index, "{key:?} is bit {index} of the report");
             assert_eq!(p2_button_for(*key), Some(*bit), "{key:?}");
             assert_eq!(button_for(*key), None, "{key:?} must not also be player 1");
         }
         assert_eq!(p2_button_for(Keycode::Z), None, "Z stays player 1");
+    }
+
+    #[test]
+    fn every_controller_button_maps_to_its_nes_bit() {
+        for (button, bit) in [
+            (Button::A, 0x01),
+            (Button::B, 0x02),
+            (Button::Back, 0x04),
+            (Button::Start, 0x08),
+            (Button::DPadUp, 0x10),
+            (Button::DPadDown, 0x20),
+            (Button::DPadLeft, 0x40),
+            (Button::DPadRight, 0x80),
+        ] {
+            assert_eq!(pad_bit(button), Some(bit), "{button:?}");
+        }
+        assert_eq!(pad_bit(Button::X), None, "a button with no NES twin");
     }
 
     #[test]
@@ -2154,6 +2224,21 @@ mod tests {
         input.apply_event(key_event(Keycode::Z, true));
         input.apply_event(key_event(Keycode::H, true));
         assert_eq!(input.keys, [0x01, 0x02], "both players can hold a button");
+
+        input.add_pad(7);
+        input.apply_event(key_event(Keycode::G, true));
+        input.apply_event(pad_event(7, Button::A, true));
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0x01, 0x03], [0x01, 0]),
+            "player 2's key and pad both hold A"
+        );
+        input.apply_event(key_event(Keycode::G, false));
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0x01, 0x02], [0x01, 0]),
+            "releasing the key leaves the pad holding A"
+        );
     }
 
     #[test]
@@ -2270,6 +2355,20 @@ mod tests {
         assert_eq!(input.pads, [0x02, 0]);
         input.apply_event(pad_event(11, Button::B, true));
         assert_eq!(input.pads, [0x02, 0], "an unassigned pad is ignored");
+    }
+
+    /// A typo in another game's line must not switch this game back to two
+    /// players: the valid override below it still applies.
+    #[test]
+    fn a_broken_line_for_another_game_does_not_hide_a_valid_override() {
+        assert_eq!(
+            players_for_game("Some Game Without Equals\nZelda = 1\n", "Zelda"),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            players_for_game("Mario = three\nZelda = 1\n", "Zelda"),
+            Ok(Some(1))
+        );
     }
 
     #[test]

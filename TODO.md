@@ -26,13 +26,12 @@ last. Each entry names its issue and effort.
 
 All S and built on machinery that already exists; batch them.
 
-3. **Two-player input** (#23) — controller 2 and the gamepad path already exist.
-4. **Fast-forward** (#20).
-5. **Frame advance** (#21) — the pause/step loop also seeds the debugger and TAS.
-6. **Volume control** (#25) — mute already exists.
-7. **Auto-save state on quit** (#43) — save-state format and folder layout exist.
-8. **Recent ROM list** (#27) — launcher config already persists the last folder.
-9. **Live screenshot hotkey** (#28) — reuse the `--dump` writer.
+3. **Fast-forward** (#20).
+4. **Frame advance** (#21) — the pause/step loop also seeds the debugger and TAS.
+5. **Volume control** (#25) — mute already exists.
+6. **Auto-save state on quit** (#43) — save-state format and folder layout exist.
+7. **Recent ROM list** (#27) — launcher config already persists the last folder.
+8. **Live screenshot hotkey** (#28) — reuse the `--dump` writer.
 
 ### 3. Headline features
 
