@@ -427,13 +427,14 @@ fn audio_should_play(paused: bool, muted: bool, turbo: bool) -> bool {
 /// A load replaces the machine's timeline: the frame the loop paused on belongs
 /// to the old one, and the queued samples are noise over the loaded state. Drop
 /// them and unpause so the next iteration renders what was restored; the
-/// per-frame audio sync restarts the queue under the usual conditions.
+/// per-frame audio sync restarts the queue under the usual conditions. Only the
+/// game buttons belong to the old run; a held Tab is host state and survives.
 fn finish_load(paused: &mut bool, audio: Option<&sdl2::audio::AudioQueue<i16>>, input: &mut Input) {
     *paused = false;
     if let Some(queue) = audio {
         queue.clear();
     }
-    input.forget();
+    input.forget_buttons();
 }
 
 /// A save or load writes no message of its own, so a short confirmation is
@@ -796,10 +797,17 @@ impl Input {
         self.pad_ids.iter().position(|&slot| slot == Some(id))
     }
 
-    /// Drop every held button without forgetting which pad is in which slot.
-    fn forget(&mut self) {
+    /// Drop every held game button without touching the host-side holds or the
+    /// pad assignment.
+    fn forget_buttons(&mut self) {
         self.keys = [0; 2];
         self.pads = [0; 2];
+    }
+
+    /// Drop every held button and host hold without forgetting which pad is in
+    /// which slot.
+    fn forget(&mut self) {
+        self.forget_buttons();
         self.turbo = false;
     }
 }
@@ -905,6 +913,13 @@ impl Play {
         self.left -= 1;
         Some(self.mask)
     }
+}
+
+/// Whether the loop waits out the frame period. Fast-forward is the only
+/// unpaused state that does not; a paused game still waits so the window stays
+/// responsive while its frame is frozen.
+fn waits_after_frame(paused: bool, turbo: bool) -> bool {
+    paused || !turbo
 }
 
 /// How long to sleep at the end of a frame that took `elapsed`. A frame that
@@ -1412,12 +1427,16 @@ fn run() -> Result<(), String> {
         // paused or muted run has no queue to follow, so it falls back to the
         // wall clock and keeps the window responsive. Fast-forward waits for
         // neither: the hold exists to run the machine as fast as it can.
-        if paused {
-            ::std::thread::sleep(budget);
-        } else if !input.turbo {
-            match &audio {
-                Some(queue) if !muted => ::std::thread::sleep(audio_sleep(queue.size(), budget)),
-                _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed(), budget)),
+        if waits_after_frame(paused, input.turbo) {
+            if paused {
+                ::std::thread::sleep(budget);
+            } else {
+                match &audio {
+                    Some(queue) if !muted => {
+                        ::std::thread::sleep(audio_sleep(queue.size(), budget))
+                    }
+                    _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed(), budget)),
+                }
             }
         }
     }
@@ -1480,9 +1499,9 @@ mod tests {
         load_latest_state, load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps,
         move_selection, p2_button_for, pad_bit, parse_script, picker_command, players_for_game,
         players_from_file, read_latest_slot, save_state_slot, slot_for, slot_line, state_slot_path,
-        wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker, PickerCommand, Play, Region,
-        Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H,
-        P2_BUTTONS, TOAST_BG, TOAST_FG, W,
+        waits_after_frame, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
+        PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::controller::Button;
     use sdl2::event::{Event, WindowEvent};
@@ -1823,9 +1842,9 @@ mod tests {
     /// A quickload replaces the machine, including the frame that was on
     /// screen when the loop paused. Staying paused would keep showing that old
     /// frame, and a button held during the old run must not press on the
-    /// restored first frame.
+    /// restored first frame. A held Tab is host state, so it survives.
     #[test]
-    fn a_loaded_state_unpauses_and_drops_held_input() {
+    fn a_loaded_state_unpauses_and_drops_game_buttons() {
         let mut paused = true;
         let mut input = Input {
             keys: [0xFF, 0xFF],
@@ -1840,7 +1859,10 @@ mod tests {
             ([0, 0], [0, 0]),
             "the old run's held buttons are gone"
         );
-        assert!(!input.turbo, "fast-forward is not a state to restore");
+        assert!(
+            input.turbo,
+            "a held Tab is host state, not part of the restored run"
+        );
     }
 
     #[test]
@@ -2118,6 +2140,19 @@ mod tests {
     fn a_pal_frame_gets_a_twenty_millisecond_budget() {
         assert_eq!(frame_budget(Region::Ntsc), FRAME_BUDGET);
         assert_eq!(frame_budget(Region::Pal), Duration::from_micros(20_000));
+    }
+
+    /// Fast-forward is the one unpaused state that does not wait after a
+    /// frame; a paused game still waits so the window stays responsive.
+    #[test]
+    fn fast_forward_skips_the_frame_wait() {
+        assert!(waits_after_frame(false, false), "normal play is paced");
+        assert!(!waits_after_frame(false, true), "fast-forward is uncapped");
+        assert!(waits_after_frame(true, false), "a paused game still waits");
+        assert!(
+            waits_after_frame(true, true),
+            "holding Tab while paused must not spin the loop"
+        );
     }
 
     #[test]
