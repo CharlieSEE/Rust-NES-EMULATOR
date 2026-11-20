@@ -97,6 +97,9 @@ Zapper is the visible payoff, rewind is broadly useful, mapper 9/10 adds games.
 - [x] **Unpause after quickload** — loading while paused leaves the pre-load frame on screen until the next frame runs. *Done; a load unpauses and restarts audio so the restored frame renders immediately.*
 - [ ] **Rewind** — ring buffer of compressed save states sampled every N frames. *Effort: M, after save states.*
 - [x] **Fast-forward** — hold-to-turbo, with audio muted or pitch-shifted. *Done; holding `Tab` runs uncapped with the audio device paused and its backlog dropped; focus loss releases the key.*
+- [ ] **Fast-forward pitch-shift** — keep audio audible during turbo by pitch-shifting it instead of muting. *Effort: S; issue #74.*
+- [ ] **Gamepad fast-forward** — hold a shoulder button for turbo, so couch play does not need the keyboard. *Effort: S; issue #75.*
+- [ ] **Fast-forward indicator** — show that turbo is held with a small on-screen marker. *Effort: S; issue #73.*
 - [ ] **Frame advance** — pause plus single-frame stepping. *Effort: S.*
 - [ ] **Zapper + mouse** — light-gun register at `$4017` bit 4, mouse aim, trigger mapping, hit detection against the framebuffer/beam position. Duck Hunt is the test case. *Effort: M.*
 - [x] **Two-player input** — bus already exposes controller 2; map a second keyboard set and a second gamepad, add a per-game player-count override. *Done; player 2 uses WASD, G/H, T/Y, the first two pads take the player slots, and `nes-players.conf` can fold both input sets into controller 1 for a one-player game.*
