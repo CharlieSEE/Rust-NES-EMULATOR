@@ -1,4 +1,4 @@
-use sdl2::controller::Button;
+use sdl2::controller::{Button, GameController};
 use sdl2::event::{Event, WindowEvent};
 use sdl2::keyboard::{Keycode, Mod, Scancode};
 
@@ -94,6 +94,25 @@ const BUTTONS: [(Keycode, &str, u8); 8] = [
     (Keycode::Left, "LEFT", 0x40),
     (Keycode::Right, "RIGHT", 0x80),
 ];
+
+/// Player 2's pad, in the same report order, on the left of the keyboard so
+/// two people can share it. No key is on player 1 or the hotkey list.
+const P2_BUTTONS: [(Keycode, u8); 8] = [
+    (Keycode::G, 0x01),
+    (Keycode::H, 0x02),
+    (Keycode::T, 0x04),
+    (Keycode::Y, 0x08),
+    (Keycode::W, 0x10),
+    (Keycode::S, 0x20),
+    (Keycode::A, 0x40),
+    (Keycode::D, 0x80),
+];
+
+/// The optional per-game player count, beside the executable. A missing file
+/// or a game with no line is two players, so two-player input works without
+/// any setup.
+const PLAYERS_CONFIG: &str = "nes-players.conf";
+const DEFAULT_PLAYERS: u8 = 2;
 
 /// Words a script may use for a bit it does not spell out. A is jump and B is
 /// run/fire in both SMB and Duck Hunt, so a script can say what it means.
@@ -419,6 +438,18 @@ fn resume_after_load(paused: &mut bool, muted: bool, audio: Option<&sdl2::audio:
     }
 }
 
+/// A load replaces the machine; held input belongs to the old run and must not
+/// press a button on the restored first frame.
+fn finish_load(
+    paused: &mut bool,
+    muted: bool,
+    audio: Option<&sdl2::audio::AudioQueue<i16>>,
+    input: &mut Input,
+) {
+    resume_after_load(paused, muted, audio);
+    input.forget();
+}
+
 /// A save or load writes no message of its own, so a short confirmation is
 /// the only sign it happened. Long enough to read, short enough to get out of
 /// the way.
@@ -566,6 +597,76 @@ fn button_for(key: Keycode) -> Option<u8> {
     BUTTONS.iter().find(|row| row.0 == key).map(|row| row.2)
 }
 
+/// Player 2's half of the same table.
+fn p2_button_for(key: Keycode) -> Option<u8> {
+    P2_BUTTONS.iter().find(|row| row.0 == key).map(|row| row.1)
+}
+
+/// The player count for `game` from the config text. Lines are
+/// `<game> = <1|2>`; blank lines, `#` comments, and lines without `=` are
+/// ignored, and the last matching line wins. A matching line with a bad value
+/// is an error.
+fn players_for_game(text: &str, game: &str) -> Result<Option<u8>, String> {
+    let mut players = None;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, count)) = line.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case(game) {
+            continue;
+        }
+        let count = count.trim();
+        let count: u8 = count
+            .parse()
+            .map_err(|_| format!("line {}: {count:?} is not 1 or 2", index + 1))?;
+        if !(1..=2).contains(&count) {
+            return Err(format!("line {}: {count} is not 1 or 2", index + 1));
+        }
+        players = Some(count);
+    }
+    Ok(players)
+}
+
+/// The player count in `path` for `game`. A missing file or a game with no
+/// line is `None`; an unreadable file or a broken line is an error naming the
+/// file. No logging here, so the caller decides what a broken config costs.
+fn players_from_file(path: &::std::path::Path, game: &str) -> Result<Option<u8>, String> {
+    let text = match ::std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ::std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    players_for_game(&text, game).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The configured player count for `rom`, or two when there is no override.
+/// A broken or unreadable config is logged and ignored: it must not stop a
+/// game from booting.
+fn load_players(rom: &::std::path::Path) -> u8 {
+    let game = rom.file_stem().unwrap_or_default().to_string_lossy();
+    let path = match report::exe_dir() {
+        Ok(dir) => dir.join(PLAYERS_CONFIG),
+        Err(e) => {
+            report::log_error(&format!(
+                "cannot locate the executable directory for {PLAYERS_CONFIG}: {e}"
+            ));
+            return DEFAULT_PLAYERS;
+        }
+    };
+    match players_from_file(&path, &game) {
+        Ok(Some(players)) => players,
+        Ok(None) => DEFAULT_PLAYERS,
+        Err(e) => {
+            report::log_error(&e);
+            DEFAULT_PLAYERS
+        }
+    }
+}
+
 /// The same eight bits from an SDL game controller. A is the bottom face
 /// button (jump in SMB), B is the right one (run/fire); the D-pad is the NES
 /// D-pad. Analogue sticks are deliberately not mapped: a d-pad is what the
@@ -584,59 +685,118 @@ fn pad_bit(button: Button) -> Option<u8> {
     }
 }
 
-/// Fold one SDL event into the held masks, returning whether the run continues.
-/// `false` quits. Keyboard and gamepad are separate masks so releasing one
-/// source cannot clear a button the other still holds; the caller ORs them.
-/// Out of `main` so the arms are reachable from a test: `Event` is a plain enum
-/// value, so a headless test can build a `FocusLost` without a window ever
-/// existing.
-fn apply_event(ev: Event, keys: &mut u8, pad: &mut u8) -> bool {
-    match ev {
-        Event::Quit { .. } => false,
-        Event::KeyDown {
-            keycode: Some(Keycode::Escape),
-            ..
-        } => false,
-        Event::KeyDown {
-            keycode: Some(key), ..
-        } => {
-            if let Some(bit) = button_for(key) {
-                *keys |= bit;
+/// Held input, one mask per source and player. Keyboard and gamepad stay
+/// apart so releasing one source cannot clear a button the other still holds.
+/// `pad_ids` names the game controller in each player's slot, so a button
+/// event from the second pad reaches the second port.
+#[derive(Default)]
+struct Input {
+    keys: [u8; 2],
+    pads: [u8; 2],
+    pad_ids: [Option<u32>; 2],
+}
+
+impl Input {
+    /// Fold one SDL event into the held masks, returning whether the run
+    /// continues. `false` quits.
+    fn apply_event(&mut self, ev: Event) -> bool {
+        match ev {
+            Event::Quit { .. } => false,
+            Event::KeyDown {
+                keycode: Some(Keycode::Escape),
+                ..
+            } => false,
+            Event::KeyDown {
+                keycode: Some(key), ..
+            } => {
+                if let Some(bit) = button_for(key) {
+                    self.keys[0] |= bit;
+                }
+                if let Some(bit) = p2_button_for(key) {
+                    self.keys[1] |= bit;
+                }
+                true
             }
-            true
-        }
-        Event::KeyUp {
-            keycode: Some(key), ..
-        } => {
-            if let Some(bit) = button_for(key) {
-                *keys &= !bit;
+            Event::KeyUp {
+                keycode: Some(key), ..
+            } => {
+                if let Some(bit) = button_for(key) {
+                    self.keys[0] &= !bit;
+                }
+                if let Some(bit) = p2_button_for(key) {
+                    self.keys[1] &= !bit;
+                }
+                true
             }
-            true
-        }
-        Event::ControllerButtonDown { button, .. } => {
-            if let Some(bit) = pad_bit(button) {
-                *pad |= bit;
+            Event::ControllerButtonDown { which, button, .. } => {
+                if let Some(slot) = self.pad_slot(which) {
+                    if let Some(bit) = pad_bit(button) {
+                        self.pads[slot] |= bit;
+                    }
+                }
+                true
             }
-            true
-        }
-        Event::ControllerButtonUp { button, .. } => {
-            if let Some(bit) = pad_bit(button) {
-                *pad &= !bit;
+            Event::ControllerButtonUp { which, button, .. } => {
+                if let Some(slot) = self.pad_slot(which) {
+                    if let Some(bit) = pad_bit(button) {
+                        self.pads[slot] &= !bit;
+                    }
+                }
+                true
             }
-            true
+            // No KeyUp ever arrives for a key released while another window
+            // has the focus, so alt-tabbing away holding Right would latch it
+            // on for good. Forget the held masks, not the pad assignment.
+            Event::Window {
+                win_event: WindowEvent::FocusLost,
+                ..
+            } => {
+                self.forget();
+                true
+            }
+            _ => true,
         }
-        // No KeyUp ever arrives for a key released while another window has the
-        // focus, so alt-tabbing away holding Right would latch it on for good.
-        // Forget both masks instead.
-        Event::Window {
-            win_event: WindowEvent::FocusLost,
-            ..
-        } => {
-            *keys = 0;
-            *pad = 0;
-            true
+    }
+
+    /// The controller masks to hand the bus. A one-player game folds both
+    /// keyboard sets and both pads into controller 1, so any input plays it.
+    fn controller_masks(&self, players: u8) -> [u8; 2] {
+        let one = self.keys[0] | self.pads[0];
+        let two = self.keys[1] | self.pads[1];
+        if players == 1 {
+            [one | two, 0]
+        } else {
+            [one, two]
         }
-        _ => true,
+    }
+
+    /// Put a newly opened pad in the first free player slot. The same pad is
+    /// never opened twice, and a third pad has no slot.
+    fn add_pad(&mut self, id: u32) -> Option<usize> {
+        if self.pad_ids.contains(&Some(id)) {
+            return None;
+        }
+        let slot = self.pad_ids.iter().position(Option::is_none)?;
+        self.pad_ids[slot] = Some(id);
+        Some(slot)
+    }
+
+    /// Unplug the pad with instance `id`, releasing anything it held.
+    fn remove_pad(&mut self, id: u32) -> Option<usize> {
+        let slot = self.pad_slot(id)?;
+        self.pad_ids[slot] = None;
+        self.pads[slot] = 0;
+        Some(slot)
+    }
+
+    fn pad_slot(&self, id: u32) -> Option<usize> {
+        self.pad_ids.iter().position(|&slot| slot == Some(id))
+    }
+
+    /// Drop every held button without forgetting which pad is in which slot.
+    fn forget(&mut self) {
+        self.keys = [0; 2];
+        self.pads = [0; 2];
     }
 }
 
@@ -851,6 +1011,7 @@ fn run() -> Result<(), String> {
         }
     }
 
+    let players = load_players(rom);
     let sdl = sdl2::init().map_err(|e| e.to_string())?;
     let video = sdl.video().map_err(|e| e.to_string())?;
     // Audio is best-effort: the picture is the primary output, so a machine
@@ -939,22 +1100,24 @@ fn run() -> Result<(), String> {
 
     let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
     // Game controllers are optional and hot-pluggable. The handles must stay
-    // alive for their button events to keep arriving, so they live in `pads`
-    // for the whole run even though nothing reads the vec.
+    // alive for their button events to keep arriving, so they live in this
+    // array for the whole run even though nothing reads it directly.
     let controller_subsystem = sdl.game_controller().ok();
-    let mut pads = Vec::new();
+    let mut input = Input::default();
+    let mut pad_handles: [Option<GameController>; 2] = [None, None];
     if let Some(controllers) = &controller_subsystem {
         for index in 0..controllers.num_joysticks().unwrap_or(0) {
             if controllers.is_game_controller(index) {
                 if let Ok(gamepad) = controllers.open(index) {
-                    pads.push(gamepad);
+                    let id = gamepad.instance_id();
+                    if let Some(slot) = input.add_pad(id) {
+                        pad_handles[slot] = Some(gamepad);
+                    }
                 }
             }
         }
     }
     let mut play = script.map(Play::new);
-    let mut keys = 0u8;
-    let mut pad = 0u8;
     let mut paused = false;
     let mut muted = false;
     let mut fullscreen = false;
@@ -969,13 +1132,23 @@ fn run() -> Result<(), String> {
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
         for event in events.poll_iter() {
-            // A controller can arrive at any time, including while the modal
-            // list owns the keys; hotplug must not be lost to the picker.
+            // A controller can arrive or leave at any time, including while
+            // the modal list owns the input; hotplug must not be lost to the
+            // picker.
             if let Event::ControllerDeviceAdded { which, .. } = &event {
                 if let Some(controllers) = &controller_subsystem {
                     if let Ok(gamepad) = controllers.open(*which) {
-                        pads.push(gamepad);
+                        let id = gamepad.instance_id();
+                        if let Some(slot) = input.add_pad(id) {
+                            pad_handles[slot] = Some(gamepad);
+                        }
                     }
+                }
+                continue;
+            }
+            if let Event::ControllerDeviceRemoved { which, .. } = &event {
+                if let Some(slot) = input.remove_pad(*which) {
+                    pad_handles[slot] = None;
                 }
                 continue;
             }
@@ -988,8 +1161,7 @@ fn run() -> Result<(), String> {
                     PickerCommand::Cancel => {
                         picker = None;
                         paused = picker_was_paused;
-                        keys = 0;
-                        pad = 0;
+                        input.forget();
                         if let Some(queue) = &audio {
                             if resume_audio(paused, muted) {
                                 queue.resume();
@@ -1008,19 +1180,14 @@ fn run() -> Result<(), String> {
                                 picker = None;
                                 // A load replaces the paused frame with the
                                 // restored one, so the game resumes either way.
-                                resume_after_load(&mut paused, muted, audio.as_ref());
-                                keys = 0;
-                                pad = 0;
+                                finish_load(&mut paused, muted, audio.as_ref(), &mut input);
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
                             Err(e) => toast_error(&mut toast, &e),
                         }
                     }
-                    PickerCommand::ForgetInput => {
-                        keys = 0;
-                        pad = 0;
-                    }
+                    PickerCommand::ForgetInput => input.forget(),
                     PickerCommand::Ignore => {}
                 }
                 continue;
@@ -1091,8 +1258,7 @@ fn run() -> Result<(), String> {
                 } => {
                     picker_was_paused = paused;
                     picker = Some(Picker::open(&save_dir, &bus.cart));
-                    keys = 0;
-                    pad = 0;
+                    input.forget();
                     if !paused {
                         paused = true;
                         if let Some(queue) = &audio {
@@ -1110,7 +1276,7 @@ fn run() -> Result<(), String> {
                     if keymod.contains(Mod::LSHIFTMOD) {
                         match load_state_slot(&save_dir, slot, &mut bus, &mut cpu) {
                             Ok(()) => {
-                                resume_after_load(&mut paused, muted, audio.as_ref());
+                                finish_load(&mut paused, muted, audio.as_ref(), &mut input);
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1132,13 +1298,13 @@ fn run() -> Result<(), String> {
                     ..
                 } => match load_latest_state(&save_dir, &mut bus, &mut cpu) {
                     Ok(slot) => {
-                        resume_after_load(&mut paused, muted, audio.as_ref());
+                        finish_load(&mut paused, muted, audio.as_ref(), &mut input);
                         toast = Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                     }
                     Err(e) => toast_error(&mut toast, &e),
                 },
                 other => {
-                    if !apply_event(other, &mut keys, &mut pad) {
+                    if !input.apply_event(other) {
                         running = false;
                     }
                 }
@@ -1148,23 +1314,24 @@ fn run() -> Result<(), String> {
         // time does not advance for either.
         if !paused {
             // A script is not a second input path: it assigns the same mask a
-            // key press assigns, and it goes through the one `set_buttons` call
-            // below.
-            let mut buttons = keys | pad;
+            // key press assigns, and it goes through the same `set_buttons`
+            // calls below. It drives player 1 only.
+            let mut masks = input.controller_masks(players);
             if let Some(script) = play.as_mut() {
                 match script.mask_for_next_frame() {
-                    Some(mask) => buttons = mask,
+                    Some(mask) => masks[0] = mask,
                     // The script is over. Release what its last step held instead
                     // of emulating one more frame with it still down -- the frame
                     // that `running = false` still runs would be played with a key
                     // that the script already let go of.
                     None => {
-                        buttons = 0;
+                        masks = [0, 0];
                         running = false;
                     }
                 }
             }
-            bus.controllers[0].set_buttons(buttons);
+            bus.controllers[0].set_buttons(masks[0]);
+            bus.controllers[1].set_buttons(masks[1]);
             // Run the CPU until the PPU has a whole frame, taking the NMI the
             // vblank flag raises and the APU's frame IRQ off its level line. SMB
             // gates its status bar on a sprite-0 hit and its NMI handler on
@@ -1302,17 +1469,66 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        age_label, apply_event, audio_sleep, button_for, draw_toast, dump_list_ends_run,
+        age_label, audio_sleep, button_for, draw_toast, dump_list_ends_run, finish_load,
         frame_budget, frame_sleep, game_save_dir, latest_state_path, load_latest_state,
         load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps, move_selection,
-        parse_script, picker_command, read_latest_slot, resume_after_load, resume_audio,
-        save_state_slot, slot_for, slot_line, state_slot_path, wrap_text, write_atomic, Bus,
-        Cartridge, Cpu, Picker, PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES,
-        AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, TOAST_BG, TOAST_FG, W,
+        p2_button_for, pad_bit, parse_script, picker_command, players_for_game, players_from_file,
+        read_latest_slot, resume_after_load, resume_audio, save_state_slot, slot_for, slot_line,
+        state_slot_path, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
+        PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
+    use sdl2::controller::Button;
     use sdl2::event::{Event, WindowEvent};
     use sdl2::keyboard::{Keycode, Scancode};
     use std::time::Duration;
+
+    fn key_event(key: Keycode, down: bool) -> Event {
+        let timestamp = u32::from(!down);
+        if down {
+            Event::KeyDown {
+                timestamp,
+                window_id: 0,
+                keycode: Some(key),
+                scancode: None,
+                keymod: sdl2::keyboard::Mod::empty(),
+                repeat: false,
+            }
+        } else {
+            Event::KeyUp {
+                timestamp,
+                window_id: 0,
+                keycode: Some(key),
+                scancode: None,
+                keymod: sdl2::keyboard::Mod::empty(),
+                repeat: false,
+            }
+        }
+    }
+
+    fn pad_event(which: u32, button: Button, down: bool) -> Event {
+        if down {
+            Event::ControllerButtonDown {
+                timestamp: 0,
+                which,
+                button,
+            }
+        } else {
+            Event::ControllerButtonUp {
+                timestamp: 1,
+                which,
+                button,
+            }
+        }
+    }
+
+    fn focus_lost() -> Event {
+        Event::Window {
+            timestamp: 0,
+            window_id: 0,
+            win_event: WindowEvent::FocusLost,
+        }
+    }
 
     #[test]
     fn a_battery_save_replaces_the_old_file_and_leaves_no_temp() {
@@ -1593,6 +1809,25 @@ mod tests {
         let mut paused = true;
         resume_after_load(&mut paused, false, None);
         assert!(!paused, "a load must render the state it just restored");
+    }
+
+    /// A quickload replaces the machine; a button held during the old run must
+    /// not press on the restored first frame.
+    #[test]
+    fn a_loaded_state_drops_held_input() {
+        let mut paused = true;
+        let mut input = Input {
+            keys: [0xFF, 0xFF],
+            pads: [0xFF, 0xFF],
+            ..Default::default()
+        };
+        finish_load(&mut paused, false, None, &mut input);
+        assert!(!paused, "a load must render the state it just restored");
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0, 0], [0, 0]),
+            "the old run's held buttons are gone"
+        );
     }
 
     #[test]
@@ -1924,113 +2159,284 @@ mod tests {
         }
     }
 
-    /// SDL sends no `KeyUp` for a key released while another window has the
-    /// focus, so the FocusLost arm is the only thing that un-latches a held
-    /// button. `Event` is a plain enum value, so this runs with no window and
-    /// no X server -- it needed the handler extracted from `main` to be
-    /// reachable at all, not a real alt-tab.
+    /// Player 2 has a second keyboard set on the left of the board. It must
+    /// press the same eight bits in the same order, and no key may belong to
+    /// both players -- a shared key would press two buttons at once.
     #[test]
-    fn a_focus_loss_clears_the_held_masks() {
-        let mut keys = 0xFF;
-        let mut pad = 0xFF;
-        let lost = Event::Window {
-            timestamp: 0,
-            window_id: 0,
-            win_event: WindowEvent::FocusLost,
-        };
-        assert!(
-            apply_event(lost, &mut keys, &mut pad),
-            "losing focus is not a quit"
+    fn player_two_keys_are_a_second_distinct_pad() {
+        assert_eq!(
+            P2_BUTTONS,
+            [
+                (Keycode::G, 0x01),
+                (Keycode::H, 0x02),
+                (Keycode::T, 0x04),
+                (Keycode::Y, 0x08),
+                (Keycode::W, 0x10),
+                (Keycode::S, 0x20),
+                (Keycode::A, 0x40),
+                (Keycode::D, 0x80),
+            ],
+            "the agreed player 2 keys, in report order"
         );
-        assert_eq!((keys, pad), (0, 0), "every held bit must be forgotten");
+        for (index, (key, bit)) in P2_BUTTONS.iter().enumerate() {
+            assert_eq!(*bit, 0x01 << index, "{key:?} is bit {index} of the report");
+            assert_eq!(p2_button_for(*key), Some(*bit), "{key:?}");
+            assert_eq!(button_for(*key), None, "{key:?} must not also be player 1");
+        }
+        assert_eq!(p2_button_for(Keycode::Z), None, "Z stays player 1");
+    }
+
+    #[test]
+    fn every_controller_button_maps_to_its_nes_bit() {
+        for (button, bit) in [
+            (Button::A, 0x01),
+            (Button::B, 0x02),
+            (Button::Back, 0x04),
+            (Button::Start, 0x08),
+            (Button::DPadUp, 0x10),
+            (Button::DPadDown, 0x20),
+            (Button::DPadLeft, 0x40),
+            (Button::DPadRight, 0x80),
+        ] {
+            assert_eq!(pad_bit(button), Some(bit), "{button:?}");
+        }
+        assert_eq!(pad_bit(Button::X), None, "a button with no NES twin");
+    }
+
+    #[test]
+    fn player_two_keys_hold_their_own_mask() {
+        let mut input = Input::default();
+        assert!(input.apply_event(key_event(Keycode::G, true)));
+        assert_eq!(input.keys, [0, 0x01], "G is player 2's A");
+        assert!(input.apply_event(key_event(Keycode::G, false)));
+        assert_eq!(input.keys, [0, 0]);
+
+        input.apply_event(key_event(Keycode::Z, true));
+        input.apply_event(key_event(Keycode::H, true));
+        assert_eq!(input.keys, [0x01, 0x02], "both players can hold a button");
+
+        input.add_pad(7);
+        input.apply_event(key_event(Keycode::G, true));
+        input.apply_event(pad_event(7, Button::A, true));
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0x01, 0x03], [0x01, 0]),
+            "player 2's key and pad both hold A"
+        );
+        input.apply_event(key_event(Keycode::G, false));
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0x01, 0x02], [0x01, 0]),
+            "releasing the key leaves the pad holding A"
+        );
     }
 
     #[test]
     fn a_key_up_clears_only_its_own_bit() {
-        let down = |key| Event::KeyDown {
-            timestamp: 0,
-            window_id: 0,
-            keycode: Some(key),
-            scancode: None,
-            keymod: sdl2::keyboard::Mod::empty(),
-            repeat: false,
-        };
-        let up = |key| Event::KeyUp {
-            timestamp: 1,
-            window_id: 0,
-            keycode: Some(key),
-            scancode: None,
-            keymod: sdl2::keyboard::Mod::empty(),
-            repeat: false,
-        };
-        let mut keys = 0u8;
-        let mut pad = 0u8;
+        let mut input = Input::default();
         for key in [Keycode::Z, Keycode::Right, Keycode::Return] {
-            assert!(apply_event(down(key), &mut keys, &mut pad), "{key:?} down");
+            assert!(input.apply_event(key_event(key, true)), "{key:?} down");
         }
-        assert_eq!(keys, 0x01 | 0x80 | 0x08, "Z, Right and Return held");
-        assert!(
-            apply_event(up(Keycode::Right), &mut keys, &mut pad),
-            "Right up"
-        );
+        assert_eq!(input.keys[0], 0x01 | 0x80 | 0x08, "Z, Right and Return");
+        assert!(input.apply_event(key_event(Keycode::Right, false)));
         assert_eq!(
-            keys,
+            input.keys[0],
             0x01 | 0x08,
             "only Right's bit goes; Z and Return are still down"
         );
         // Escape quits, a key with no bit does nothing, and both still say the
         // run continues.
         assert!(
-            !apply_event(down(Keycode::Escape), &mut keys, &mut pad),
+            !input.apply_event(key_event(Keycode::Escape, true)),
             "Escape ends the run"
         );
-        let before = keys;
+        let before = input.keys;
         assert!(
-            apply_event(down(Keycode::F5), &mut keys, &mut pad),
+            input.apply_event(key_event(Keycode::F5, true)),
             "F5 is not a quit"
         );
-        assert_eq!(keys, before, "F5 is not on the pad");
+        assert_eq!(input.keys, before, "F5 is not on either pad");
     }
 
     /// Keyboard and gamepad are separate masks so releasing one source cannot
     /// release a button the other still holds.
     #[test]
     fn keyboard_and_gamepad_hold_the_same_bits_independently() {
-        let key_down = Event::KeyDown {
-            timestamp: 0,
-            window_id: 0,
-            keycode: Some(Keycode::Z),
-            scancode: None,
-            keymod: sdl2::keyboard::Mod::empty(),
-            repeat: false,
+        let mut input = Input::default();
+        input.add_pad(0);
+        input.apply_event(key_event(Keycode::Z, true));
+        input.apply_event(pad_event(0, Button::A, true));
+        assert_eq!((input.keys, input.pads), ([0x01, 0], [0x01, 0]));
+        input.apply_event(key_event(Keycode::Z, false));
+        assert_eq!((input.keys, input.pads), ([0x00, 0], [0x01, 0]));
+        input.apply_event(pad_event(0, Button::A, false));
+        assert_eq!((input.keys, input.pads), ([0, 0], [0, 0]));
+    }
+
+    /// SDL sends no `KeyUp` for a key released while another window has the
+    /// focus, so the FocusLost arm is the only thing that un-latches a held
+    /// button. `Event` is a plain enum value, so this runs with no window and
+    /// no X server -- it needed the handler extracted from `main` to be
+    /// reachable at all, not a real alt-tab.
+    #[test]
+    fn a_focus_loss_clears_both_players_but_remembers_the_pads() {
+        let mut input = Input::default();
+        input.add_pad(7);
+        input.add_pad(9);
+        input.keys = [0xFF, 0xFF];
+        input.pads = [0xFF, 0xFF];
+        assert!(
+            input.apply_event(focus_lost()),
+            "losing focus is not a quit"
+        );
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0, 0], [0, 0]),
+            "every held bit must be forgotten"
+        );
+        assert_eq!(
+            input.pad_ids,
+            [Some(7), Some(9)],
+            "the pads are still plugged in"
+        );
+    }
+
+    #[test]
+    fn a_two_player_game_keeps_the_players_apart() {
+        let input = Input {
+            keys: [0x01, 0x02],
+            pads: [0x04, 0x08],
+            ..Default::default()
         };
-        let key_up = Event::KeyUp {
-            timestamp: 1,
-            window_id: 0,
-            keycode: Some(Keycode::Z),
-            scancode: None,
-            keymod: sdl2::keyboard::Mod::empty(),
-            repeat: false,
+        assert_eq!(input.controller_masks(2), [0x05, 0x0A]);
+    }
+
+    /// A one-player game folds every input source into controller 1, so the
+    /// second keyboard set or the second pad can play it alone.
+    #[test]
+    fn a_one_player_game_folds_both_input_sets_into_controller_one() {
+        let input = Input {
+            keys: [0x01, 0x02],
+            pads: [0x04, 0x08],
+            ..Default::default()
         };
-        let pad_down = Event::ControllerButtonDown {
-            timestamp: 2,
-            which: 0,
-            button: sdl2::controller::Button::A,
-        };
-        let pad_up = Event::ControllerButtonUp {
-            timestamp: 3,
-            which: 0,
-            button: sdl2::controller::Button::A,
-        };
-        let mut keys = 0u8;
-        let mut pad = 0u8;
-        apply_event(key_down, &mut keys, &mut pad);
-        apply_event(pad_down, &mut keys, &mut pad);
-        assert_eq!((keys, pad), (0x01, 0x01), "Z and pad A both hold A");
-        apply_event(key_up, &mut keys, &mut pad);
-        assert_eq!((keys, pad), (0x00, 0x01), "pad A keeps A held");
-        apply_event(pad_up, &mut keys, &mut pad);
-        assert_eq!((keys, pad), (0x00, 0x00));
+        assert_eq!(input.controller_masks(1), [0x0F, 0]);
+    }
+
+    #[test]
+    fn gamepads_take_the_first_free_player_slot_and_leave_it_on_removal() {
+        let mut input = Input::default();
+        assert_eq!(input.add_pad(7), Some(0), "the first pad is player 1");
+        assert_eq!(input.add_pad(9), Some(1), "the second pad is player 2");
+        assert_eq!(input.add_pad(11), None, "a third pad has no player");
+        assert_eq!(input.add_pad(7), None, "the same pad is not opened twice");
+        input.pads[1] = 0x01;
+        assert_eq!(input.remove_pad(9), Some(1));
+        assert_eq!(input.pads[1], 0, "a removed pad releases what it held");
+        assert_eq!(input.add_pad(11), Some(1), "the freed slot is reused");
+    }
+
+    #[test]
+    fn a_gamepad_button_reaches_the_player_whose_slot_holds_it() {
+        let mut input = Input::default();
+        input.add_pad(7);
+        input.add_pad(9);
+        input.apply_event(pad_event(9, Button::A, true));
+        assert_eq!(input.pads, [0, 0x01], "the second pad is player 2");
+        input.apply_event(pad_event(9, Button::A, false));
+        assert_eq!(input.pads, [0, 0]);
+        input.apply_event(pad_event(7, Button::B, true));
+        assert_eq!(input.pads, [0x02, 0]);
+        input.apply_event(pad_event(11, Button::B, true));
+        assert_eq!(input.pads, [0x02, 0], "an unassigned pad is ignored");
+    }
+
+    /// A typo in another game's line must not switch this game back to two
+    /// players: the valid override below it still applies.
+    #[test]
+    fn a_broken_line_for_another_game_does_not_hide_a_valid_override() {
+        assert_eq!(
+            players_for_game("Some Game Without Equals\nZelda = 1\n", "Zelda"),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            players_for_game("Mario = three\nZelda = 1\n", "Zelda"),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            players_for_game("Zelda 1\n", "Zelda"),
+            Ok(None),
+            "a line without `=` is ignored, not guessed"
+        );
+    }
+
+    /// The file wrapper: a found line applies, while a missing file, a game
+    /// with no line, and a broken line all fall back instead of stopping play.
+    #[test]
+    fn the_player_config_file_applies_found_lines_and_defaults_on_trouble() {
+        let dir = std::env::temp_dir().join(format!("nes-players-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nes-players.conf");
+
+        assert_eq!(
+            players_from_file(&path, "Zelda"),
+            Ok(None),
+            "a missing file is the default"
+        );
+
+        std::fs::write(&path, "Zelda = 1\n").unwrap();
+        assert_eq!(players_from_file(&path, "Zelda"), Ok(Some(1)));
+        assert_eq!(
+            players_from_file(&path, "Mario"),
+            Ok(None),
+            "no line for the game is the default"
+        );
+
+        std::fs::write(&path, "Zelda = 0\n").unwrap();
+        assert!(
+            players_from_file(&path, "Zelda").is_err(),
+            "a broken line is an error the caller logs"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_player_override_is_one_line_per_game() {
+        let text = "\
+# games that are not two-player
+Contra (USA) = 2
+Zelda = 1   # solo
+";
+        assert_eq!(players_for_game(text, "Zelda"), Ok(Some(1)));
+        assert_eq!(
+            players_for_game(text, "contra (usa)"),
+            Ok(Some(2)),
+            "the game name is case-insensitive"
+        );
+        assert_eq!(
+            players_for_game(text, "Mario"),
+            Ok(None),
+            "no line means the default"
+        );
+        assert_eq!(
+            players_for_game("Zelda = 1\nZelda = 2\n", "Zelda"),
+            Ok(Some(2)),
+            "the last matching line wins"
+        );
+    }
+
+    #[test]
+    fn a_broken_player_override_is_an_error() {
+        for (text, needle) in [
+            ("Zelda = 0\n", "1 or 2"),
+            ("Zelda = 3\n", "1 or 2"),
+            ("Zelda = one\n", "one"),
+        ] {
+            let err = players_for_game(text, "Zelda").unwrap_err();
+            assert!(err.contains(needle), "{text:?} gave {err:?}");
+        }
     }
 
     /// A dump frame past the end of the run is written nowhere and reported

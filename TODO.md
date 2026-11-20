@@ -3,7 +3,7 @@
 Current state: mappers 0/1/2/3/4/7/66/71/185, cycle-based PPU with scanline IRQ support in
 the cartridge, APU with DMC, NTSC and PAL timing, battery saves, versioned save-state
 serialization with quicksave slots and an in-game slot picker, launcher,
-scripted input and frame dumps.
+two-player input, scripted input and frame dumps.
 Everything unchecked below is not implemented.
 
 Effort: S = hours, M = a day, L = a few days, XL = a week or more.
@@ -26,13 +26,12 @@ last. Each entry names its issue and effort.
 
 All S and built on machinery that already exists; batch them.
 
-3. **Two-player input** (#23) — controller 2 and the gamepad path already exist.
-4. **Fast-forward** (#20).
-5. **Frame advance** (#21) — the pause/step loop also seeds the debugger and TAS.
-6. **Volume control** (#25) — mute already exists.
-7. **Auto-save state on quit** (#43) — save-state format and folder layout exist.
-8. **Recent ROM list** (#27) — launcher config already persists the last folder.
-9. **Live screenshot hotkey** (#28) — reuse the `--dump` writer.
+3. **Fast-forward** (#20).
+4. **Frame advance** (#21) — the pause/step loop also seeds the debugger and TAS.
+5. **Volume control** (#25) — mute already exists.
+6. **Auto-save state on quit** (#43) — save-state format and folder layout exist.
+7. **Recent ROM list** (#27) — launcher config already persists the last folder.
+8. **Live screenshot hotkey** (#28) — reuse the `--dump` writer.
 
 ### 3. Headline features
 
@@ -100,7 +99,7 @@ Zapper is the visible payoff, rewind is broadly useful, mapper 9/10 adds games.
 - [ ] **Fast-forward** — hold-to-turbo, with audio muted or pitch-shifted. *Effort: S.*
 - [ ] **Frame advance** — pause plus single-frame stepping. *Effort: S.*
 - [ ] **Zapper + mouse** — light-gun register at `$4017` bit 4, mouse aim, trigger mapping, hit detection against the framebuffer/beam position. Duck Hunt is the test case. *Effort: M.*
-- [ ] **Two-player input** — bus already exposes controller 2; map a second keyboard set and a second gamepad, add a per-game player-count override. *Effort: S.*
+- [x] **Two-player input** — bus already exposes controller 2; map a second keyboard set and a second gamepad, add a per-game player-count override. *Done; player 2 uses WASD, G/H, T/Y, the first two pads take the player slots, and `nes-players.conf` can fold both input sets into controller 1 for a one-player game.*
 - [ ] **Remappable controls** — config file for keyboard and gamepad bindings, with defaults matching the current README. *Effort: M.*
 - [ ] **Volume control** — hotkeys plus persisted config, separate master and APU balance. *Effort: S.*
 - [ ] **Per-game configuration** — remember volume, video filter, cheats and controller count per ROM hash. *Effort: M.*
