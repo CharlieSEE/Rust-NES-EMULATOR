@@ -81,6 +81,7 @@ repository.
 | --- | --- |
 | Pause | `P` |
 | Reset | `R` |
+| Fast-forward | Hold `Tab` (audio muted) |
 | Quicksave slot 1–9 | `1`–`9` |
 | Quickload slot 1–9 | `Left Shift`+`1`–`9` |
 | Quickload latest slot | `F8` |
