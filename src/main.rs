@@ -418,36 +418,23 @@ fn picker_command(event: &Event) -> PickerCommand {
     }
 }
 
-/// The picker pauses the game while it is open; audio follows the game, and a
-/// muted game stays silent even when play resumes.
-fn resume_audio(paused: bool, muted: bool) -> bool {
-    !paused && !muted
+/// The device plays only while the game runs at normal speed and the player has
+/// not muted it. Pausing, muting and fast-forward all keep it silent.
+fn audio_should_play(paused: bool, muted: bool, turbo: bool) -> bool {
+    !paused && !muted && !turbo
 }
 
 /// A load replaces the machine's timeline: the frame the loop paused on belongs
 /// to the old one, and the queued samples are noise over the loaded state. Drop
-/// them, unpause so the next iteration renders what was restored, and restart
-/// the queue unless the player muted it.
-fn resume_after_load(paused: &mut bool, muted: bool, audio: Option<&sdl2::audio::AudioQueue<i16>>) {
+/// them and unpause so the next iteration renders what was restored; the
+/// per-frame audio sync restarts the queue under the usual conditions. Only the
+/// game buttons belong to the old run; a held Tab is host state and survives.
+fn finish_load(paused: &mut bool, audio: Option<&sdl2::audio::AudioQueue<i16>>, input: &mut Input) {
     *paused = false;
     if let Some(queue) = audio {
         queue.clear();
-        if !muted {
-            queue.resume();
-        }
     }
-}
-
-/// A load replaces the machine; held input belongs to the old run and must not
-/// press a button on the restored first frame.
-fn finish_load(
-    paused: &mut bool,
-    muted: bool,
-    audio: Option<&sdl2::audio::AudioQueue<i16>>,
-    input: &mut Input,
-) {
-    resume_after_load(paused, muted, audio);
-    input.forget();
+    input.forget_buttons();
 }
 
 /// A save or load writes no message of its own, so a short confirmation is
@@ -694,6 +681,9 @@ struct Input {
     keys: [u8; 2],
     pads: [u8; 2],
     pad_ids: [Option<u32>; 2],
+    /// Fast-forward is held, not toggled: release the key and normal speed
+    /// returns. It lives here so a focus loss forgets it with the buttons.
+    turbo: bool,
 }
 
 impl Input {
@@ -706,6 +696,20 @@ impl Input {
                 keycode: Some(Keycode::Escape),
                 ..
             } => false,
+            Event::KeyDown {
+                keycode: Some(Keycode::Tab),
+                ..
+            } => {
+                self.turbo = true;
+                true
+            }
+            Event::KeyUp {
+                keycode: Some(Keycode::Tab),
+                ..
+            } => {
+                self.turbo = false;
+                true
+            }
             Event::KeyDown {
                 keycode: Some(key), ..
             } => {
@@ -793,10 +797,18 @@ impl Input {
         self.pad_ids.iter().position(|&slot| slot == Some(id))
     }
 
-    /// Drop every held button without forgetting which pad is in which slot.
-    fn forget(&mut self) {
+    /// Drop every held game button without touching the host-side holds or the
+    /// pad assignment.
+    fn forget_buttons(&mut self) {
         self.keys = [0; 2];
         self.pads = [0; 2];
+    }
+
+    /// Drop every held button and host hold without forgetting which pad is in
+    /// which slot.
+    fn forget(&mut self) {
+        self.forget_buttons();
+        self.turbo = false;
     }
 }
 
@@ -901,6 +913,13 @@ impl Play {
         self.left -= 1;
         Some(self.mask)
     }
+}
+
+/// Whether the loop waits out the frame period. Fast-forward is the only
+/// unpaused state that does not; a paused game still waits so the window stays
+/// responsive while its frame is frozen.
+fn waits_after_frame(paused: bool, turbo: bool) -> bool {
+    paused || !turbo
 }
 
 /// How long to sleep at the end of a frame that took `elapsed`. A frame that
@@ -1090,12 +1109,14 @@ fn run() -> Result<(), String> {
     }
     let mut last_save = ::std::time::Instant::now();
 
+    let mut audio_playing = false;
     if let Some(queue) = &audio {
         // The queue is opened with no allowed changes, so a device that cannot
         // do exactly this spec fails the open instead of renegotiating it; the
         // mixer follows whatever rate the device did agree to.
         bus.apu.set_sample_rate(queue.spec().freq as u32);
         queue.resume();
+        audio_playing = true;
     }
 
     let mut events = sdl.event_pump().map_err(|e| e.to_string())?;
@@ -1162,11 +1183,6 @@ fn run() -> Result<(), String> {
                         picker = None;
                         paused = picker_was_paused;
                         input.forget();
-                        if let Some(queue) = &audio {
-                            if resume_audio(paused, muted) {
-                                queue.resume();
-                            }
-                        }
                     }
                     PickerCommand::Move(delta) => {
                         if let Some(open) = picker.as_mut() {
@@ -1180,7 +1196,7 @@ fn run() -> Result<(), String> {
                                 picker = None;
                                 // A load replaces the paused frame with the
                                 // restored one, so the game resumes either way.
-                                finish_load(&mut paused, muted, audio.as_ref(), &mut input);
+                                finish_load(&mut paused, audio.as_ref(), &mut input);
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1199,13 +1215,6 @@ fn run() -> Result<(), String> {
                     ..
                 } => {
                     paused = !paused;
-                    if let Some(queue) = &audio {
-                        if paused {
-                            queue.pause();
-                        } else if !muted {
-                            queue.resume();
-                        }
-                    }
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::R),
@@ -1242,12 +1251,9 @@ fn run() -> Result<(), String> {
                     ..
                 } => {
                     muted = !muted;
-                    if let Some(queue) = &audio {
-                        if muted {
-                            queue.pause();
+                    if muted {
+                        if let Some(queue) = &audio {
                             queue.clear();
-                        } else if !paused {
-                            queue.resume();
                         }
                     }
                 }
@@ -1259,12 +1265,7 @@ fn run() -> Result<(), String> {
                     picker_was_paused = paused;
                     picker = Some(Picker::open(&save_dir, &bus.cart));
                     input.forget();
-                    if !paused {
-                        paused = true;
-                        if let Some(queue) = &audio {
-                            queue.pause();
-                        }
-                    }
+                    paused = true;
                 }
                 Event::KeyDown {
                     scancode: Some(key),
@@ -1276,7 +1277,7 @@ fn run() -> Result<(), String> {
                     if keymod.contains(Mod::LSHIFTMOD) {
                         match load_state_slot(&save_dir, slot, &mut bus, &mut cpu) {
                             Ok(()) => {
-                                finish_load(&mut paused, muted, audio.as_ref(), &mut input);
+                                finish_load(&mut paused, audio.as_ref(), &mut input);
                                 toast =
                                     Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                             }
@@ -1298,7 +1299,7 @@ fn run() -> Result<(), String> {
                     ..
                 } => match load_latest_state(&save_dir, &mut bus, &mut cpu) {
                     Ok(slot) => {
-                        finish_load(&mut paused, muted, audio.as_ref(), &mut input);
+                        finish_load(&mut paused, audio.as_ref(), &mut input);
                         toast = Some(Toast::new(&format!("Loaded slot {slot}"), CONFIRM_TOAST));
                     }
                     Err(e) => toast_error(&mut toast, &e),
@@ -1309,6 +1310,24 @@ fn run() -> Result<(), String> {
                     }
                 }
             }
+        }
+        // Pause, mute and fast-forward all stop the device; only this sync
+        // touches the queue, so a hotkey handled anywhere above cannot leave it
+        // playing when the game is silent. Fast-forward also drops the backlog
+        // it inherited, or releasing the key would play stale sound.
+        let should_play = audio_should_play(paused, muted, input.turbo);
+        if should_play != audio_playing {
+            if let Some(queue) = &audio {
+                if should_play {
+                    queue.resume();
+                } else {
+                    queue.pause();
+                    if input.turbo {
+                        queue.clear();
+                    }
+                }
+            }
+            audio_playing = should_play;
         }
         // A paused machine keeps its frame on screen and its script on hold;
         // time does not advance for either.
@@ -1339,9 +1358,10 @@ fn run() -> Result<(), String> {
             bus.run_frame(&mut cpu);
             if let Some(queue) = &audio {
                 let samples = bus.apu.take_samples();
-                // Muted still drains the APU's queue, or the mix would grow
-                // without bound; the samples are simply not handed to the device.
-                if !muted && !samples.is_empty() {
+                // Muted and fast-forward still drain the APU's queue, or the mix
+                // would grow without bound; the samples are simply not handed to
+                // the device.
+                if !muted && !input.turbo && !samples.is_empty() {
                     // A queue past `AUDIO_MAX_QUEUED` is a stall being played
                     // back: drop this frame and let the device catch up to the
                     // picture rather than fall further behind it. A device that
@@ -1405,13 +1425,18 @@ fn run() -> Result<(), String> {
         // With a device, its queue sets the pace; without one, the wall-clock
         // budget does. Either way the emulation is untouched by the wait. A
         // paused or muted run has no queue to follow, so it falls back to the
-        // wall clock and keeps the window responsive.
-        if paused {
-            ::std::thread::sleep(budget);
-        } else {
-            match &audio {
-                Some(queue) if !muted => ::std::thread::sleep(audio_sleep(queue.size(), budget)),
-                _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed(), budget)),
+        // wall clock and keeps the window responsive. Fast-forward waits for
+        // neither: the hold exists to run the machine as fast as it can.
+        if waits_after_frame(paused, input.turbo) {
+            if paused {
+                ::std::thread::sleep(budget);
+            } else {
+                match &audio {
+                    Some(queue) if !muted => {
+                        ::std::thread::sleep(audio_sleep(queue.size(), budget))
+                    }
+                    _ => ::std::thread::sleep(frame_sleep(frame_start.elapsed(), budget)),
+                }
             }
         }
     }
@@ -1469,12 +1494,12 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        age_label, audio_sleep, button_for, draw_toast, dump_list_ends_run, finish_load,
-        frame_budget, frame_sleep, game_save_dir, latest_state_path, load_latest_state,
-        load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps, move_selection,
-        p2_button_for, pad_bit, parse_script, picker_command, players_for_game, players_from_file,
-        read_latest_slot, resume_after_load, resume_audio, save_state_slot, slot_for, slot_line,
-        state_slot_path, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
+        age_label, audio_should_play, audio_sleep, button_for, draw_toast, dump_list_ends_run,
+        finish_load, frame_budget, frame_sleep, game_save_dir, latest_state_path,
+        load_latest_state, load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps,
+        move_selection, p2_button_for, pad_bit, parse_script, picker_command, players_for_game,
+        players_from_file, read_latest_slot, save_state_slot, slot_for, slot_line, state_slot_path,
+        waits_after_frame, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
         PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
         AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
@@ -1748,14 +1773,26 @@ mod tests {
         assert_eq!(picker_command(&lost), PickerCommand::ForgetInput);
     }
 
-    /// Opening the list pauses the game; closing it returns to the pause state
-    /// it had before, and a muted game stays silent.
+    /// The device plays only for a running, unmuted game at normal speed; every
+    /// other state keeps it silent.
     #[test]
-    fn the_picker_keeps_the_pause_and_mute_state() {
-        assert!(resume_audio(false, false), "play resumes");
-        assert!(!resume_audio(true, false), "a paused game stays paused");
-        assert!(!resume_audio(false, true), "a muted game stays silent");
-        assert!(!resume_audio(true, true));
+    fn pause_mute_and_fast_forward_all_silence_audio() {
+        assert!(
+            audio_should_play(false, false, false),
+            "normal play is audible"
+        );
+        assert!(
+            !audio_should_play(true, false, false),
+            "a paused game is silent"
+        );
+        assert!(
+            !audio_should_play(false, true, false),
+            "a muted game is silent"
+        );
+        assert!(
+            !audio_should_play(false, false, true),
+            "fast-forward is silent"
+        );
     }
 
     /// Up from the first slot wraps to the last, and down from the last wraps
@@ -1802,31 +1839,29 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
-    /// A load replaces the machine, including the frame that was on screen
-    /// when the loop paused. Staying paused would keep showing that old frame.
+    /// A quickload replaces the machine, including the frame that was on
+    /// screen when the loop paused. Staying paused would keep showing that old
+    /// frame, and a button held during the old run must not press on the
+    /// restored first frame. A held Tab is host state, so it survives.
     #[test]
-    fn a_loaded_state_unpauses_the_frame_loop() {
-        let mut paused = true;
-        resume_after_load(&mut paused, false, None);
-        assert!(!paused, "a load must render the state it just restored");
-    }
-
-    /// A quickload replaces the machine; a button held during the old run must
-    /// not press on the restored first frame.
-    #[test]
-    fn a_loaded_state_drops_held_input() {
+    fn a_loaded_state_unpauses_and_drops_game_buttons() {
         let mut paused = true;
         let mut input = Input {
             keys: [0xFF, 0xFF],
             pads: [0xFF, 0xFF],
+            turbo: true,
             ..Default::default()
         };
-        finish_load(&mut paused, false, None, &mut input);
+        finish_load(&mut paused, None, &mut input);
         assert!(!paused, "a load must render the state it just restored");
         assert_eq!(
             (input.keys, input.pads),
             ([0, 0], [0, 0]),
             "the old run's held buttons are gone"
+        );
+        assert!(
+            input.turbo,
+            "a held Tab is host state, not part of the restored run"
         );
     }
 
@@ -2107,6 +2142,19 @@ mod tests {
         assert_eq!(frame_budget(Region::Pal), Duration::from_micros(20_000));
     }
 
+    /// Fast-forward is the one unpaused state that does not wait after a
+    /// frame; a paused game still waits so the window stays responsive.
+    #[test]
+    fn fast_forward_skips_the_frame_wait() {
+        assert!(waits_after_frame(false, false), "normal play is paced");
+        assert!(!waits_after_frame(false, true), "fast-forward is uncapped");
+        assert!(waits_after_frame(true, false), "a paused game still waits");
+        assert!(
+            waits_after_frame(true, true),
+            "holding Tab while paused must not spin the loop"
+        );
+    }
+
     #[test]
     fn a_sleep_fills_out_the_frame_budget_and_never_goes_negative() {
         let budget = frame_budget(Region::Ntsc);
@@ -2273,6 +2321,25 @@ mod tests {
         assert_eq!((input.keys, input.pads), ([0, 0], [0, 0]));
     }
 
+    /// Tab is fast-forward, not a pad button: holding it must never press A,
+    /// B or anything a game can read.
+    #[test]
+    fn tab_holds_fast_forward_without_pressing_a_button() {
+        let mut input = Input::default();
+        assert!(
+            input.apply_event(key_event(Keycode::Tab, true)),
+            "pressing Tab is not a quit"
+        );
+        assert!(input.turbo, "Tab starts fast-forward");
+        assert_eq!(
+            (input.keys, input.pads),
+            ([0, 0], [0, 0]),
+            "Tab is not on either pad"
+        );
+        input.apply_event(key_event(Keycode::Tab, false));
+        assert!(!input.turbo, "releasing Tab stops it");
+    }
+
     /// SDL sends no `KeyUp` for a key released while another window has the
     /// focus, so the FocusLost arm is the only thing that un-latches a held
     /// button. `Event` is a plain enum value, so this runs with no window and
@@ -2285,6 +2352,7 @@ mod tests {
         input.add_pad(9);
         input.keys = [0xFF, 0xFF];
         input.pads = [0xFF, 0xFF];
+        input.turbo = true;
         assert!(
             input.apply_event(focus_lost()),
             "losing focus is not a quit"
@@ -2294,6 +2362,7 @@ mod tests {
             ([0, 0], [0, 0]),
             "every held bit must be forgotten"
         );
+        assert!(!input.turbo, "a held Tab must not survive the alt-tab");
         assert_eq!(
             input.pad_ids,
             [Some(7), Some(9)],
