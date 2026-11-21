@@ -922,6 +922,21 @@ fn waits_after_frame(paused: bool, turbo: bool) -> bool {
     paused || !turbo
 }
 
+/// Whether to emulate a frame now. Unpausing throws queued requests away:
+/// they belong to the paused run that asked for them; otherwise one queued
+/// step is consumed per call.
+fn should_emulate_frame(paused: bool, pending: &mut u32) -> bool {
+    if !paused {
+        *pending = 0;
+        return true;
+    }
+    if *pending == 0 {
+        return false;
+    }
+    *pending -= 1;
+    true
+}
+
 /// How long to sleep at the end of a frame that took `elapsed`. A frame that
 /// overran gets no sleep at all and the next one starts fresh.
 ///
@@ -1148,6 +1163,9 @@ fn run() -> Result<(), String> {
     let mut picker_was_paused = false;
     let mut overlay = vec![0u32; W * H];
     let mut frames = 0u32;
+    // One `.` press queues one frame; the frame block consumes one request per
+    // iteration, so rapid taps polled together are not lost.
+    let mut pending_steps = 0u32;
     while running {
         // Started before anything else in the frame so the emulation, the
         // upload and the sleep are all inside the measured budget.
@@ -1216,6 +1234,17 @@ fn run() -> Result<(), String> {
                 } => {
                     paused = !paused;
                 }
+                // Frame advance is a paused-only action: while the game runs,
+                // the frame clock already advances it.
+                Event::KeyDown {
+                    keycode: Some(Keycode::Period),
+                    repeat: false,
+                    ..
+                } => {
+                    if paused {
+                        pending_steps = pending_steps.saturating_add(1);
+                    }
+                }
                 Event::KeyDown {
                     keycode: Some(Keycode::R),
                     repeat: false,
@@ -1266,6 +1295,7 @@ fn run() -> Result<(), String> {
                     picker = Some(Picker::open(&save_dir, &bus.cart));
                     input.forget();
                     paused = true;
+                    pending_steps = 0;
                 }
                 Event::KeyDown {
                     scancode: Some(key),
@@ -1330,8 +1360,9 @@ fn run() -> Result<(), String> {
             audio_playing = should_play;
         }
         // A paused machine keeps its frame on screen and its script on hold;
-        // time does not advance for either.
-        if !paused {
+        // time does not advance for either. A queued frame-advance request is
+        // the one exception: it runs one frame and stays paused.
+        if should_emulate_frame(paused, &mut pending_steps) {
             // A script is not a second input path: it assigns the same mask a
             // key press assigns, and it goes through the same `set_buttons`
             // calls below. It drives player 1 only.
@@ -1358,10 +1389,11 @@ fn run() -> Result<(), String> {
             bus.run_frame(&mut cpu);
             if let Some(queue) = &audio {
                 let samples = bus.apu.take_samples();
-                // Muted and fast-forward still drain the APU's queue, or the mix
-                // would grow without bound; the samples are simply not handed to
-                // the device.
-                if !muted && !input.turbo && !samples.is_empty() {
+                // Muted, fast-forward and paused still drain the APU's queue, or
+                // the mix would grow without bound; the samples are simply not
+                // handed to the device. A single stepped frame is silent too:
+                // the device is paused, so queueing it would only add latency.
+                if !muted && !input.turbo && !paused && !samples.is_empty() {
                     // A queue past `AUDIO_MAX_QUEUED` is a stall being played
                     // back: drop this frame and let the device catch up to the
                     // picture rather than fall further behind it. A device that
@@ -1426,8 +1458,9 @@ fn run() -> Result<(), String> {
         // budget does. Either way the emulation is untouched by the wait. A
         // paused or muted run has no queue to follow, so it falls back to the
         // wall clock and keeps the window responsive. Fast-forward waits for
-        // neither: the hold exists to run the machine as fast as it can.
-        if waits_after_frame(paused, input.turbo) {
+        // neither: the hold exists to run the machine as fast as it can. A
+        // queued step skips the wait so a burst drains back-to-back.
+        if pending_steps == 0 && waits_after_frame(paused, input.turbo) {
             if paused {
                 ::std::thread::sleep(budget);
             } else {
@@ -1498,10 +1531,10 @@ mod tests {
         finish_load, frame_budget, frame_sleep, game_save_dir, latest_state_path,
         load_latest_state, load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps,
         move_selection, p2_button_for, pad_bit, parse_script, picker_command, players_for_game,
-        players_from_file, read_latest_slot, save_state_slot, slot_for, slot_line, state_slot_path,
-        waits_after_frame, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
-        PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
-        AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
+        players_from_file, read_latest_slot, save_state_slot, should_emulate_frame, slot_for,
+        slot_line, state_slot_path, waits_after_frame, wrap_text, write_atomic, Bus, Cartridge,
+        Cpu, Input, Picker, PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES,
+        AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::controller::Button;
     use sdl2::event::{Event, WindowEvent};
@@ -2153,6 +2186,31 @@ mod tests {
             waits_after_frame(true, true),
             "holding Tab while paused must not spin the loop"
         );
+    }
+
+    /// Normal play advances every iteration; a paused machine advances only by
+    /// consuming queued steps; unpausing discards the rest.
+    #[test]
+    fn frame_advance_runs_normally_and_consumes_queued_steps() {
+        let mut pending = 3;
+        assert!(
+            should_emulate_frame(false, &mut pending),
+            "normal play always advances"
+        );
+        assert_eq!(pending, 0, "unpausing discards the queued steps");
+
+        let mut pending = 0;
+        assert!(
+            !should_emulate_frame(true, &mut pending),
+            "pause freezes the machine"
+        );
+
+        let mut pending = 2;
+        assert!(should_emulate_frame(true, &mut pending));
+        assert_eq!(pending, 1, "the first press is consumed");
+        assert!(should_emulate_frame(true, &mut pending));
+        assert_eq!(pending, 0, "the second press is consumed");
+        assert!(!should_emulate_frame(true, &mut pending));
     }
 
     #[test]
