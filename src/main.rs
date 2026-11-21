@@ -922,6 +922,13 @@ fn waits_after_frame(paused: bool, turbo: bool) -> bool {
     paused || !turbo
 }
 
+/// A paused machine still runs a frame when the player asked for exactly one.
+/// Everything else (audio, the script, the frame counter) follows the same path
+/// as normal play, so a step is a real frame and not a redraw of the old one.
+fn emulates_frame(paused: bool, step: bool) -> bool {
+    !paused || step
+}
+
 /// How long to sleep at the end of a frame that took `elapsed`. A frame that
 /// overran gets no sleep at all and the next one starts fresh.
 ///
@@ -1152,6 +1159,9 @@ fn run() -> Result<(), String> {
         // Started before anything else in the frame so the emulation, the
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
+        // One key press, one frame. It is cleared at the top of each iteration,
+        // so holding the key cannot turn a single step into fast-forward.
+        let mut step = false;
         for event in events.poll_iter() {
             // A controller can arrive or leave at any time, including while
             // the modal list owns the input; hotplug must not be lost to the
@@ -1215,6 +1225,17 @@ fn run() -> Result<(), String> {
                     ..
                 } => {
                     paused = !paused;
+                }
+                // Frame advance is a paused-only action: while the game runs,
+                // the frame clock already advances it.
+                Event::KeyDown {
+                    keycode: Some(Keycode::Period),
+                    repeat: false,
+                    ..
+                } => {
+                    if paused {
+                        step = true;
+                    }
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::R),
@@ -1330,8 +1351,9 @@ fn run() -> Result<(), String> {
             audio_playing = should_play;
         }
         // A paused machine keeps its frame on screen and its script on hold;
-        // time does not advance for either.
-        if !paused {
+        // time does not advance for either. A frame-advance request is the one
+        // exception: it runs exactly one frame and stays paused.
+        if emulates_frame(paused, step) {
             // A script is not a second input path: it assigns the same mask a
             // key press assigns, and it goes through the same `set_buttons`
             // calls below. It drives player 1 only.
@@ -1358,10 +1380,11 @@ fn run() -> Result<(), String> {
             bus.run_frame(&mut cpu);
             if let Some(queue) = &audio {
                 let samples = bus.apu.take_samples();
-                // Muted and fast-forward still drain the APU's queue, or the mix
-                // would grow without bound; the samples are simply not handed to
-                // the device.
-                if !muted && !input.turbo && !samples.is_empty() {
+                // Muted, fast-forward and paused still drain the APU's queue, or
+                // the mix would grow without bound; the samples are simply not
+                // handed to the device. A single stepped frame is silent too:
+                // the device is paused, so queueing it would only add latency.
+                if !muted && !input.turbo && !paused && !samples.is_empty() {
                     // A queue past `AUDIO_MAX_QUEUED` is a stall being played
                     // back: drop this frame and let the device catch up to the
                     // picture rather than fall further behind it. A device that
@@ -1495,7 +1518,7 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         age_label, audio_should_play, audio_sleep, button_for, draw_toast, dump_list_ends_run,
-        finish_load, frame_budget, frame_sleep, game_save_dir, latest_state_path,
+        emulates_frame, finish_load, frame_budget, frame_sleep, game_save_dir, latest_state_path,
         load_latest_state, load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps,
         move_selection, p2_button_for, pad_bit, parse_script, picker_command, players_for_game,
         players_from_file, read_latest_slot, save_state_slot, slot_for, slot_line, state_slot_path,
@@ -2152,6 +2175,22 @@ mod tests {
         assert!(
             waits_after_frame(true, true),
             "holding Tab while paused must not spin the loop"
+        );
+    }
+
+    /// A step is one emulated frame while the game stays paused; without a
+    /// request, a paused machine does not advance at all.
+    #[test]
+    fn a_frame_step_runs_once_while_paused() {
+        assert!(emulates_frame(false, false), "normal play always advances");
+        assert!(
+            emulates_frame(false, true),
+            "a step during play is just a frame"
+        );
+        assert!(!emulates_frame(true, false), "pause freezes the machine");
+        assert!(
+            emulates_frame(true, true),
+            "a step advances the paused machine"
         );
     }
 
