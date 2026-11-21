@@ -922,19 +922,13 @@ fn waits_after_frame(paused: bool, turbo: bool) -> bool {
     paused || !turbo
 }
 
-/// A paused machine still runs a frame when the player asked for exactly one.
-/// The machine state, script and frame counter follow the same path as normal
-/// play, so a step is a real frame and not a redraw of the old one.
-fn emulates_frame(paused: bool, step: bool) -> bool {
-    !paused || step
-}
-
-/// Consume one queued frame-advance request. Unpausing throws the rest away:
-/// they belong to the paused run that asked for them.
-fn take_pending_step(paused: bool, pending: &mut u32) -> bool {
+/// Whether to emulate a frame now. Unpausing throws queued requests away:
+/// they belong to the paused run that asked for them; otherwise one queued
+/// step is consumed per call.
+fn should_emulate_frame(paused: bool, pending: &mut u32) -> bool {
     if !paused {
         *pending = 0;
-        return false;
+        return true;
     }
     if *pending == 0 {
         return false;
@@ -1368,8 +1362,7 @@ fn run() -> Result<(), String> {
         // A paused machine keeps its frame on screen and its script on hold;
         // time does not advance for either. A queued frame-advance request is
         // the one exception: it runs one frame and stays paused.
-        let step = take_pending_step(paused, &mut pending_steps);
-        if emulates_frame(paused, step) {
+        if should_emulate_frame(paused, &mut pending_steps) {
             // A script is not a second input path: it assigns the same mask a
             // key press assigns, and it goes through the same `set_buttons`
             // calls below. It drives player 1 only.
@@ -1535,13 +1528,13 @@ fn write_ppm(path: &str, frame: &[u32]) -> Result<(), String> {
 mod tests {
     use super::{
         age_label, audio_should_play, audio_sleep, button_for, draw_toast, dump_list_ends_run,
-        emulates_frame, finish_load, frame_budget, frame_sleep, game_save_dir, latest_state_path,
+        finish_load, frame_budget, frame_sleep, game_save_dir, latest_state_path,
         load_latest_state, load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps,
         move_selection, p2_button_for, pad_bit, parse_script, picker_command, players_for_game,
-        players_from_file, read_latest_slot, save_state_slot, slot_for, slot_line, state_slot_path,
-        take_pending_step, waits_after_frame, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input,
-        Picker, PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
-        AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
+        players_from_file, read_latest_slot, save_state_slot, should_emulate_frame, slot_for,
+        slot_line, state_slot_path, waits_after_frame, wrap_text, write_atomic, Bus, Cartridge,
+        Cpu, Input, Picker, PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES,
+        AUDIO_MAX_QUEUED, AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::controller::Button;
     use sdl2::event::{Event, WindowEvent};
@@ -2195,37 +2188,29 @@ mod tests {
         );
     }
 
-    /// A step is one emulated frame while the game stays paused; without a
-    /// request, a paused machine does not advance at all.
+    /// Normal play advances every iteration; a paused machine advances only by
+    /// consuming queued steps; unpausing discards the rest.
     #[test]
-    fn a_frame_step_runs_once_while_paused() {
-        assert!(emulates_frame(false, false), "normal play always advances");
-        assert!(
-            emulates_frame(false, true),
-            "a step during play is just a frame"
-        );
-        assert!(!emulates_frame(true, false), "pause freezes the machine");
-        assert!(
-            emulates_frame(true, true),
-            "a step advances the paused machine"
-        );
-    }
-
-    /// Two presses polled in one iteration must still run two frames. Once the
-    /// game is unpaused, the remaining requests belong to a paused run that no
-    /// longer exists.
-    #[test]
-    fn queued_frame_steps_run_one_per_iteration_and_drop_on_unpause() {
-        let mut pending = 2;
-        assert!(take_pending_step(true, &mut pending));
-        assert_eq!(pending, 1, "the first press is consumed");
-        assert!(take_pending_step(true, &mut pending));
-        assert_eq!(pending, 0, "the second press is consumed");
-        assert!(!take_pending_step(true, &mut pending));
-
+    fn frame_advance_runs_normally_and_consumes_queued_steps() {
         let mut pending = 3;
-        assert!(!take_pending_step(false, &mut pending));
+        assert!(
+            should_emulate_frame(false, &mut pending),
+            "normal play always advances"
+        );
         assert_eq!(pending, 0, "unpausing discards the queued steps");
+
+        let mut pending = 0;
+        assert!(
+            !should_emulate_frame(true, &mut pending),
+            "pause freezes the machine"
+        );
+
+        let mut pending = 2;
+        assert!(should_emulate_frame(true, &mut pending));
+        assert_eq!(pending, 1, "the first press is consumed");
+        assert!(should_emulate_frame(true, &mut pending));
+        assert_eq!(pending, 0, "the second press is consumed");
+        assert!(!should_emulate_frame(true, &mut pending));
     }
 
     #[test]
