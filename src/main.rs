@@ -923,10 +923,24 @@ fn waits_after_frame(paused: bool, turbo: bool) -> bool {
 }
 
 /// A paused machine still runs a frame when the player asked for exactly one.
-/// Everything else (audio, the script, the frame counter) follows the same path
-/// as normal play, so a step is a real frame and not a redraw of the old one.
+/// The machine state, script and frame counter follow the same path as normal
+/// play, so a step is a real frame and not a redraw of the old one.
 fn emulates_frame(paused: bool, step: bool) -> bool {
     !paused || step
+}
+
+/// Consume one queued frame-advance request. Unpausing throws the rest away:
+/// they belong to the paused run that asked for them.
+fn take_pending_step(paused: bool, pending: &mut u32) -> bool {
+    if !paused {
+        *pending = 0;
+        return false;
+    }
+    if *pending == 0 {
+        return false;
+    }
+    *pending -= 1;
+    true
 }
 
 /// How long to sleep at the end of a frame that took `elapsed`. A frame that
@@ -1155,13 +1169,13 @@ fn run() -> Result<(), String> {
     let mut picker_was_paused = false;
     let mut overlay = vec![0u32; W * H];
     let mut frames = 0u32;
+    // One `.` press queues one frame; the frame block consumes one request per
+    // iteration, so rapid taps polled together are not lost.
+    let mut pending_steps = 0u32;
     while running {
         // Started before anything else in the frame so the emulation, the
         // upload and the sleep are all inside the measured budget.
         let frame_start = ::std::time::Instant::now();
-        // One key press, one frame. It is cleared at the top of each iteration,
-        // so holding the key cannot turn a single step into fast-forward.
-        let mut step = false;
         for event in events.poll_iter() {
             // A controller can arrive or leave at any time, including while
             // the modal list owns the input; hotplug must not be lost to the
@@ -1234,7 +1248,7 @@ fn run() -> Result<(), String> {
                     ..
                 } => {
                     if paused {
-                        step = true;
+                        pending_steps = pending_steps.saturating_add(1);
                     }
                 }
                 Event::KeyDown {
@@ -1287,6 +1301,7 @@ fn run() -> Result<(), String> {
                     picker = Some(Picker::open(&save_dir, &bus.cart));
                     input.forget();
                     paused = true;
+                    pending_steps = 0;
                 }
                 Event::KeyDown {
                     scancode: Some(key),
@@ -1351,8 +1366,9 @@ fn run() -> Result<(), String> {
             audio_playing = should_play;
         }
         // A paused machine keeps its frame on screen and its script on hold;
-        // time does not advance for either. A frame-advance request is the one
-        // exception: it runs exactly one frame and stays paused.
+        // time does not advance for either. A queued frame-advance request is
+        // the one exception: it runs one frame and stays paused.
+        let step = take_pending_step(paused, &mut pending_steps);
         if emulates_frame(paused, step) {
             // A script is not a second input path: it assigns the same mask a
             // key press assigns, and it goes through the same `set_buttons`
@@ -1449,8 +1465,9 @@ fn run() -> Result<(), String> {
         // budget does. Either way the emulation is untouched by the wait. A
         // paused or muted run has no queue to follow, so it falls back to the
         // wall clock and keeps the window responsive. Fast-forward waits for
-        // neither: the hold exists to run the machine as fast as it can.
-        if waits_after_frame(paused, input.turbo) {
+        // neither: the hold exists to run the machine as fast as it can. A
+        // queued step skips the wait so a burst drains back-to-back.
+        if pending_steps == 0 && waits_after_frame(paused, input.turbo) {
             if paused {
                 ::std::thread::sleep(budget);
             } else {
@@ -1522,8 +1539,8 @@ mod tests {
         load_latest_state, load_state_slot, mask_for_name, migrate_legacy_states, missed_dumps,
         move_selection, p2_button_for, pad_bit, parse_script, picker_command, players_for_game,
         players_from_file, read_latest_slot, save_state_slot, slot_for, slot_line, state_slot_path,
-        waits_after_frame, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input, Picker,
-        PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
+        take_pending_step, waits_after_frame, wrap_text, write_atomic, Bus, Cartridge, Cpu, Input,
+        Picker, PickerCommand, Play, Region, Slot, Toast, AUDIO_FRAME_BYTES, AUDIO_MAX_QUEUED,
         AUDIO_TARGET, FRAME_BUDGET, H, P2_BUTTONS, TOAST_BG, TOAST_FG, W,
     };
     use sdl2::controller::Button;
@@ -2192,6 +2209,23 @@ mod tests {
             emulates_frame(true, true),
             "a step advances the paused machine"
         );
+    }
+
+    /// Two presses polled in one iteration must still run two frames. Once the
+    /// game is unpaused, the remaining requests belong to a paused run that no
+    /// longer exists.
+    #[test]
+    fn queued_frame_steps_run_one_per_iteration_and_drop_on_unpause() {
+        let mut pending = 2;
+        assert!(take_pending_step(true, &mut pending));
+        assert_eq!(pending, 1, "the first press is consumed");
+        assert!(take_pending_step(true, &mut pending));
+        assert_eq!(pending, 0, "the second press is consumed");
+        assert!(!take_pending_step(true, &mut pending));
+
+        let mut pending = 3;
+        assert!(!take_pending_step(false, &mut pending));
+        assert_eq!(pending, 0, "unpausing discards the queued steps");
     }
 
     #[test]
